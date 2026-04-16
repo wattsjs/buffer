@@ -89,7 +89,7 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
   exit 0
 fi
 
-for cmd in gh git xcodebuild xcrun ditto hdiutil security tar base64 codesign openssl; do
+for cmd in gh git xcodebuild xcrun ditto hdiutil security tar base64 codesign openssl create-dmg; do
   require_cmd "$cmd"
 done
 
@@ -299,9 +299,28 @@ echo "==> Creating DMG"
 DMG_STAGING_DIR="$WORK_DIR/dmg-staging"
 mkdir -p "$DMG_STAGING_DIR"
 cp -R "$APP_PATH" "$DMG_STAGING_DIR/"
-ln -s /Applications "$DMG_STAGING_DIR/Applications"
-hdiutil create -volname "$PRODUCT_NAME" -srcfolder "$DMG_STAGING_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
-codesign --force --sign "$DEVELOPER_ID_APPLICATION" "$DMG_PATH"
+
+# Extract .icns from the built app for use as volume icon
+APP_ICNS="$APP_PATH/Contents/Resources/AppIcon.icns"
+VOLICON_ARGS=()
+if [[ -f "$APP_ICNS" ]]; then
+  VOLICON_ARGS=(--volicon "$APP_ICNS")
+fi
+
+# Use create-dmg for a polished installer window
+create-dmg \
+  --volname "$PRODUCT_NAME" \
+  "${VOLICON_ARGS[@]}" \
+  --window-pos 200 120 \
+  --window-size 660 400 \
+  --icon-size 128 \
+  --icon "$PRODUCT_NAME.app" 180 170 \
+  --app-drop-link 480 170 \
+  --hide-extension "$PRODUCT_NAME.app" \
+  --no-internet-enable \
+  --codesign "$DEVELOPER_ID_APPLICATION" \
+  "$DMG_PATH" \
+  "$DMG_STAGING_DIR"
 
 echo "==> Notarizing DMG"
 xcrun notarytool submit "$DMG_PATH" "${NOTARY_ARGS[@]}" --wait
