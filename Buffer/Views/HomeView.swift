@@ -2,7 +2,7 @@ import SwiftUI
 
 struct HomeView: View {
     let recentChannels: [Channel]
-    let hasLoadedOnce: Bool
+    let favoriteChannels: [Channel]
     let currentProgram: (Channel) -> EPGProgram?
     let onChannelSelected: (Channel) -> Void
     let sportsViewModel: SportsViewModel
@@ -19,16 +19,24 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                if !liveEvents.isEmpty {
-                    liveSportsSection
-                } else if !hideSport && sportsViewModel.isLoading && !sportsViewModel.hasLoadedOnce {
-                    liveSportsPlaceholder
+                if !hideSport {
+                    if !liveEvents.isEmpty {
+                        liveSportsSection
+                    } else {
+                        liveSportsPlaceholder
+                    }
                 }
 
-                if recentChannels.isEmpty && liveEvents.isEmpty && (hideSport || sportsViewModel.hasLoadedOnce) {
-                    emptyState
-                } else if !recentChannels.isEmpty {
+                if !recentChannels.isEmpty {
                     section(title: "Recently Watched", channels: recentChannels)
+                } else {
+                    sectionPlaceholder(title: "Recently Watched", icon: "clock.arrow.circlepath")
+                }
+
+                if !favoriteChannels.isEmpty {
+                    section(title: "Favorites", channels: favoriteChannels)
+                } else {
+                    sectionPlaceholder(title: "Favorites", icon: "heart")
                 }
             }
             .padding(24)
@@ -77,8 +85,10 @@ struct HomeView: View {
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                ProgressView()
-                    .controlSize(.small)
+                if sportsViewModel.isLoading && !sportsViewModel.hasLoadedOnce {
+                    ProgressView()
+                        .controlSize(.small)
+                }
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -97,15 +107,30 @@ struct HomeView: View {
         }
     }
 
-    private var emptyState: some View {
-        ContentUnavailableView(
-            "Nothing here yet",
-            systemImage: "clock.arrow.circlepath",
-            description: Text(hasLoadedOnce
-                ? "Channels you watch will appear here."
-                : "Loading…")
-        )
-        .frame(maxWidth: .infinity, minHeight: 320)
+    private func sectionPlaceholder(title: String, icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.quaternary)
+                Text(title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 16) {
+                ForEach(0..<3, id: \.self) { _ in
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.primary.opacity(0.03))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+                        )
+                        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        .frame(minWidth: 220, maxWidth: 280)
+                }
+            }
+        }
     }
 
     private func section(title: String, channels: [Channel]) -> some View {

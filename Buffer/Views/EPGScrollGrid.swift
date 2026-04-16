@@ -21,6 +21,8 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
     let programRowWidth: CGFloat
     let headerHeight: CGFloat
     let nowLineX: CGFloat?
+    var channelNameProvider: ((Item) -> String)? = nil
+    var rowDataProvider: ((Item) -> ChannelLabelRowData)? = nil
     var revealItemID: AnyHashable?
     let channelContent: (Item) -> ChannelContent
     let programContent: (Item) -> ProgramContent
@@ -44,6 +46,13 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
         container.setHeaderContent(headerContent())
         container.setCornerContent(cornerContent())
         container.setNowLineX(nowLineX)
+
+        if let channelNameProvider {
+            container.setChannelNames(items.map { channelNameProvider($0) })
+        }
+        if let rowDataProvider {
+            container.setRowData(items.map { rowDataProvider($0) })
+        }
 
         let newIDs = items.map { AnyHashable($0.id) }
         if newIDs != coordinator.itemIDs {
@@ -167,9 +176,11 @@ final class EPGContainerView: NSView {
     private let headerHost = NSHostingView(rootView: AnyView(EmptyView()))
     private let cornerHost = NSHostingView(rootView: AnyView(EmptyView()))
     private let nowLineView = NSView()
+    private let channelLabelOverlay = ChannelLabelOverlayView()
 
     private var dimensions = Dimensions(rowHeight: 0, channelColumnWidth: 0, programRowWidth: 0, headerHeight: 0)
     private var nowLineX: CGFloat?
+    private var channelNames: [String] = []
     private var isSyncing = false
 
     override var isFlipped: Bool { true }
@@ -237,6 +248,17 @@ final class EPGContainerView: NSView {
 
     func setCornerContent<Content: View>(_ content: Content) {
         cornerHost.rootView = AnyView(content)
+    }
+
+    func setChannelNames(_ names: [String]) {
+        channelNames = names
+        // Row data will be built when programs are available via setRowData
+        channelLabelOverlay.needsDisplay = true
+    }
+
+    func setRowData(_ data: [ChannelLabelRowData]) {
+        channelLabelOverlay.rowData = data
+        channelLabelOverlay.needsDisplay = true
     }
 
     func setNowLineX(_ x: CGFloat?) {
@@ -312,6 +334,9 @@ final class EPGContainerView: NSView {
         nowLineView.isHidden = true
         addSubview(nowLineView)
 
+        channelLabelOverlay.wantsLayer = false
+        addSubview(channelLabelOverlay)
+
         let nc = NotificationCenter.default
         nc.addObserver(
             self,
@@ -351,6 +376,9 @@ final class EPGContainerView: NSView {
         programScrollView.frame = NSRect(x: ccw, y: hh, width: bodyWidth, height: bodyHeight)
 
         headerHost.frame = NSRect(x: 0, y: 0, width: dimensions.programRowWidth, height: hh)
+
+        channelLabelOverlay.frame = NSRect(x: ccw, y: hh, width: bodyWidth, height: bodyHeight)
+        channelLabelOverlay.rowHeight = dimensions.rowHeight
 
         updateNowLineFrame()
     }
@@ -423,6 +451,7 @@ final class EPGContainerView: NSView {
         mirror(y: origin.y, to: channelScrollView)
         mirror(x: origin.x, to: headerScrollView)
         updateNowLineFrame()
+        updateChannelLabelOverlay()
     }
 
     @objc private func channelBoundsDidChange(_ note: Notification) {
@@ -431,6 +460,7 @@ final class EPGContainerView: NSView {
         defer { isSyncing = false }
 
         mirror(y: clip.bounds.origin.y, to: programScrollView)
+        updateChannelLabelOverlay()
     }
 
     @objc private func headerBoundsDidChange(_ note: Notification) {
@@ -440,6 +470,13 @@ final class EPGContainerView: NSView {
 
         mirror(x: clip.bounds.origin.x, to: programScrollView)
         updateNowLineFrame()
+    }
+
+    private func updateChannelLabelOverlay() {
+        let clip = programScrollView.contentView.bounds
+        channelLabelOverlay.scrollOffsetX = clip.origin.x
+        channelLabelOverlay.scrollOffsetY = clip.origin.y
+        channelLabelOverlay.needsDisplay = true
     }
 
     private func mirror(x: CGFloat, to scrollView: NSScrollView) {
@@ -456,6 +493,127 @@ final class EPGContainerView: NSView {
         let target = NSPoint(x: clip.bounds.origin.x, y: y)
         clip.scroll(to: target)
         scrollView.reflectScrolledClipView(clip)
+    }
+}
+
+// MARK: - Channel label overlay
+
+struct ChannelLabelRowData {
+    let channelName: String
+    /// Block rects + time strings in document coordinates (x relative to row start)
+    let blocks: [(rect: CGRect, timeRange: String?)]
+}
+
+final class ChannelLabelOverlayView: NSView {
+    var rowData: [ChannelLabelRowData] = []
+    var rowHeight: CGFloat = 64
+    var scrollOffsetX: CGFloat = 0
+    var scrollOffsetY: CGFloat = 0
+
+    override var isFlipped: Bool { true }
+    override func hitTest(_ aPoint: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !rowData.isEmpty else { return }
+
+        // Clip to our own bounds so text doesn't bleed into the header
+        NSBezierPath(rect: bounds).addClip()
+
+        let nameAttrs: [NSAttributedString.Key: Any] = {
+            let p = NSMutableParagraphStyle()
+            p.lineBreakMode = .byTruncatingTail
+            return [
+                .font: NSFont.systemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: p,
+            ]
+        }()
+        let timeAttrs = nameAttrs
+
+        let insetX: CGFloat = 9
+        let insetY: CGFloat = 9
+
+        let firstVisibleRow = max(0, Int(scrollOffsetY / rowHeight))
+        let visibleRowCount = Int(ceil(bounds.height / rowHeight)) + 1
+
+        for i in firstVisibleRow..<min(firstVisibleRow + visibleRowCount, rowData.count) {
+            let data = rowData[i]
+            guard !data.blocks.isEmpty else { continue }
+
+            let rowY = CGFloat(i) * rowHeight - scrollOffsetY
+            let docLeftEdge = scrollOffsetX
+            let hasName = !data.channelName.isEmpty
+            let nameSize = hasName ? (data.channelName as NSString).size(withAttributes: nameAttrs) : .zero
+            let nameWidth = min(nameSize.width + 1, bounds.width * 0.35)
+
+            // The sticky X position for the channel name (screen coords)
+            let stickyX = insetX
+
+            for block in data.blocks {
+                let blockScreenMinX = block.rect.minX - scrollOffsetX
+                let blockScreenMaxX = block.rect.maxX - scrollOffsetX
+
+                guard blockScreenMaxX > 0, blockScreenMinX < bounds.width else { continue }
+
+                let blockTextMinX = max(0, blockScreenMinX) + 9
+                guard blockTextMinX < blockScreenMaxX - 10 else { continue }
+
+                // Clip to this block, inset to hide text in the gap
+                let clipInset: CGFloat = 2
+                let blockClipMinX = max(0, blockScreenMinX + clipInset)
+                let blockClipMaxX = blockScreenMaxX - clipInset
+                guard blockClipMaxX > blockClipMinX + 10 else { continue }
+
+                let blockClipRect = NSRect(
+                    x: blockClipMinX,
+                    y: rowY,
+                    width: blockClipMaxX - blockClipMinX,
+                    height: rowHeight
+                )
+
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: blockClipRect).addClip()
+
+                // Does the sticky channel name overlap this block?
+                let stickyDocX = scrollOffsetX + stickyX
+                let stickyDocEndX = stickyDocX + nameWidth
+                let blockOverlapsSticky = hasName
+                    && block.rect.maxX > stickyDocX
+                    && block.rect.minX < stickyDocEndX
+
+                var timeStartX = blockTextMinX
+
+                if blockOverlapsSticky {
+                    // Draw channel name at sticky position
+                    let nameRect = NSRect(x: stickyX, y: rowY + insetY, width: nameWidth, height: nameSize.height)
+                    (data.channelName as NSString).draw(
+                        with: nameRect,
+                        options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
+                        attributes: nameAttrs
+                    )
+                    let nameEndX = stickyX + nameWidth + 8
+                    if nameEndX > timeStartX {
+                        timeStartX = nameEndX
+                    }
+                }
+
+                // Draw time
+                if let timeRange = block.timeRange {
+                    let timeAvail = blockClipMaxX - timeStartX - 9
+                    if timeAvail > 20 {
+                        let ts = (timeRange as NSString).size(withAttributes: timeAttrs)
+                        let timeRect = NSRect(x: timeStartX, y: rowY + insetY, width: min(ts.width, timeAvail), height: ts.height)
+                        (timeRange as NSString).draw(
+                            with: timeRect,
+                            options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
+                            attributes: timeAttrs
+                        )
+                    }
+                }
+
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
     }
 }
 

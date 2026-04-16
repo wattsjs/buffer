@@ -4,9 +4,7 @@ import Foundation
 enum ExternalPlayerKind: String, CaseIterable, Identifiable {
     case none
     case iina
-    case vlc
-    case mpv
-    case quickTime
+    case vidhub
 
     var id: String { rawValue }
 
@@ -14,9 +12,7 @@ enum ExternalPlayerKind: String, CaseIterable, Identifiable {
         switch self {
         case .none: return "None"
         case .iina: return "IINA"
-        case .vlc: return "VLC"
-        case .mpv: return "mpv"
-        case .quickTime: return "QuickTime Player"
+        case .vidhub: return "VidHub"
         }
     }
 
@@ -24,9 +20,7 @@ enum ExternalPlayerKind: String, CaseIterable, Identifiable {
         switch self {
         case .none: return nil
         case .iina: return "com.colliderli.iina"
-        case .vlc: return "org.videolan.vlc"
-        case .mpv: return "io.mpv"
-        case .quickTime: return "com.apple.QuickTimePlayerX"
+        case .vidhub: return nil
         }
     }
 }
@@ -48,21 +42,29 @@ enum ExternalPlayer {
     static func launch(streamURL: URL, using kind: ExternalPlayerKind) {
         guard kind != .none else { return }
 
-        if kind == .iina {
-            let encoded = streamURL.absoluteString
-                .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? streamURL.absoluteString
-            if let iinaURL = URL(string: "iina://weblink?url=\(encoded)"),
-               NSWorkspace.shared.urlForApplication(toOpen: iinaURL) != nil {
-                NSWorkspace.shared.open(iinaURL)
+        let raw = streamURL.absoluteString
+
+        switch kind {
+        case .none:
+            return
+
+        case .iina:
+            var components = URLComponents(string: "iina://weblink")!
+            components.queryItems = [URLQueryItem(name: "url", value: raw)]
+            if let url = components.url,
+               NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+                NSWorkspace.shared.open(url)
                 return
             }
-        }
 
-        if let bundleID = kind.bundleIdentifier,
-           let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            let config = NSWorkspace.OpenConfiguration()
-            NSWorkspace.shared.open([streamURL], withApplicationAt: appURL, configuration: config, completionHandler: nil)
-            return
+        case .vidhub:
+            var components = URLComponents(string: "open-vidhub://x-callback-url/open")!
+            components.queryItems = [URLQueryItem(name: "url", value: raw)]
+            if let url = components.url,
+               NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+                NSWorkspace.shared.open(url)
+                return
+            }
         }
 
         NSWorkspace.shared.open(streamURL)

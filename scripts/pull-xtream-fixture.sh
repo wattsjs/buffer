@@ -73,7 +73,13 @@ def attr: clean | gsub("\""; "\\\"");
 | "#EXTM3U\n"
   + (
       map(
-        "#EXTINF:-1 tvg-id=\"\((.epg_channel_id // \"\") | attr)\" tvg-logo=\"\((.stream_icon // \"\") | attr)\" group-title=\"\(($catmap[(.category_id | tostring)] // \"Uncategorized\") | attr)\",\((.name // \"Unknown\") | clean)\n"
+        "#EXTINF:-1 tvg-id=\""
+        + ((.epg_channel_id // "") | attr)
+        + "\" tvg-logo=\""
+        + ((.stream_icon // "") | attr)
+        + "\" group-title=\""
+        + (($catmap[(.category_id | tostring)] // "Uncategorized") | attr)
+        + "\"," + ((.name // "Unknown") | clean) + "\n"
         + $base + "/live/" + $user + "/" + $pass + "/" + (.stream_id | tostring) + ".m3u8"
       )
       | join("\n")
@@ -85,7 +91,13 @@ def attr: clean | gsub("\""; "\\\"");
 | "#EXTM3U\n"
   + (
       map(
-        "#EXTINF:-1 tvg-id=\"\((.epgChannelID // \"\") | attr)\" tvg-logo=\"\((.logoURL // \"\") | attr)\" group-title=\"\((.group // \"Uncategorized\") | attr)\",\((.name // \"Unknown\") | clean)\n"
+        "#EXTINF:-1 tvg-id=\""
+        + ((.epgChannelID // "") | attr)
+        + "\" tvg-logo=\""
+        + ((.logoURL // "") | attr)
+        + "\" group-title=\""
+        + ((.group // "Uncategorized") | attr)
+        + "\"," + ((.name // "Unknown") | clean) + "\n"
         + (.streamURL | tostring)
       )
       | join("\n")
