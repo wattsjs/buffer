@@ -46,7 +46,7 @@ struct ContentView: View {
         case .home:
             HomeView(
                 recentChannels: viewModel.recentChannels,
-                hasLoadedOnce: viewModel.hasLoadedOnce,
+                favoriteChannels: viewModel.favoriteChannels,
                 currentProgram: { viewModel.currentProgram(for: $0) },
                 onChannelSelected: { openChannel($0) },
                 sportsViewModel: sportsViewModel
@@ -159,28 +159,20 @@ struct ContentView: View {
         ContentUnavailableView {
             Label("Welcome to Buffer", systemImage: "tv.badge.wifi")
         } description: {
-            VStack(spacing: 10) {
-                Text("Add your first IPTV account to start syncing channels, guide data, and recent watches.")
-                Text("Buffer will open setup, save your account, and start the first sync as soon as you click Apply & Sync.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .multilineTextAlignment(.center)
+            Text("Add an IPTV account, then click Apply & Sync.")
+                .multilineTextAlignment(.center)
         } actions: {
             VStack(spacing: 12) {
                 Button {
                     openSettings()
                 } label: {
-                    Label("Add First Account", systemImage: "plus.circle.fill")
+                    Label("Add Account", systemImage: "plus.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
 
-                VStack(spacing: 6) {
-                    Label("Supports Xtream Codes and M3U playlists", systemImage: "checkmark.circle")
-                    Label("You can change providers later in Settings", systemImage: "gear")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text("Xtream Codes and M3U supported")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

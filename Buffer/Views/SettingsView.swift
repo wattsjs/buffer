@@ -44,7 +44,7 @@ private struct GeneralSettingsTab: View {
                 Section {
                     SetupFeedbackCard(
                         title: "Add your first account",
-                        message: "Choose your provider type, paste the account details below, then click Apply & Sync. Buffer saves the account and starts the first sync right away.",
+                        message: "Choose a provider, enter the details, then click Apply & Sync.",
                         systemImage: "sparkles",
                         tint: .accentColor
                     )
@@ -162,7 +162,7 @@ private struct GeneralSettingsTab: View {
         if viewModel.isRefreshing, hasSubmittedFirstAccount {
             return (
                 title: "Syncing your channels",
-                message: viewModel.loadingStage ?? "Connecting to your provider and downloading the guide.",
+                message: viewModel.loadingStage ?? "Connecting and downloading channels.",
                 systemImage: "arrow.triangle.2.circlepath",
                 tint: .accentColor,
                 showsProgress: true
@@ -172,7 +172,7 @@ private struct GeneralSettingsTab: View {
         if hasSubmittedFirstAccount, viewModel.lastUpdated != nil {
             return (
                 title: "Account added",
-                message: "Your first sync finished successfully. You can close Settings and start browsing channels.",
+                message: "Sync complete. You can close Settings.",
                 systemImage: "checkmark.circle.fill",
                 tint: .green,
                 showsProgress: false
@@ -182,7 +182,7 @@ private struct GeneralSettingsTab: View {
         if hasSubmittedFirstAccount {
             return (
                 title: "Account saved",
-                message: "Buffer will kick off the first sync immediately.",
+                message: "Starting the first sync.",
                 systemImage: "clock.badge.checkmark",
                 tint: .accentColor,
                 showsProgress: false
@@ -253,7 +253,7 @@ private struct GeneralSettingsTab: View {
         case .testing:
             return ConnectionFeedback(
                 title: "Testing connection",
-                message: "Checking your provider details, channel feed, and guide URL.",
+                message: "Checking the account and guide.",
                 systemImage: "bolt.horizontal.circle",
                 tint: .accentColor,
                 showsProgress: true
@@ -507,7 +507,7 @@ private struct AccountStatusCard: View {
 
     private var lastUpdatedText: String {
         guard let checked = status?.lastChecked else {
-            return "No account details yet."
+            return "No details yet."
         }
         return "Updated \(checked.formatted(date: .abbreviated, time: .shortened))"
     }
@@ -547,7 +547,7 @@ private struct AccountStatusCard: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if status == nil {
-                Text("Use Test Connection or Apply & Sync to load the latest account details.")
+                Text("Use Test Connection or Apply & Sync to load details.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -630,7 +630,7 @@ private struct GeneralAppSettingsTab: View {
                     get: { !hideSport },
                     set: { hideSport = !$0 }
                 ))
-                Text("When enabled, live scores and events from ESPN appear on the Home page and in the sidebar. Disabling stops background polling.")
+                Text("Shows ESPN live scores on Home and in the sidebar. Turn it off to stop background polling.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -660,7 +660,7 @@ private struct PlaybackSettingsTab: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text("Seconds of video mpv prefetches ahead of playback. Higher values smooth over network hiccups but add latency behind live.")
+                Text("How many seconds mpv buffers ahead. Higher values reduce stutter but add more delay.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -683,9 +683,9 @@ private struct PlaybackSettingsTab: View {
     private var footerText: String {
         switch selectedPlayer {
         case .none:
-            return "Channels open in Buffer's built-in player."
+            return "Channels open in Buffer."
         default:
-            return "Selecting a channel hands the stream URL to \(selectedPlayer.displayName). If it isn't installed, the system's default handler opens instead."
+            return "Selecting a channel opens the stream in \(selectedPlayer.displayName)."
         }
     }
 }
@@ -704,7 +704,7 @@ private struct SyncSettingsTab: View {
                         Text(interval.title).tag(interval.hours)
                     }
                 }
-                Text("Runs silently in the background while Buffer is open. Use the Refresh button in the toolbar to trigger an immediate sync.")
+                Text("Refreshes in the background while Buffer is open.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -61,6 +61,17 @@ struct EPGGridView: View {
                 programRowWidth: width,
                 headerHeight: headerHeight,
                 nowLineX: nowX,
+                channelNameProvider: { $0.name },
+                rowDataProvider: { [programsProvider, timelineStart, pixelsPerMinute, timelineHours] channel in
+                    Self.buildRowData(
+                        channel: channel,
+                        programs: programsProvider(channel),
+                        timelineStart: timelineStart,
+                        pixelsPerMinute: pixelsPerMinute,
+                        timelineHours: timelineHours,
+                        rowHeight: rowHeight
+                    )
+                },
                 revealItemID: revealChannelID.map { AnyHashable($0) },
                 channelContent: { channel in
                     ChannelCell(
@@ -95,6 +106,52 @@ struct EPGGridView: View {
             )
             .background(Color(nsColor: .textBackgroundColor))
         }
+    }
+
+    private static func buildRowData(
+        channel: Channel,
+        programs: [EPGProgram],
+        timelineStart: Date,
+        pixelsPerMinute: CGFloat,
+        timelineHours: Int,
+        rowHeight: CGFloat
+    ) -> ChannelLabelRowData {
+        let timelineWidth = CGFloat(timelineHours * 60) * pixelsPerMinute
+        let end = timelineStart.addingTimeInterval(Double(timelineWidth / pixelsPerMinute) * 60)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "h:mma"
+        formatter.amSymbol = "am"
+        formatter.pmSymbol = "pm"
+
+        let sorted = programs
+            .filter { $0.end > timelineStart && $0.start < end }
+            .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
+
+        var blocks: [(rect: CGRect, timeRange: String?)] = []
+        var cursor = timelineStart
+
+        for p in sorted {
+            let effectiveStart = max(p.start, cursor)
+            guard p.end > effectiveStart else { continue }
+            let startX = max(0, effectiveStart.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
+            let endX = min(Double(timelineWidth), p.end.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
+            let width = endX - startX
+            guard width > 2 else { continue }
+            blocks.append((
+                rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
+                timeRange: "\(formatter.string(from: p.start)) - \(formatter.string(from: p.end))"
+            ))
+            cursor = p.end
+        }
+
+        if blocks.isEmpty {
+            blocks.append((
+                rect: CGRect(x: 0, y: 3, width: timelineWidth, height: rowHeight - 6),
+                timeRange: nil
+            ))
+        }
+
+        return ChannelLabelRowData(channelName: channel.name, blocks: blocks)
     }
 
     private func timeStrip(timelineStart: Date) -> some View {
@@ -426,24 +483,19 @@ private struct ProgramCanvasLayer: View, Equatable {
                 }
                 let timeSize = resolvedTime?.measure(in: unbounded) ?? .zero
 
+                let timeLineHeight = timeSize.height
+
                 context.drawLayer { layer in
                     layer.clip(to: Path(inset))
+
                     let titleOriginY = block.timeRange == nil
                         ? inset.midY - titleSize.height / 2
-                        : textRect.minY
+                        : textRect.minY + timeLineHeight + 1
                     let titleOrigin = CGPoint(x: textRect.minX, y: titleOriginY)
                     layer.draw(
                         resolvedTitle,
                         in: CGRect(origin: titleOrigin, size: CGSize(width: max(titleSize.width, textRect.width), height: titleSize.height))
                     )
-
-                    if let resolvedTime {
-                        let timeOrigin = CGPoint(x: textRect.minX, y: textRect.minY + titleSize.height + 1)
-                        layer.draw(
-                            resolvedTime,
-                            in: CGRect(origin: timeOrigin, size: CGSize(width: max(timeSize.width, textRect.width), height: timeSize.height))
-                        )
-                    }
 
                     if block.hasReminder {
                         let bellText = Text(Image(systemName: "bell.fill"))
