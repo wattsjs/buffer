@@ -33,7 +33,7 @@ nonisolated final class StreamProxy: @unchecked Sendable {
 
     // MARK: - Listener
 
-    private let stateLock = NSLock()
+    private let stateLock = NSCondition()
     private var listener: NWListener?
     private(set) var port: UInt16 = 0
     private let readySemaphore = DispatchSemaphore(value: 0)
@@ -44,6 +44,9 @@ nonisolated final class StreamProxy: @unchecked Sendable {
     /// One broadcaster per upstream URL. Created lazily on first viewer
     /// attach, torn down when its last sink goes away.
     private var broadcasters: [String: BroadcasterHandle] = [:]
+    /// Broadcasters currently being opened. Other callers wait so we don't
+    /// stampede the same upstream URL with duplicate HLS/TLS handshakes.
+    private var openingBroadcasters: Set<String> = []
     /// viewer token → upstream URL (so HTTP route can map `/s/<token>` to
     /// the right broadcaster).
     private var pendingViewerTokens: [UUID: String] = [:]
@@ -79,11 +82,15 @@ nonisolated final class StreamProxy: @unchecked Sendable {
         }
     }
 
-    private final class RecordingTap {
+    private final class RecordingTap: @unchecked Sendable {
         let broadcasterKey: String
         let fileURL: URL
         let fileHandle: FileHandle
         var sinkToken: Int32 = 0
+        private let writeQueue: DispatchQueue
+        private let statsLock = NSLock()
+        private var closed = false
+        private var _bytesWritten: Int64 = 0
         /// Retained closures — must outlive the C callback registration.
         var onBytes: BufferSinkOnBytes?
         var onEOF: BufferSinkOnEOF?
@@ -95,11 +102,41 @@ nonisolated final class StreamProxy: @unchecked Sendable {
         /// discard bytes for ~1 s after attach; provider segments are
         /// keyframe-aligned so the next segment boundary (~2 s) will start
         /// cleanly. For now we write everything; future improvement.
-        var bytesWritten: Int64 = 0
+        var bytesWritten: Int64 {
+            statsLock.withLock { _bytesWritten }
+        }
         init(broadcasterKey: String, fileURL: URL, fileHandle: FileHandle) {
             self.broadcasterKey = broadcasterKey
             self.fileURL = fileURL
             self.fileHandle = fileHandle
+            self.writeQueue = DispatchQueue(
+                label: "com.buffer.recording.tap.\(UUID().uuidString)",
+                qos: .userInitiated
+            )
+        }
+
+        func enqueueWrite(_ data: Data) {
+            writeQueue.async { [weak self] in
+                guard let self, !self.closed else { return }
+                do {
+                    try self.fileHandle.write(contentsOf: data)
+                    self.statsLock.withLock {
+                        self._bytesWritten += Int64(data.count)
+                    }
+                } catch {
+                    self.closed = true
+                    try? self.fileHandle.close()
+                    print("[StreamProxy] recording write failed: \(error)")
+                }
+            }
+        }
+
+        func finish() {
+            writeQueue.sync {
+                guard !closed else { return }
+                closed = true
+                try? fileHandle.close()
+            }
         }
     }
 
@@ -233,20 +270,12 @@ nonisolated final class StreamProxy: @unchecked Sendable {
         tap.onBytes = { ctx, bytes, len in
             guard let ctx, let bytes else { return }
             let tap = Unmanaged<RecordingTap>.fromOpaque(ctx).takeUnretainedValue()
-            let data = Data(bytes: bytes, count: len)
-            // FileHandle.write can throw; no cheap way to handle from C callback
-            // thread. Swallow errors; a disk-full event will stop growth.
-            do {
-                try tap.fileHandle.write(contentsOf: data)
-                tap.bytesWritten += Int64(len)
-            } catch {
-                print("[StreamProxy] recording write failed: \(error)")
-            }
+            tap.enqueueWrite(Data(bytes: bytes, count: len))
         }
         tap.onEOF = { ctx in
             guard let ctx else { return }
             let tap = Unmanaged<RecordingTap>.fromOpaque(ctx).takeUnretainedValue()
-            try? tap.fileHandle.close()
+            tap.finish()
         }
 
         let cb = BufferSinkCallbacks(
@@ -254,9 +283,17 @@ nonisolated final class StreamProxy: @unchecked Sendable {
             on_eof: tap.onEOF,
             ctx: ctx
         )
-        let token = buffer_broadcaster_add_sink(broadcaster.ptr, cb)
+        // A cold broadcaster can emit a few packets between open-complete and
+        // sink attach; replay those so scheduled/cold-start recordings don't
+        // clip the beginning. If the broadcaster is already serving another
+        // consumer, skip replay so we don't prepend stale bytes or block live
+        // playback while writing the replay window to disk.
+        let replayFlags: UInt32 = buffer_broadcaster_sink_count(broadcaster.ptr) == 0
+            ? UInt32(BUFFER_BROADCASTER_SINK_FLAG_REPLAY_RECENT)
+            : 0
+        let token = buffer_broadcaster_add_sink_with_flags(broadcaster.ptr, cb, replayFlags)
         if token <= 0 {
-            try? handle.close()
+            tap.finish()
             return nil
         }
         tap.sinkToken = token
@@ -297,7 +334,7 @@ nonisolated final class StreamProxy: @unchecked Sendable {
         if let ptr = broadcaster?.ptr {
             buffer_broadcaster_remove_sink(ptr, tap.sinkToken)
         }
-        try? tap.fileHandle.close()
+        tap.finish()
         reapIfIdle(key: tap.broadcasterKey)
     }
 
@@ -346,10 +383,26 @@ nonisolated final class StreamProxy: @unchecked Sendable {
                                    referer: String?,
                                    caller: String = #function) throws -> BroadcasterHandle {
         let key = upstreamURL.absoluteString
-        if let existing = stateLock.withLock({ broadcasters[key] }),
-           existing.ptr != nil {
-            print("[StreamProxy] ensureBroadcaster REUSE caller=\(caller) url=\(redact(key))")
-            return existing
+        while true {
+            stateLock.lock()
+            if let existing = broadcasters[key], existing.ptr != nil {
+                stateLock.unlock()
+                print("[StreamProxy] ensureBroadcaster REUSE caller=\(caller) url=\(redact(key))")
+                return existing
+            }
+            if !openingBroadcasters.contains(key) {
+                openingBroadcasters.insert(key)
+                stateLock.unlock()
+                break
+            }
+            stateLock.wait()
+            stateLock.unlock()
+        }
+        defer {
+            stateLock.lock()
+            openingBroadcasters.remove(key)
+            stateLock.broadcast()
+            stateLock.unlock()
         }
 
         // Providers occasionally return a transient error on the first
@@ -377,14 +430,18 @@ nonisolated final class StreamProxy: @unchecked Sendable {
             if let ptr {
                 handle.ptr = ptr
                 print("[StreamProxy] ensureBroadcaster OK caller=\(caller) attempt=\(attempt) elapsed=\(elapsedMs)ms url=\(redact(key))")
-                stateLock.withLock {
-                    // Another caller may have raced — keep the first one.
-                    if let existing = broadcasters[key], existing.ptr != nil {
-                        buffer_broadcaster_free(ptr)
-                        handle.ptr = existing.ptr
-                    } else {
-                        broadcasters[key] = handle
-                    }
+                stateLock.lock()
+                // Another caller may have completed while we were opening,
+                // usually because the broadcaster was installed before this
+                // task reacquired the condition lock after a wake-up.
+                if let existing = broadcasters[key], existing.ptr != nil {
+                    stateLock.unlock()
+                    buffer_broadcaster_free(ptr)
+                    handle.ptr = existing.ptr
+                    print("[StreamProxy] ensureBroadcaster REUSE caller=\(caller) url=\(redact(key))")
+                } else {
+                    broadcasters[key] = handle
+                    stateLock.unlock()
                 }
                 return handle
             }
@@ -791,10 +848,10 @@ private final class ConnectionSinkAdapter: @unchecked Sendable {
         self.onEOF = { ctx in
             guard let ctx else { return }
             let me = Unmanaged<ConnectionSinkAdapter>.fromOpaque(ctx).takeUnretainedValue()
-            me.detach()
+            me.detachFromBroadcasterEOF()
         }
 
-        var cb = BufferSinkCallbacks(
+        let cb = BufferSinkCallbacks(
             on_bytes: self.onBytes,
             on_eof: self.onEOF,
             ctx: ctx
@@ -809,6 +866,10 @@ private final class ConnectionSinkAdapter: @unchecked Sendable {
     private let detachLock = NSLock()
 
     func detach() {
+        detach(removeSink: true)
+    }
+
+    private func detach(removeSink: Bool) {
         detachLock.lock()
         if detached { detachLock.unlock(); return }
         detached = true
@@ -817,12 +878,20 @@ private final class ConnectionSinkAdapter: @unchecked Sendable {
         // Remove from broadcaster FIRST so it stops delivering bytes. After
         // this returns, broadcaster guarantees no more on_bytes callbacks
         // for this sink token.
-        if sinkToken > 0, let b = broadcasterPtr {
+        if removeSink, sinkToken > 0, let b = broadcasterPtr {
             buffer_broadcaster_remove_sink(b, sinkToken)
         }
+        sinkToken = 0
         connection.cancel()
         onClose(self)
         retainToken?.release()
         retainToken = nil
+    }
+
+    private func detachFromBroadcasterEOF() {
+        // notify_eof already marked the sink dead and is currently running
+        // inside the broadcaster's delivery pass, so calling
+        // remove_sink here would wait for the callback that we're in.
+        detach(removeSink: false)
     }
 }

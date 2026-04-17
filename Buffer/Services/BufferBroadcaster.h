@@ -22,6 +22,12 @@ typedef struct {
     void *ctx;
 } BufferSinkCallbacks;
 
+enum {
+    /// Replays the recent MPEG-TS ring to the sink before live bytes flow.
+    /// Use this for player sockets that need an immediate PAT/PMT/keyframe.
+    BUFFER_BROADCASTER_SINK_FLAG_REPLAY_RECENT = 1u << 0,
+};
+
 /// Open a broadcaster for `input_url`. Starts pulling and muxing
 /// immediately on a background thread. Returns NULL on synchronous failure
 /// (connect / handshake / probe errors). error buffer populated on failure.
@@ -33,6 +39,13 @@ BufferBroadcaster *buffer_broadcaster_create(const char *input_url,
 /// Register a byte sink. Bytes start flowing immediately (callback invoked
 /// from the broadcaster's thread). Returns a positive token; 0 = failure.
 int buffer_broadcaster_add_sink(BufferBroadcaster *b, BufferSinkCallbacks cb);
+
+/// Register a sink with explicit delivery flags. `flags == 0` attaches the
+/// sink to live bytes only; `BUFFER_BROADCASTER_SINK_FLAG_REPLAY_RECENT`
+/// enables the replay ring first.
+int buffer_broadcaster_add_sink_with_flags(BufferBroadcaster *b,
+                                           BufferSinkCallbacks cb,
+                                           uint32_t flags);
 
 /// Remove a sink by token. Safe to call from any thread; the broadcaster
 /// guarantees no more callbacks for that sink after this returns.

@@ -81,7 +81,7 @@ final class MPVLayerHostView: NSView {
 /// Each layer owns its own CGL context (via `copyCGLContext`). The mpv
 /// render context is initialized against this CGL context the first time
 /// CoreAnimation calls `copyCGLContext`. After that, the mpv update
-/// callback dispatches `display()` on the main thread whenever a new
+/// callback marks the layer dirty on the main thread whenever a new
 /// frame is ready; `draw(inCGLContext:)` does the actual render.
 ///
 /// Resize is automatic: each `draw` call queries `GL_VIEWPORT` from the
@@ -216,9 +216,15 @@ final class MPVPlayerLayer: CAOpenGLLayer {
             guard let layer = box.layer, !layer.displayScheduled else { return }
             layer.displayScheduled = true
             DispatchQueue.main.async { [weak layer] in
-                guard let layer, !layer.torn else { return }
-                layer.displayScheduled = false
-                layer.display()
+                guard let layer else { return }
+                guard !layer.torn else {
+                    layer.displayScheduled = false
+                    return
+                }
+                // Let Core Animation coalesce multiple mpv frame callbacks
+                // into one draw pass instead of forcing an immediate redraw
+                // on every callback.
+                layer.setNeedsDisplay()
             }
         }, context: ptr)
     }
@@ -242,6 +248,8 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         forLayerTime t: CFTimeInterval,
         displayTime ts: UnsafePointer<CVTimeStamp>?
     ) {
+        displayScheduled = false
+
         guard renderReady, !torn, let renderCtx = player?.renderContextHandle else {
             glClearColor(0, 0, 0, 1)
             glClear(GLbitfield(GL_COLOR_BUFFER_BIT))

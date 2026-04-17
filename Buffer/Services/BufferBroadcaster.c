@@ -1,5 +1,6 @@
 #include "BufferBroadcaster.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,11 @@
 
 #define MAX_SINKS 16
 #define OUTPUT_IO_BUFFER_SIZE (64 * 1024)
+#define MPEGTS_PACKET_SIZE 188
+#define REPLAY_SCAN_BYTES (6 * 1024 * 1024)
+#define REPLAY_FALLBACK_BYTES (4 * 1024 * 1024)
+#define REPLAY_PAT_LOOKBACK_BYTES (512 * 1024)
+#define REPLAY_SYNC_PROBE_PACKETS 5
 
 // Ring buffer that keeps the most recent muxed MPEG-TS bytes so a newly
 // attached sink gets a replay — including PAT/PMT + at least one keyframe —
@@ -71,6 +77,12 @@ struct BufferBroadcaster {
     // -1 means "skip"). Only video+audio streams are copied.
     int *stream_mapping;
     int stream_mapping_size;
+    int output_stream_count;
+    int64_t *stream_ts_offset;
+    int64_t *last_written_dts;
+    int64_t *last_written_pts;
+    int64_t *last_written_duration;
+    uint8_t *needs_timestamp_rebase;
 
     // Replay ring: most recent muxed MPEG-TS bytes. Protected by
     // sinks_mutex (same lock used for the sinks array — both are touched
@@ -82,6 +94,80 @@ struct BufferBroadcaster {
 };
 
 static int write_to_sinks(void *opaque, const uint8_t *buf, int buf_size);
+static void buffer_av_log(void *ptr, int level, const char *fmt, va_list vl);
+
+static pthread_once_t s_global_init_once = PTHREAD_ONCE_INIT;
+
+static void broadcaster_global_init(void) {
+    avformat_network_init();
+    av_log_set_level(AV_LOG_INFO);
+    av_log_set_callback(buffer_av_log);
+}
+
+static int input_interrupt_cb(void *opaque) {
+    BufferBroadcaster *b = (BufferBroadcaster *)opaque;
+    return b && b->stop_requested;
+}
+
+static int64_t packet_step_for_stream(BufferBroadcaster *b, int out_idx, const AVPacket *pkt) {
+    if (pkt && pkt->duration > 0) return pkt->duration;
+    if (b && b->last_written_duration &&
+        out_idx >= 0 && out_idx < b->output_stream_count &&
+        b->last_written_duration[out_idx] > 0) {
+        return b->last_written_duration[out_idx];
+    }
+    return 1;
+}
+
+static void ensure_monotonic_timestamps(BufferBroadcaster *b, AVPacket *pkt, int out_idx) {
+    if (!b || !pkt || out_idx < 0 || out_idx >= b->output_stream_count) return;
+
+    int64_t last_dts = b->last_written_dts ? b->last_written_dts[out_idx] : AV_NOPTS_VALUE;
+    int64_t last_pts = b->last_written_pts ? b->last_written_pts[out_idx] : AV_NOPTS_VALUE;
+    int64_t offset = b->stream_ts_offset ? b->stream_ts_offset[out_idx] : 0;
+    int64_t incoming_anchor = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+    int64_t reference_anchor = last_dts != AV_NOPTS_VALUE ? last_dts : last_pts;
+
+    if (b->needs_timestamp_rebase &&
+        b->needs_timestamp_rebase[out_idx] &&
+        incoming_anchor != AV_NOPTS_VALUE &&
+        reference_anchor != AV_NOPTS_VALUE) {
+        int64_t target = reference_anchor + packet_step_for_stream(b, out_idx, pkt);
+        int64_t delta = target - incoming_anchor;
+        offset += delta;
+        b->stream_ts_offset[out_idx] = offset;
+        b->needs_timestamp_rebase[out_idx] = 0;
+        fprintf(stderr,
+                "[broadcaster] timestamp rebase stream=%d delta=%lld last=%lld incoming=%lld\n",
+                out_idx,
+                (long long)delta,
+                (long long)reference_anchor,
+                (long long)incoming_anchor);
+    } else if (b->needs_timestamp_rebase) {
+        b->needs_timestamp_rebase[out_idx] = 0;
+    }
+
+    if (offset != 0) {
+        if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += offset;
+        if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += offset;
+    }
+
+    if (last_dts != AV_NOPTS_VALUE &&
+        pkt->dts != AV_NOPTS_VALUE &&
+        pkt->dts <= last_dts) {
+        int64_t bump = (last_dts + 1) - pkt->dts;
+        pkt->dts += bump;
+        if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += bump;
+        if (b->stream_ts_offset) b->stream_ts_offset[out_idx] += bump;
+    } else if (last_pts != AV_NOPTS_VALUE &&
+               pkt->pts != AV_NOPTS_VALUE &&
+               pkt->pts <= last_pts) {
+        int64_t bump = (last_pts + 1) - pkt->pts;
+        pkt->pts += bump;
+        if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += bump;
+        if (b->stream_ts_offset) b->stream_ts_offset[out_idx] += bump;
+    }
+}
 
 static void copy_str(char **dst, const char *src) {
     if (!src) { *dst = NULL; return; }
@@ -154,24 +240,142 @@ static void ring_append(BufferBroadcaster *b, const uint8_t *buf, size_t len) {
     if (b->ring_size > b->ring_capacity) b->ring_size = b->ring_capacity;
 }
 
+static void copy_ring_snapshot(BufferBroadcaster *b, uint8_t *dst) {
+    if (!b || !dst || !b->ring || b->ring_size == 0) return;
+    if (b->ring_size < b->ring_capacity) {
+        memcpy(dst, b->ring, b->ring_size);
+        return;
+    }
+
+    size_t first_len = b->ring_capacity - b->ring_head;
+    memcpy(dst, b->ring + b->ring_head, first_len);
+    if (b->ring_head > 0) {
+        memcpy(dst + first_len, b->ring, b->ring_head);
+    }
+}
+
+static size_t find_packet_alignment(const uint8_t *buf, size_t len) {
+    if (!buf || len < MPEGTS_PACKET_SIZE * 3) return SIZE_MAX;
+
+    size_t max_offset = len < MPEGTS_PACKET_SIZE ? len : MPEGTS_PACKET_SIZE;
+    for (size_t offset = 0; offset < max_offset; offset++) {
+        int synced = 1;
+        for (int i = 0; i < REPLAY_SYNC_PROBE_PACKETS; i++) {
+            size_t idx = offset + (size_t)i * MPEGTS_PACKET_SIZE;
+            if (idx >= len) break;
+            if (buf[idx] != 0x47) {
+                synced = 0;
+                break;
+            }
+        }
+        if (synced) return offset;
+    }
+
+    return SIZE_MAX;
+}
+
+static int packet_pid(const uint8_t *pkt) {
+    return ((pkt[1] & 0x1f) << 8) | pkt[2];
+}
+
+static int packet_has_random_access(const uint8_t *pkt) {
+    if (!pkt || pkt[0] != 0x47) return 0;
+    if ((pkt[1] & 0x40) == 0) return 0;
+
+    int adaptation_control = (pkt[3] >> 4) & 0x3;
+    if (adaptation_control != 2 && adaptation_control != 3) return 0;
+
+    int adaptation_length = pkt[4];
+    if (adaptation_length < 1 || adaptation_length > 182) return 0;
+
+    uint8_t flags = pkt[5];
+    return (flags & 0x40) != 0;
+}
+
+static size_t aligned_tail_offset(const uint8_t *buf, size_t len, size_t target) {
+    if (!buf || len == 0 || target >= len) return 0;
+    size_t align = find_packet_alignment(buf + target, len - target);
+    if (align == SIZE_MAX) return target;
+    return target + align;
+}
+
+static size_t compute_replay_offset(const uint8_t *buf, size_t len) {
+    if (!buf || len <= REPLAY_FALLBACK_BYTES) return 0;
+
+    size_t fallback = aligned_tail_offset(
+        buf,
+        len,
+        len > REPLAY_FALLBACK_BYTES ? len - REPLAY_FALLBACK_BYTES : 0
+    );
+
+    size_t scan_start = len > REPLAY_SCAN_BYTES ? len - REPLAY_SCAN_BYTES : 0;
+    size_t scan_align = find_packet_alignment(buf + scan_start, len - scan_start);
+    if (scan_align == SIZE_MAX) {
+        return fallback;
+    }
+    scan_start += scan_align;
+
+    size_t packet_count = (len - scan_start) / MPEGTS_PACKET_SIZE;
+    if (packet_count == 0) {
+        return fallback;
+    }
+
+    int64_t keyframe_packet = -1;
+    for (int64_t i = (int64_t)packet_count - 1; i >= 0; i--) {
+        const uint8_t *pkt = buf + scan_start + (size_t)i * MPEGTS_PACKET_SIZE;
+        if (packet_has_random_access(pkt)) {
+            keyframe_packet = i;
+            break;
+        }
+    }
+    if (keyframe_packet < 0) {
+        return fallback;
+    }
+
+    int64_t start_packet = keyframe_packet;
+    int64_t lookback_packets = (int64_t)(REPLAY_PAT_LOOKBACK_BYTES / MPEGTS_PACKET_SIZE);
+    int64_t min_packet = keyframe_packet - lookback_packets;
+    if (min_packet < 0) min_packet = 0;
+
+    for (int64_t i = keyframe_packet; i >= min_packet; i--) {
+        const uint8_t *pkt = buf + scan_start + (size_t)i * MPEGTS_PACKET_SIZE;
+        if (packet_pid(pkt) == 0) {
+            start_packet = i;
+            break;
+        }
+    }
+
+    return scan_start + (size_t)start_packet * MPEGTS_PACKET_SIZE;
+}
+
 // Deliver the ring contents in chronological order to a single sink. Used
 // at sink-attach time to replay recent PAT/PMT/keyframe so mpv can decode
 // from byte zero instead of waiting for the next keyframe.
 static void ring_replay_to(BufferBroadcaster *b, BufferSinkCallbacks cb) {
     if (!cb.on_bytes || !b->ring || b->ring_size == 0) return;
-    if (b->ring_size < b->ring_capacity) {
-        // Ring hasn't wrapped yet — bytes 0..ring_size are valid in order.
-        cb.on_bytes(cb.ctx, b->ring, b->ring_size);
+    uint8_t *snapshot = (uint8_t *)malloc(b->ring_size);
+    if (!snapshot) {
+        if (b->ring_size < b->ring_capacity) {
+            cb.on_bytes(cb.ctx, b->ring, b->ring_size);
+            return;
+        }
+
+        size_t first_len = b->ring_capacity - b->ring_head;
+        if (first_len > 0) {
+            cb.on_bytes(cb.ctx, b->ring + b->ring_head, first_len);
+        }
+        if (b->ring_head > 0) {
+            cb.on_bytes(cb.ctx, b->ring, b->ring_head);
+        }
         return;
     }
-    // Ring full — oldest byte is at ring_head, newest at ring_head-1.
-    size_t first_len = b->ring_capacity - b->ring_head;
-    if (first_len > 0) {
-        cb.on_bytes(cb.ctx, b->ring + b->ring_head, first_len);
+
+    copy_ring_snapshot(b, snapshot);
+    size_t replay_offset = compute_replay_offset(snapshot, b->ring_size);
+    if (replay_offset < b->ring_size) {
+        cb.on_bytes(cb.ctx, snapshot + replay_offset, b->ring_size - replay_offset);
     }
-    if (b->ring_head > 0) {
-        cb.on_bytes(cb.ctx, b->ring, b->ring_head);
-    }
+    free(snapshot);
 }
 
 // Called from worker thread. Stores bytes in the replay ring AND fans
@@ -296,7 +500,24 @@ static int build_output(BufferBroadcaster *b, char *error, size_t error_size) {
         b->stream_mapping[i] = out_s->index;
     }
 
+    b->output_stream_count = (int)b->out_ctx->nb_streams;
+    b->stream_ts_offset = (int64_t *)av_calloc((size_t)b->output_stream_count, sizeof(*b->stream_ts_offset));
+    b->last_written_dts = (int64_t *)av_calloc((size_t)b->output_stream_count, sizeof(*b->last_written_dts));
+    b->last_written_pts = (int64_t *)av_calloc((size_t)b->output_stream_count, sizeof(*b->last_written_pts));
+    b->last_written_duration = (int64_t *)av_calloc((size_t)b->output_stream_count, sizeof(*b->last_written_duration));
+    b->needs_timestamp_rebase = (uint8_t *)av_calloc((size_t)b->output_stream_count, sizeof(*b->needs_timestamp_rebase));
+    if (!b->stream_ts_offset || !b->last_written_dts || !b->last_written_pts ||
+        !b->last_written_duration || !b->needs_timestamp_rebase) {
+        snprintf(error, error_size, "timestamp state alloc failed");
+        return -1;
+    }
+    for (int i = 0; i < b->output_stream_count; i++) {
+        b->last_written_dts[i] = AV_NOPTS_VALUE;
+        b->last_written_pts[i] = AV_NOPTS_VALUE;
+    }
+
     AVDictionary *hdr_opts = NULL;
+    av_dict_set(&hdr_opts, "mpegts_flags", "pat_pmt_at_frames", 0);
     // mpegts ignores most options; this is harmless for future use.
     rc = avformat_write_header(b->out_ctx, &hdr_opts);
     av_dict_free(&hdr_opts);
@@ -335,10 +556,23 @@ static int open_input_with_options(BufferBroadcaster *b, char *error, size_t err
     // generous defaults (1000).
     av_dict_set_int(&opts, "seg_max_retry", 5, 0);
 
+    AVFormatContext *ctx = avformat_alloc_context();
+    if (!ctx) {
+        av_dict_free(&opts);
+        snprintf(error, error_size, "avformat_alloc_context failed");
+        return AVERROR(ENOMEM);
+    }
+    ctx->interrupt_callback.callback = input_interrupt_cb;
+    ctx->interrupt_callback.opaque = b;
+
+    b->in_ctx = ctx;
     int rc = avformat_open_input(&b->in_ctx, b->input_url, NULL, &opts);
     av_dict_free(&opts);
     if (rc < 0) {
         format_error(rc, error, error_size);
+        // Per libavformat docs, avformat_open_input frees a user-supplied
+        // context and NULLs the pointer on failure.
+        b->in_ctx = NULL;
         return rc;
     }
 
@@ -429,15 +663,24 @@ static void *worker_main(void *arg) {
             AVStream *out_s = b->out_ctx->streams[out_idx];
 
             // Rescale timestamps from input's time_base to the output
-            // stream. After a reopen the input's PTS origin may jump
-            // forward — mpegts downstream tolerates this (mpv treats it
-            // as a discontinuity and resyncs) so we don't bother
-            // synthesising an offset here.
+            // stream, then rebase after any reopen so the output muxer
+            // continues to see strictly increasing DTS.
             av_packet_rescale_ts(pkt, in_s->time_base, out_s->time_base);
+            ensure_monotonic_timestamps(b, pkt, out_idx);
             pkt->stream_index = out_idx;
             pkt->pos = -1;
 
             int werr = av_interleaved_write_frame(b->out_ctx, pkt);
+            if (werr >= 0 &&
+                out_idx >= 0 &&
+                out_idx < b->output_stream_count &&
+                b->last_written_dts &&
+                b->last_written_pts &&
+                b->last_written_duration) {
+                b->last_written_dts[out_idx] = pkt->dts;
+                b->last_written_pts[out_idx] = pkt->pts;
+                b->last_written_duration[out_idx] = packet_step_for_stream(b, out_idx, pkt);
+            }
             av_packet_unref(pkt);
             if (werr < 0) {
                 // Muxer error — our own pipeline, not the upstream. Not
@@ -498,6 +741,9 @@ static void *worker_main(void *arg) {
                     // Escape the outer loop too.
                     goto fatal;
                 }
+                if (b->needs_timestamp_rebase) {
+                    memset(b->needs_timestamp_rebase, 1, (size_t)b->output_stream_count);
+                }
                 fprintf(stderr, "[broadcaster] reopen OK — resuming\n");
                 reopened = 1;
                 break;
@@ -545,17 +791,9 @@ BufferBroadcaster *buffer_broadcaster_create(const char *input_url,
         return NULL;
     }
 
-    // Ensure network init + install our log callback once. Install it
-    // even if the caller is reusing the module, since AVFormatContext's
-    // per-open errors only surface through the log callback (the return
-    // code tells us a number; the *why* comes through av_log).
-    static int net_inited = 0;
-    if (!net_inited) {
-        avformat_network_init();
-        av_log_set_level(AV_LOG_INFO);
-        av_log_set_callback(buffer_av_log);
-        net_inited = 1;
-    }
+    // Ensure network init + log callback are installed once. Per-open libav
+    // failures often surface only through av_log, so keep the callback on.
+    pthread_once(&s_global_init_once, broadcaster_global_init);
 
     BufferBroadcaster *b = (BufferBroadcaster *)calloc(1, sizeof(*b));
     if (!b) { snprintf(error, error_size, "calloc failed"); return NULL; }
@@ -609,14 +847,27 @@ BufferBroadcaster *buffer_broadcaster_create(const char *input_url,
 }
 
 int buffer_broadcaster_add_sink(BufferBroadcaster *b, BufferSinkCallbacks cb) {
+    return buffer_broadcaster_add_sink_with_flags(
+        b,
+        cb,
+        BUFFER_BROADCASTER_SINK_FLAG_REPLAY_RECENT
+    );
+}
+
+int buffer_broadcaster_add_sink_with_flags(BufferBroadcaster *b,
+                                           BufferSinkCallbacks cb,
+                                           uint32_t flags) {
     if (!b) return 0;
+    if (!cb.on_bytes) return 0;
     int assigned = 0;
     pthread_mutex_lock(&b->sinks_mutex);
     // Replay ring BEFORE marking the sink alive — that way `write_to_sinks`
     // won't double-deliver the current chunk. This blocks the worker
     // thread if it's trying to write; replay is fast (memcpy + socket
     // send) so the stall is brief.
-    ring_replay_to(b, cb);
+    if (flags & BUFFER_BROADCASTER_SINK_FLAG_REPLAY_RECENT) {
+        ring_replay_to(b, cb);
+    }
     for (int i = 0; i < MAX_SINKS; i++) {
         if (!b->sinks[i].alive) {
             b->sinks[i].alive = 1;
@@ -720,6 +971,11 @@ void buffer_broadcaster_free(BufferBroadcaster *b) {
         avformat_close_input(&b->in_ctx);
     }
     free(b->stream_mapping);
+    av_freep(&b->stream_ts_offset);
+    av_freep(&b->last_written_dts);
+    av_freep(&b->last_written_pts);
+    av_freep(&b->last_written_duration);
+    av_freep(&b->needs_timestamp_rebase);
     free(b->input_url);
     free(b->user_agent);
     free(b->referer);
