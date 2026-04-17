@@ -271,10 +271,10 @@ private struct SportEventCard: View {
         }
     }
 
-    private func setReminder(for channel: Channel) {
-        guard let playlistID = activePlaylistID else { return }
-        // Create a synthetic EPGProgram to use with the existing reminder system
-        let program = EPGProgram(
+    /// Synthetic EPGProgram used for reminder + recording integrations.
+    /// ESPN scoreboards only give a start time, so we assume a 3-hour window.
+    private func syntheticProgram(for channel: Channel) -> EPGProgram {
+        EPGProgram(
             id: "sport_\(event.id)",
             channelID: channel.epgChannelID ?? channel.id,
             title: event.displayTitle,
@@ -282,6 +282,11 @@ private struct SportEventCard: View {
             start: event.startDate,
             end: event.startDate.addingTimeInterval(3 * 3600)
         )
+    }
+
+    private func setReminder(for channel: Channel) {
+        guard let playlistID = activePlaylistID else { return }
+        let program = syntheticProgram(for: channel)
         Task { @MainActor in
             let scheduled = await notificationManager.scheduleReminder(
                 playlistID: playlistID,
@@ -295,6 +300,27 @@ private struct SportEventCard: View {
                 channel: channel,
                 leadMinutes: 5,
                 scheduled: scheduled
+            )
+        }
+    }
+
+    private func record(channel: Channel) {
+        guard let playlistID = activePlaylistID else { return }
+        let program = syntheticProgram(for: channel)
+        switch event.status {
+        case .live, .halftime:
+            Task { @MainActor in
+                _ = await RecordingManager.shared.startLiveRecording(
+                    playlistID: playlistID,
+                    channel: channel,
+                    program: program
+                )
+            }
+        default:
+            _ = RecordingManager.shared.schedule(
+                playlistID: playlistID,
+                channel: channel,
+                program: program
             )
         }
     }
@@ -393,6 +419,10 @@ private struct SportEventCard: View {
                 onSetReminder: { channel in
                     showStreams = false
                     setReminder(for: channel)
+                },
+                onRecord: { channel in
+                    showStreams = false
+                    record(channel: channel)
                 }
             )
         }
@@ -506,6 +536,31 @@ private struct StreamsPopover: View {
     let isPlayable: Bool
     let onChannelSelected: (Channel) -> Void
     let onSetReminder: (Channel) -> Void
+    let onRecord: (Channel) -> Void
+
+    /// ESPN scoreboards only surface a start time. We assume a 3-hour window
+    /// so the user can see roughly when the broadcast will wrap — matches the
+    /// duration used for the reminder + recording program window.
+    private var timeRange: String {
+        let end = event.startDate.addingTimeInterval(3 * 3600)
+        let cal = Calendar.current
+        let timeFmt = DateFormatter()
+        timeFmt.amSymbol = "am"
+        timeFmt.pmSymbol = "pm"
+        timeFmt.dateFormat = "h:mma"
+
+        let dayPrefix: String
+        if cal.isDateInToday(event.startDate) {
+            dayPrefix = "Today"
+        } else if cal.isDateInTomorrow(event.startDate) {
+            dayPrefix = "Tomorrow"
+        } else {
+            let dayFmt = DateFormatter()
+            dayFmt.dateFormat = "EEE d MMM"
+            dayPrefix = dayFmt.string(from: event.startDate)
+        }
+        return "\(dayPrefix) · \(timeFmt.string(from: event.startDate)) – \(timeFmt.string(from: end))"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -524,6 +579,15 @@ private struct StreamsPopover: View {
                             .font(.system(size: 11))
                             .foregroundStyle(.tertiary)
                     }
+                }
+                HStack(spacing: 5) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                    Text(timeRange)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
             }
             .padding(.horizontal, 14)
@@ -547,7 +611,8 @@ private struct StreamsPopover: View {
                                 isFavorite: favoriteIDs.contains(match.channel.id),
                                 isPlayable: isPlayable,
                                 onPlay: { onChannelSelected(match.channel) },
-                                onRemind: { onSetReminder(match.channel) }
+                                onRemind: { onSetReminder(match.channel) },
+                                onRecord: { onRecord(match.channel) }
                             )
                         }
                     }
@@ -569,6 +634,7 @@ private struct StreamMatchRow: View {
     let isPlayable: Bool
     let onPlay: () -> Void
     let onRemind: () -> Void
+    let onRecord: () -> Void
 
     @State private var hovered = false
 
@@ -605,6 +671,16 @@ private struct StreamMatchRow: View {
             Spacer()
 
             confidenceDots(score: match.score)
+
+            Button {
+                onRecord()
+            } label: {
+                Image(systemName: "record.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+            .buttonStyle(.borderless)
+            .help(isPlayable ? "Record now" : "Schedule recording")
 
             if isPlayable {
                 Button {

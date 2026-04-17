@@ -210,12 +210,74 @@ private struct ReminderRow: View {
             if let channel {
                 AddToMultiViewMenuItem(channel: channel)
             }
+            if let channel, reminder.programEnd > Date() {
+                recordingMenuItems(channel: channel)
+            }
             Button(role: .destructive, action: onCancel) {
                 Label("Cancel Reminder", systemImage: "bell.slash")
             }
         }
         .onTapGesture {
             onPlay()
+        }
+    }
+
+    /// Reminder rows carry enough program metadata to build an EPGProgram and
+    /// hand it to RecordingManager via the same path the EPG grid uses.
+    private func reminderProgram() -> EPGProgram {
+        EPGProgram(
+            id: reminder.programID,
+            channelID: reminder.channelID,
+            title: reminder.programTitle,
+            description: reminder.programDescription,
+            start: reminder.programStart,
+            end: reminder.programEnd
+        )
+    }
+
+    @ViewBuilder
+    private func recordingMenuItems(channel: Channel) -> some View {
+        let recorder = RecordingManager.shared
+        let existing = recorder.recordings.first { rec in
+            rec.programID == reminder.programID
+                && rec.channelID == channel.id
+                && (rec.status == .scheduled || rec.status == .recording)
+        }
+
+        if let existing {
+            let isRec = existing.status == .recording
+            Button {
+                recorder.cancel(id: existing.id)
+            } label: {
+                Label(
+                    isRec ? "Stop Recording" : "Cancel Scheduled Recording",
+                    systemImage: isRec ? "stop.circle.fill" : "xmark.circle"
+                )
+            }
+        } else if reminder.programStart <= Date() {
+            // Program is already airing — kick off a live recording immediately.
+            Button {
+                let program = reminderProgram()
+                Task { @MainActor in
+                    _ = await recorder.startLiveRecording(
+                        playlistID: reminder.playlistID,
+                        channel: channel,
+                        program: program
+                    )
+                }
+            } label: {
+                Label("Record Now", systemImage: "record.circle")
+            }
+        } else {
+            Button {
+                _ = recorder.schedule(
+                    playlistID: reminder.playlistID,
+                    channel: channel,
+                    program: reminderProgram()
+                )
+            } label: {
+                Label("Record This Program", systemImage: "record.circle")
+            }
         }
     }
 }

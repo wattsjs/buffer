@@ -57,6 +57,13 @@ actor ESPNClient {
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 return []
             }
+            // Golf tournaments don't provide per-round data in the scoreboard
+            // feed, so expand each tournament into one SportEvent per round
+            // using ESPN's leaderboard endpoint (which surfaces tee times and
+            // round-level completion state across all competitors).
+            if league.sport == .golf {
+                return await expandGolfScoreboard(data: data, league: league)
+            }
             return filterStaleLookbackEvents(parse(data: data, league: league))
         } catch {
             print("[ESPN] Failed to fetch \(league.shortName): \(error.localizedDescription)")
@@ -338,6 +345,177 @@ actor ESPNClient {
             tournamentName: tournamentName,
             leader: nil
         )
+    }
+
+    // MARK: - Golf expansion (per-round events)
+
+    /// Enumerate the tournaments in a golf scoreboard response and fan out to
+    /// the leaderboard endpoint for each, so we can surface per-round start
+    /// times and round-level completion state.
+    private func expandGolfScoreboard(data: Data, league: League) async -> [SportEvent] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let events = json["events"] as? [[String: Any]] else {
+            return []
+        }
+
+        let ids: [String] = events.compactMap { $0["id"] as? String }
+
+        var all: [SportEvent] = []
+        await withTaskGroup(of: [SportEvent].self) { group in
+            for id in ids {
+                group.addTask { [self] in
+                    await self.fetchGolfEventRounds(eventID: id, league: league)
+                }
+            }
+            for await rounds in group {
+                all.append(contentsOf: rounds)
+            }
+        }
+        return all
+    }
+
+    /// Fetch the leaderboard for a single golf event and expand it into one
+    /// SportEvent per round.
+    private func fetchGolfEventRounds(eventID: String, league: League) async -> [SportEvent] {
+        guard let url = URL(string: "https://site.web.api.espn.com/apis/site/v2/sports/golf/leaderboard?league=\(league.slug)&event=\(eventID)") else {
+            return []
+        }
+        do {
+            let (data, response) = try await session.data(from: url)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let events = json["events"] as? [[String: Any]],
+                  let ev = events.first else {
+                return []
+            }
+            return buildGolfRounds(from: ev, league: league)
+        } catch {
+            print("[ESPN] Leaderboard fetch failed for \(eventID): \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    private func buildGolfRounds(from ev: [String: Any], league: League) -> [SportEvent] {
+        guard let id = ev["id"] as? String,
+              let name = ev["name"] as? String else { return [] }
+        let shortName = (ev["shortName"] as? String) ?? name
+
+        let comp = (ev["competitions"] as? [[String: Any]])?.first
+        let competitors = (comp?["competitors"] as? [[String: Any]]) ?? []
+        let compStatus = comp?["status"] as? [String: Any]
+        let compStatusType = compStatus?["type"] as? [String: Any]
+        let compState = (compStatusType?["state"] as? String) ?? "pre"
+        let compPeriod = (compStatus?["period"] as? Int) ?? 1
+
+        let broadcasts = parseBroadcasts(comp)
+        let courses = ev["courses"] as? [[String: Any]]
+        let venue = (courses?.first?["name"] as? String)
+            ?? ((comp?["venue"] as? [String: Any])?["fullName"] as? String)
+
+        // Aggregate per-round tee times and scoring progress across all
+        // competitors. Earliest tee time = round start; we also track how
+        // many competitors have a posted score to detect an in-progress round
+        // that hasn't moved ESPN's overall status forward yet.
+        struct RoundAgg { var earliestTee: Date?; var scored: Int; var total: Int }
+        var byPeriod: [Int: RoundAgg] = [:]
+        var maxPeriod = 0
+        for c in competitors {
+            let ls = c["linescores"] as? [[String: Any]] ?? []
+            for line in ls {
+                guard let period = line["period"] as? Int else { continue }
+                maxPeriod = max(maxPeriod, period)
+                var agg = byPeriod[period] ?? RoundAgg(earliestTee: nil, scored: 0, total: 0)
+                agg.total += 1
+                if line["value"] != nil { agg.scored += 1 }
+                if let teeStr = line["teeTime"] as? String {
+                    let t = parseDate(teeStr)
+                    if let cur = agg.earliestTee {
+                        agg.earliestTee = min(cur, t)
+                    } else {
+                        agg.earliestTee = t
+                    }
+                }
+                byPeriod[period] = agg
+            }
+        }
+
+        guard maxPeriod > 0 else { return [] }
+
+        let leader = extractGolfLeader(competitors: competitors)
+        let fallbackStart = parseDate((ev["date"] as? String) ?? "")
+
+        var out: [SportEvent] = []
+        for period in 1...maxPeriod {
+            let agg = byPeriod[period] ?? RoundAgg(earliestTee: nil, scored: 0, total: 0)
+            let startDate = agg.earliestTee
+                ?? fallbackStart.addingTimeInterval(Double(period - 1) * 86400)
+
+            let status: EventStatus
+            let detailText: String
+            if period < compPeriod {
+                status = .final_(detail: "Round \(period) Complete")
+                detailText = "Round \(period) Complete"
+            } else if period == compPeriod {
+                switch compState {
+                case "in":
+                    status = .live(detail: "R\(period) in progress")
+                    detailText = "Round \(period) in progress"
+                case "post":
+                    status = .final_(detail: "R\(period) Play Complete")
+                    detailText = "Round \(period) Play Complete"
+                default:
+                    status = .scheduled
+                    detailText = "Round \(period)"
+                }
+            } else {
+                status = .scheduled
+                detailText = "Round \(period)"
+            }
+
+            let roundLeader: LeaderInfo? = (status.isLive || status.isFinished) ? leader : nil
+
+            out.append(SportEvent(
+                id: "\(league.id)_\(id)_r\(period)",
+                sport: league.sport,
+                league: league,
+                title: "\(name) — Round \(period)",
+                shortTitle: "R\(period) \(shortName)",
+                homeTeam: nil,
+                awayTeam: nil,
+                startDate: startDate,
+                status: status,
+                broadcast: broadcasts,
+                venue: venue,
+                detail: detailText,
+                tournamentName: name,
+                leader: roundLeader
+            ))
+        }
+        return out
+    }
+
+    /// Leader across the field — first competitor by sort order with a display
+    /// score. Leaderboard responses wrap score as `{ displayValue, value }`.
+    private func extractGolfLeader(competitors: [[String: Any]]) -> LeaderInfo? {
+        let sorted = competitors.sorted { a, b in
+            let ao = (a["sortOrder"] as? Int) ?? (a["order"] as? Int) ?? Int.max
+            let bo = (b["sortOrder"] as? Int) ?? (b["order"] as? Int) ?? Int.max
+            return ao < bo
+        }
+        guard let first = sorted.first,
+              let athlete = first["athlete"] as? [String: Any],
+              let name = (athlete["displayName"] as? String)
+                ?? (athlete["shortName"] as? String) else {
+            return nil
+        }
+        let scoreDisplay: String? = {
+            if let dict = first["score"] as? [String: Any],
+               let dv = dict["displayValue"] as? String, !dv.isEmpty { return dv }
+            if let str = first["score"] as? String, !str.isEmpty { return str }
+            return nil
+        }()
+        guard let score = scoreDisplay else { return nil }
+        return LeaderInfo(name: name, score: score)
     }
 
     // MARK: - Session expansion (F1 / NASCAR)
