@@ -180,10 +180,10 @@ final class MPVPlayer {
         timePos = 0
         duration = 0
         isSeekable = false
-        if autoplay {
-            setFlag("pause", false)
-            isPlaying = true
-        }
+        cacheSeconds = 0
+        isBuffering = false
+        setFlag("pause", !autoplay)
+        isPlaying = autoplay
         isLoading = true
         currentURL = url
 
@@ -204,10 +204,8 @@ final class MPVPlayer {
         }
 
         let path = url.absoluteString
-        command(handle, ["loadfile", path])
-        if autoplay {
-            setFlag("pause", false)
-        }
+        command(handle, ["loadfile", path, "replace"])
+        setFlag("pause", !autoplay)
     }
 
     func seek(to seconds: Double) {

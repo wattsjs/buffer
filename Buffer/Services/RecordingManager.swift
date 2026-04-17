@@ -308,7 +308,11 @@ final class RecordingManager {
 
     /// True when a live recording is active for the given channel.
     func isLiveRecording(forChannel channelURL: URL) -> Bool {
-        StreamProxy.shared.hasRecordingFor(channel: channelURL)
+        recordings.contains {
+            $0.source == .live &&
+            $0.status == .recording &&
+            $0.streamURL == channelURL
+        }
     }
 
     /// Thread-safe set of currently-recording IDs. Mirrors
@@ -805,4 +809,3 @@ final class RecordingManager {
         }
     }
 }
-

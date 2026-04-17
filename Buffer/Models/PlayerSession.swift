@@ -99,7 +99,11 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
     @ObservationIgnored private var firstFailureAt: Date?
     @ObservationIgnored private var playbackWatchdog: Task<Void, Never>?
+    @ObservationIgnored private var stallWatchdog: Task<Void, Never>?
     @ObservationIgnored private var playbackMode: PlaybackMode = .live
+    @ObservationIgnored private var lastObservedTimePos: Double = 0
+    @ObservationIgnored private var lastPlaybackProgressAt: Date?
+    @ObservationIgnored private var expectedStoppedEndFiles: Int = 0
 
     /// After this long of continuous reconnect failures without a single
     /// successful `FILE_LOADED`, surface an error to the user. The reconnect
@@ -110,11 +114,22 @@ final class PlayerSlot: Identifiable {
     /// Seconds of continuous playback required before we consider the stream
     /// "healthy" and reset the reconnect backoff counter.
     @ObservationIgnored private let healthyPlaybackSeconds: Double = 5
+    /// If playback keeps claiming to be alive but `timePos` does not advance
+    /// for longer than these windows, treat it as a dead player and reload the
+    /// live source. This covers hangs that never surface as `END_FILE`.
+    @ObservationIgnored private let stalledWhileLoadingSeconds: TimeInterval = 15
+    @ObservationIgnored private let stalledWhileBufferingSeconds: TimeInterval = 12
+    @ObservationIgnored private let stalledWhilePlayingSeconds: TimeInterval = 6
+    @ObservationIgnored private let playbackProgressEpsilon: Double = 0.25
 
     fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
         switch reason {
         case .stopped:
             // Initiated by us (new loadfile, teardown). Nothing to do.
+            if expectedStoppedEndFiles > 0 {
+                expectedStoppedEndFiles -= 1
+                return
+            }
             cancelReconnect()
             return
         case .eof, .error:
@@ -132,7 +147,7 @@ final class PlayerSlot: Identifiable {
         scheduleReconnect(reason: reason)
     }
 
-    private func scheduleReconnect(reason: MPVEndReason) {
+    private func scheduleReconnect(reason: MPVEndReason, immediate: Bool = false) {
         // Mark the start of a failure streak so we know when to give up
         // visibly. `firstFailureAt` is cleared on every successful playback
         // beyond `healthyPlaybackSeconds`.
@@ -146,8 +161,13 @@ final class PlayerSlot: Identifiable {
         // 0.25s, 0.5s, 1s, 2s, 4s, then capped at 5s. The first retry is
         // snappy so a single bad segment barely blips; later retries
         // breathe so we don't hammer a dead upstream.
-        let baseDelay = 0.25 * pow(2.0, Double(min(attempt, 5)))
-        let delay = min(baseDelay, 5.0)
+        let delay: Double
+        if immediate {
+            delay = 0
+        } else {
+            let baseDelay = 0.25 * pow(2.0, Double(min(attempt, 5)))
+            delay = min(baseDelay, 5.0)
+        }
 
         let failureAge = firstFailureAt.map { Date().timeIntervalSince($0) } ?? 0
         let shouldSurfaceError = failureAge >= fatalReconnectWindow
@@ -164,9 +184,16 @@ final class PlayerSlot: Identifiable {
             }
         }
 
+        playbackWatchdog?.cancel()
+        playbackWatchdog = nil
+        stallWatchdog?.cancel()
+        stallWatchdog = nil
+
         reconnectTask?.cancel()
         reconnectTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
+            if delay > 0 {
+                try? await Task.sleep(for: .seconds(delay))
+            }
             guard !Task.isCancelled, let self else { return }
             self.performReconnect()
         }
@@ -174,10 +201,12 @@ final class PlayerSlot: Identifiable {
 
     private func performReconnect() {
         guard playbackMode == .live else { return }
+        reconnectTask = nil
+        stopRecoveryTasks(resetFailureWindow: false)
         let url = freshProxiedURL()
+        noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(url, autoplay: true)
-        player.play()
-        armHealthyPlaybackWatchdog()
+        armRecoveryWatchdogs()
     }
 
     /// Watches timePos; once playback has advanced by `healthyPlaybackSeconds`
@@ -201,13 +230,85 @@ final class PlayerSlot: Identifiable {
         }
     }
 
-    func cancelReconnect() {
+    private func armStallWatchdog() {
+        stallWatchdog?.cancel()
+        lastObservedTimePos = player.timePos
+        lastPlaybackProgressAt = Date()
+
+        stallWatchdog = Task { @MainActor [weak self] in
+            while true {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self else { return }
+                guard self.playbackMode == .live else { return }
+
+                let currentTimePos = self.player.timePos
+                if currentTimePos - self.lastObservedTimePos >= self.playbackProgressEpsilon {
+                    self.lastObservedTimePos = currentTimePos
+                    self.lastPlaybackProgressAt = Date()
+                    continue
+                }
+
+                self.lastObservedTimePos = currentTimePos
+
+                if !self.player.isPlaying {
+                    self.lastPlaybackProgressAt = Date()
+                    continue
+                }
+
+                let threshold: TimeInterval
+                if self.player.isLoading {
+                    threshold = self.stalledWhileLoadingSeconds
+                } else if self.player.isBuffering {
+                    threshold = self.stalledWhileBufferingSeconds
+                } else {
+                    threshold = self.stalledWhilePlayingSeconds
+                }
+
+                let lastProgressAt = self.lastPlaybackProgressAt ?? Date()
+                if Date().timeIntervalSince(lastProgressAt) < threshold {
+                    continue
+                }
+
+                let reason: MPVEndReason = .error(
+                    code: 0,
+                    message: self.player.isBuffering || self.player.isLoading
+                        ? "playback stalled while buffering"
+                        : "playback stalled"
+                )
+                self.scheduleReconnect(reason: reason, immediate: true)
+                return
+            }
+        }
+    }
+
+    private func armRecoveryWatchdogs() {
+        armHealthyPlaybackWatchdog()
+        armStallWatchdog()
+    }
+
+    private func stopRecoveryTasks(resetFailureWindow: Bool) {
         reconnectTask?.cancel()
         reconnectTask = nil
         playbackWatchdog?.cancel()
         playbackWatchdog = nil
-        reconnectAttempt = 0
-        firstFailureAt = nil
+        stallWatchdog?.cancel()
+        stallWatchdog = nil
+        lastPlaybackProgressAt = nil
+
+        if resetFailureWindow {
+            reconnectAttempt = 0
+            firstFailureAt = nil
+        }
+    }
+
+    private func noteExpectedStopIfReplacingCurrentItem() {
+        if player.currentURL != nil {
+            expectedStoppedEndFiles += 1
+        }
+    }
+
+    func cancelReconnect() {
+        stopRecoveryTasks(resetFailureWindow: true)
     }
 
     init(channel: Channel, currentProgram: EPGProgram?) {
@@ -224,27 +325,29 @@ final class PlayerSlot: Identifiable {
 
     func loadInitialLive() {
         playbackMode = .live
-        cancelReconnect()
+        stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
-        player.loadURL(proxiedURL)
-        player.play()
+        noteExpectedStopIfReplacingCurrentItem()
+        player.loadURL(proxiedURL, autoplay: true)
+        armRecoveryWatchdogs()
     }
 
     func loadLive() {
         playbackMode = .live
-        cancelReconnect()
+        stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
         let url = freshProxiedURL()
+        noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(url, autoplay: true)
-        player.play()
+        armRecoveryWatchdogs()
     }
 
     func loadCatchup(_ url: URL) {
         playbackMode = .catchup
         cancelReconnect()
         player.clearReconnectingErrorMessage()
+        noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(url, autoplay: true)
-        player.play()
     }
 
     /// Mint a fresh proxy token for the current channel. Proxy URLs are
