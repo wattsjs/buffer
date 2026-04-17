@@ -26,8 +26,12 @@
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
 	<key>SUEnableInstallerLauncherService</key>
 	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>21600</integer>
 	<key>SUFeedURL</key>
 	<string>$(SPARKLE_FEED_URL)</string>
 	<key>SUPublicEDKey</key>
