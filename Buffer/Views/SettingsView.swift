@@ -950,6 +950,7 @@ private struct GeneralAppSettingsTab: View {
 private struct PlaybackSettingsTab: View {
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
     @AppStorage(BufferSetting.appStorageKey) private var bufferSeconds: Int = BufferSetting.default
+    @AppStorage(StreamProbeSetting.enabledKey) private var probeStreams: Bool = false
 
     var body: some View {
         Form {
@@ -968,6 +969,18 @@ private struct PlaybackSettingsTab: View {
                     }
                 }
                 Text("How many seconds mpv buffers ahead. Higher values reduce stutter but add more delay.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Stream Metadata") {
+                Toggle("Probe channels for codec, resolution, and FPS", isOn: $probeStreams)
+                    .onChange(of: probeStreams) { _, newValue in
+                        if !newValue {
+                            StreamProbeService.shared.clearAll()
+                        }
+                    }
+                Text("When channels appear in the sidebar or grid Buffer briefly opens each stream with libavformat to read metadata. Adds extra connections to your provider, so leave it off if you're tight on session limits.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

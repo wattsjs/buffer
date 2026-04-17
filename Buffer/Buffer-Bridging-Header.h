@@ -3,5 +3,6 @@
 
 #include "Services/BufferAVIO.h"
 #include "Services/BufferBroadcaster.h"
+#include "Services/BufferProbe.h"
 
 #endif

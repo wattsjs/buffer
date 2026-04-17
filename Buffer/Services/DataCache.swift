@@ -12,6 +12,11 @@ nonisolated enum DataCache {
         let programs: [String: [EPGProgram]]
     }
 
+    struct CachedProbes: Codable, Sendable {
+        let savedAt: Date
+        let probes: [String: StreamProbe]
+    }
+
     nonisolated private static func cacheDirectory() -> URL? {
         let fm = FileManager.default
         guard let base = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else {
@@ -58,6 +63,10 @@ nonisolated enum DataCache {
         cacheDirectory()?.appendingPathComponent("programs_\(key).json")
     }
 
+    nonisolated private static func probesURL(for key: String) -> URL? {
+        cacheDirectory()?.appendingPathComponent("probes_\(key).json")
+    }
+
     // MARK: - Channels
 
     nonisolated static func loadChannels(key: String) -> CachedChannels? {
@@ -85,6 +94,22 @@ nonisolated enum DataCache {
     nonisolated static func savePrograms(_ programs: [String: [EPGProgram]], key: String) {
         guard let url = programsURL(for: key) else { return }
         let payload = CachedPrograms(savedAt: Date(), programs: programs)
+        if let data = try? JSONEncoder.cacheEncoder.encode(payload) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    // MARK: - Stream probes
+
+    nonisolated static func loadProbes(key: String) -> CachedProbes? {
+        guard let url = probesURL(for: key),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        return try? JSONDecoder.cacheDecoder.decode(CachedProbes.self, from: data)
+    }
+
+    nonisolated static func saveProbes(_ probes: [String: StreamProbe], key: String) {
+        guard let url = probesURL(for: key) else { return }
+        let payload = CachedProbes(savedAt: Date(), probes: probes)
         if let data = try? JSONEncoder.cacheEncoder.encode(payload) {
             try? data.write(to: url, options: .atomic)
         }

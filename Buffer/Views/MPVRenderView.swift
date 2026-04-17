@@ -217,13 +217,15 @@ final class MPVPlayerLayer: CAOpenGLLayer {
             layer.displayScheduled = true
             DispatchQueue.main.async { [weak layer] in
                 guard let layer else { return }
-                guard !layer.torn else {
-                    layer.displayScheduled = false
-                    return
-                }
-                // Let Core Animation coalesce multiple mpv frame callbacks
-                // into one draw pass instead of forcing an immediate redraw
-                // on every callback.
+                // Clear the coalesce flag here rather than inside draw():
+                // during fullscreen transitions CoreAnimation can drop the
+                // draw pass for our layer, and if the flag is only reset in
+                // draw() it gets stuck at true and every subsequent mpv
+                // frame callback is dropped, freezing the video.
+                // CoreAnimation coalesces multiple setNeedsDisplay calls
+                // into one draw pass anyway.
+                layer.displayScheduled = false
+                guard !layer.torn else { return }
                 layer.setNeedsDisplay()
             }
         }, context: ptr)
@@ -248,8 +250,6 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         forLayerTime t: CFTimeInterval,
         displayTime ts: UnsafePointer<CVTimeStamp>?
     ) {
-        displayScheduled = false
-
         guard renderReady, !torn, let renderCtx = player?.renderContextHandle else {
             glClearColor(0, 0, 0, 1)
             glClear(GLbitfield(GL_COLOR_BUFFER_BIT))

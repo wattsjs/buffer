@@ -187,6 +187,10 @@ private struct RecentChannelCard: View {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .strokeBorder(Color.primary.opacity(isHovering ? 0.25 : 0.08), lineWidth: 1)
                 )
+                .overlay(alignment: .bottomLeading) {
+                    StreamProbeBadge(channelID: channel.id, style: .compact)
+                        .padding(6)
+                }
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(channel.name)
@@ -212,6 +216,8 @@ private struct RecentChannelCard: View {
         .buttonStyle(.plain)
         .help(channel.name)
         .onHover { isHovering = $0 }
+        .requestStreamProbe(for: channel)
+        .fadeIfStreamDead(channelID: channel.id)
         .contextMenu {
             Button(action: onTap) {
                 Label("Play Channel", systemImage: "play.fill")
@@ -389,96 +395,11 @@ private struct HomeLiveStreamsPopover: View {
     let onChannelSelected: (Channel) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(event.displayTitle)
-                    .font(.system(size: 14, weight: .semibold))
-                    .lineLimit(1)
-                Text(event.league.fullName)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-
-            Divider()
-
-            if matches.isEmpty {
-                Text("No matching streams found")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 24)
-            } else {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(matches) { match in
-                            HomeLiveStreamRow(
-                                match: match,
-                                isFavorite: favoriteIDs.contains(match.channel.id),
-                                onPlay: { onChannelSelected(match.channel) }
-                            )
-                        }
-                    }
-                    .padding(.vertical, 6)
-                    .padding(.horizontal, 8)
-                }
-                .frame(maxHeight: 300)
-            }
-        }
-        .frame(width: 320)
-    }
-}
-
-private struct HomeLiveStreamRow: View {
-    let match: StreamMatch
-    let isFavorite: Bool
-    let onPlay: () -> Void
-
-    @State private var hovered = false
-
-    var body: some View {
-        HStack(spacing: 10) {
-            ChannelLogoTile(channel: match.channel)
-                .frame(width: 28, height: 28)
-
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    Text(match.channel.name)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
-                    if isFavorite {
-                        Image(systemName: "heart.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.pink)
-                    }
-                }
-                if let title = match.programTitle, !title.isEmpty {
-                    Text(title)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            Spacer()
-
-            Button(action: onPlay) {
-                Image(systemName: "play.fill")
-                    .font(.system(size: 11))
-            }
-            .buttonStyle(.borderless)
-            .help("Play now")
-        }
-        .padding(.vertical, 5)
-        .padding(.horizontal, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(hovered ? Color.accentColor.opacity(0.08) : Color.clear)
+        StreamMatchesPopover(
+            event: event,
+            matches: matches,
+            favoriteIDs: favoriteIDs,
+            onPlay: onChannelSelected
         )
-        .contentShape(Rectangle())
-        .onHover { hovered = $0 }
-        .onTapGesture(perform: onPlay)
     }
 }

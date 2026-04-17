@@ -8,12 +8,14 @@ nonisolated struct ChannelSearchIndex: Sendable {
     let nameLower: String
     let group: String          // original channel group name (for display)
     let inSportsGroup: Bool
+    let isHidden: Bool         // channel belongs to a user-hidden group
     /// EPG titles already lowercased, sorted by start time.
     /// Only programs within a ±48h window are kept.
     let epgTitles: ContiguousArray<EPGTitle>
 
     struct EPGTitle: Sendable {
         let title: String       // original casing for display
+        let description: String // original casing, trimmed for display
         let titleLower: ContiguousArray<UInt8>  // UTF-8 bytes for fast search
         let descLower: ContiguousArray<UInt8>   // description UTF-8 bytes
         let start: Date
@@ -28,6 +30,10 @@ nonisolated struct StreamMatch: Identifiable, Sendable {
     let score: Double
     let reason: String         // channel group / folder
     let programTitle: String?  // matched EPG program title, if any
+    let programDescription: String?
+    let programStart: Date?
+    let programEnd: Date?
+    let isHidden: Bool         // from a user-hidden group (fallback only)
 }
 
 /// High-performance sport event → channel matcher.
@@ -53,7 +59,7 @@ nonisolated enum StreamMatcher {
         let horizon = Date().addingTimeInterval(48 * 3600)
 
         return channels.compactMap { channel in
-            if hiddenGroups.contains(channel.group) { return nil }
+            let isHidden = isGroupHidden(channel.group, hiddenGroups: hiddenGroups)
             let nameLower = normalise(channel.name)
             let groupLower = normalise(channel.group)
 
@@ -70,6 +76,7 @@ nonisolated enum StreamMatcher {
                             : desc
                         epgTitles.append(.init(
                             title: p.title,
+                            description: descPrefix,
                             titleLower: ContiguousArray(normalise(p.title).utf8),
                             descLower: ContiguousArray(normalise(descPrefix).utf8),
                             start: p.start,
@@ -84,9 +91,38 @@ nonisolated enum StreamMatcher {
                 nameLower: nameLower,
                 group: channel.group,
                 inSportsGroup: groupLower.contains("sport") || groupLower.contains("ppv"),
+                isHidden: isHidden,
                 epgTitles: epgTitles
             )
         }
+    }
+
+    private static func isGroupHidden(_ group: String, hiddenGroups: Set<String>) -> Bool {
+        guard !hiddenGroups.isEmpty else { return false }
+        if hiddenGroups.contains(group) { return true }
+
+        let path = splitGroupPath(group)
+        guard !path.isEmpty else { return false }
+
+        for hidden in hiddenGroups {
+            let hiddenPath = splitGroupPath(hidden)
+            guard !hiddenPath.isEmpty, hiddenPath.count <= path.count else { continue }
+            if Array(path.prefix(hiddenPath.count)) == hiddenPath {
+                return true
+            }
+            if path.contains(hiddenPath[0]) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func splitGroupPath(_ group: String) -> [String] {
+        group
+            .components(separatedBy: "|")
+            .flatMap { $0.components(separatedBy: "/") }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     // MARK: - Matching
@@ -137,26 +173,32 @@ nonisolated enum StreamMatcher {
                 queries: queries,
                 broadcastLower: broadcastLower,
                 contextKeywords: contextKeywords,
+                eventStart: event.startDate,
                 windowStart: windowStart,
-                windowEnd: windowEnd
+                windowEnd: windowEnd,
+                isTournament: isTournament
             )
             if score.value >= minimumScore {
                 matches.append(StreamMatch(
                     channel: index[i].channel,
                     score: score.value,
                     reason: score.reason,
-                    programTitle: score.programTitle
+                    programTitle: score.programTitle,
+                    programDescription: score.programDescription,
+                    programStart: score.programStart,
+                    programEnd: score.programEnd,
+                    isHidden: index[i].isHidden
                 ))
             }
         }
 
-        if matches.count > 10 {
-            matches.sort { $0.score > $1.score }
-            matches.removeSubrange(10...)
-        } else {
-            matches.sort { $0.score > $1.score }
-        }
-        return matches
+        // Prefer non-hidden matches. Only surface hidden-group matches when
+        // nothing else is available.
+        let visible = matches.filter { !$0.isHidden }
+        var result = visible.isEmpty ? matches : visible
+        result.sort { $0.score > $1.score }
+        if result.count > 10 { result.removeSubrange(10...) }
+        return result
     }
 
     // MARK: - Scoring
@@ -165,9 +207,26 @@ nonisolated enum StreamMatcher {
         var value: Double = 0
         var reason: String = ""
         var programTitle: String?
+        var programDescription: String?
+        var programStart: Date?
+        var programEnd: Date?
 
-        mutating func record(_ v: Double, _ r: String, program: String? = nil) {
-            if v > value { value = v; reason = r; programTitle = program }
+        mutating func record(
+            _ v: Double,
+            _ r: String,
+            program: String? = nil,
+            description: String? = nil,
+            start: Date? = nil,
+            end: Date? = nil
+        ) {
+            if v > value {
+                value = v
+                reason = r
+                programTitle = program
+                programDescription = description
+                programStart = start
+                programEnd = end
+            }
         }
     }
 
@@ -176,8 +235,10 @@ nonisolated enum StreamMatcher {
         queries: [SearchQuery],
         broadcastLower: [String],
         contextKeywords: [ContiguousArray<UInt8>],
+        eventStart: Date,
         windowStart: Date,
-        windowEnd: Date
+        windowEnd: Date,
+        isTournament: Bool
     ) -> Score {
         var best = Score()
         let entry = index[i]
@@ -187,7 +248,15 @@ nonisolated enum StreamMatcher {
         if !entry.epgTitles.isEmpty {
             for epg in entry.epgTitles {
                 guard epg.start < windowEnd && epg.end > windowStart else { continue }
+                let timeBonus = matchTimeBonus(
+                    eventStart: eventStart,
+                    epgStart: epg.start,
+                    isTournament: isTournament
+                )
+
                 for q in queries {
+                    guard q.target != .channelOnly else { continue }
+
                     if allBytesMatch(q.tokenBytes, in: epg.titleLower) {
                         // Single-token EPG title matches are ambiguous across
                         // sports (e.g. "giants" in both MLB and IPL cricket).
@@ -200,7 +269,14 @@ nonisolated enum StreamMatcher {
                             }
                             if !hasContext { continue }
                         }
-                        best.record(q.score + 50, groupLabel, program: epg.title)
+                        best.record(
+                            q.score + 50 + timeBonus,
+                            groupLabel,
+                            program: epg.title,
+                            description: epg.description,
+                            start: epg.start,
+                            end: epg.end
+                        )
                         break
                     }
                     // Description search: only for multi-token queries.
@@ -209,7 +285,14 @@ nonisolated enum StreamMatcher {
                         && !epg.descLower.isEmpty
                         && allBytesMatch(q.tokenBytes, in: epg.descLower)
                     {
-                        best.record(q.score + 35, groupLabel, program: epg.title)
+                        best.record(
+                            q.score + 35 + (timeBonus * 0.8),
+                            groupLabel,
+                            program: epg.title,
+                            description: epg.description,
+                            start: epg.start,
+                            end: epg.end
+                        )
                         break
                     }
                 }
@@ -219,6 +302,7 @@ nonisolated enum StreamMatcher {
 
         // ── Channel name ──
         for q in queries {
+            guard q.target != .epgOnly else { continue }
             if allTokensMatch(q.tokens, in: entry.nameLower) {
                 best.record(q.score, groupLabel)
                 break
@@ -362,13 +446,108 @@ nonisolated enum StreamMatcher {
         let tokenBytes: [ContiguousArray<UInt8>]  // pre-computed UTF-8 for fast matching
         let score: Double
         let label: String
+        let target: QueryTarget
 
-        init(tokens: [String], score: Double, label: String) {
+        init(
+            tokens: [String],
+            score: Double,
+            label: String,
+            target: QueryTarget = .both
+        ) {
             self.tokens = tokens
             self.tokenBytes = tokens.map { ContiguousArray($0.utf8) }
             self.score = score
             self.label = label
+            self.target = target
         }
+    }
+
+    private enum QueryTarget {
+        case both
+        case epgOnly
+        case channelOnly
+    }
+
+    private static func matchTimeBonus(
+        eventStart: Date,
+        epgStart: Date,
+        isTournament: Bool
+    ) -> Double {
+        let delta = abs(epgStart.timeIntervalSince(eventStart))
+        if isTournament {
+            if delta <= 30 * 60 { return 8 }
+            if delta <= 2 * 3600 { return 4 }
+            return 0
+        }
+
+        if delta <= 10 * 60 { return 20 }
+        if delta <= 30 * 60 { return 14 }
+        if delta <= 60 * 60 { return 8 }
+        if delta <= 120 * 60 { return 4 }
+        return 0
+    }
+
+    private static let broadcastStopWords: Set<String> = [
+        "tv", "network", "networks", "sports", "sport", "channel", "chs", "hd", "fhd", "uhd",
+        "plus", "live", "stream", "streaming", "network"
+    ]
+
+    private static func extractTokens(
+        from text: String,
+        minimumLength: Int = 3,
+        stopWords: Set<String> = trivialWords
+    ) -> [String] {
+        normalise(text)
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
+            .map { String($0) }
+            .map(normalise)
+            .filter {
+                let token = $0
+                return token.count >= minimumLength && !stopWords.contains(token)
+            }
+    }
+
+    private static func buildBroadcastQueries(_ broadcasts: [String]) -> [SearchQuery] {
+        var out: [SearchQuery] = []
+
+        for broadcast in broadcasts {
+            let tokens = extractTokens(
+                from: broadcast,
+                minimumLength: 2,
+                stopWords: broadcastStopWords
+            )
+            guard !tokens.isEmpty else { continue }
+
+            if tokens.count > 1 {
+                out.append(SearchQuery(
+                    tokens: Array(tokens.prefix(3)),
+                    score: 190,
+                    label: "Broadcast: \(broadcast)",
+                    target: .channelOnly
+                ))
+            }
+
+            if let first = tokens.first {
+                out.append(SearchQuery(
+                    tokens: [first],
+                    score: 120,
+                    label: "Broadcast token: \(first)",
+                    target: .channelOnly
+                ))
+            }
+
+            if let second = tokens.dropFirst().first {
+                out.append(SearchQuery(
+                    tokens: [second],
+                    score: 100,
+                    label: "Broadcast token: \(second)",
+                    target: .channelOnly
+                ))
+            }
+        }
+
+        return out
     }
 
     private static func buildQueries(for event: SportEvent) -> [SearchQuery] {
@@ -376,6 +555,25 @@ nonisolated enum StreamMatcher {
 
         var queries: [SearchQuery] = []
         queries.reserveCapacity(16)
+
+        let broadcastQueries = buildBroadcastQueries(event.broadcast)
+        queries.append(contentsOf: broadcastQueries)
+
+        // Prefer short, broadcast-friendly identifiers (e.g. "LAL vs BOS") when available.
+        if event.shortTitle != event.title {
+            let shortTokens = extractTokens(
+                from: event.shortTitle,
+                minimumLength: 2,
+                stopWords: broadcastStopWords
+            )
+            if !shortTokens.isEmpty {
+                queries.append(SearchQuery(
+                    tokens: Array(shortTokens.prefix(3)),
+                    score: 120,
+                    label: "Short title: \(event.shortTitle)"
+                ))
+            }
+        }
 
         let competitionTokens = competitionKeywords(for: event)
 
@@ -455,7 +653,7 @@ nonisolated enum StreamMatcher {
             }
         }
 
-        if teams.allSatisfy({ $0.displayName == "TBD" }) {
+        if teams.isEmpty || teams.allSatisfy({ $0.displayName == "TBD" }) {
             let titleTokens = normalise(event.title)
                 .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
                 .map(String.init)
@@ -463,6 +661,48 @@ nonisolated enum StreamMatcher {
             if !titleTokens.isEmpty {
                 queries.append(SearchQuery(tokens: Array(titleTokens.prefix(3)), score: 100,
                                            label: event.title))
+            }
+        }
+
+        if let venue = event.venue {
+            let venueTokens = extractTokens(
+                from: venue,
+                minimumLength: 4,
+                stopWords: trivialWords
+            )
+            if !venueTokens.isEmpty {
+                queries.append(SearchQuery(
+                    tokens: Array(venueTokens.prefix(2)),
+                    score: 80,
+                    label: "Venue: \(venue)",
+                    target: .epgOnly
+                ))
+            }
+        }
+
+        if let detail = event.detail {
+            let detailTokens = extractTokens(
+                from: detail,
+                minimumLength: 3,
+                stopWords: trivialWords
+            )
+            if !detailTokens.isEmpty {
+                queries.append(SearchQuery(
+                    tokens: Array(detailTokens.prefix(2)),
+                    score: 75,
+                    label: "Detail: \(detail)",
+                    target: .epgOnly
+                ))
+            }
+        }
+
+        if teams.isEmpty {
+            for comp in competitionTokens where comp.count >= 3 {
+                queries.append(SearchQuery(tokens: [comp], score: 90,
+                                         label: "League: \(comp)"))
+            }
+            for kw in sportKeywords(for: event) where kw.count >= 3 {
+                queries.append(SearchQuery(tokens: [kw], score: 70, label: "Sport: \(kw)"))
             }
         }
 
@@ -516,10 +756,11 @@ nonisolated enum StreamMatcher {
         // Ensure we have at least some queries even with no teams
         guard !queries.isEmpty else {
             // Last resort: use the event title tokens
-            let titleTokens = normalise(event.title)
-                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-                .map(String.init)
-                .filter { $0.count >= 3 }
+            let titleTokens = extractTokens(
+                from: event.title,
+                minimumLength: 3,
+                stopWords: trivialWords
+            )
             if !titleTokens.isEmpty {
                 queries.append(SearchQuery(tokens: Array(titleTokens.prefix(3)), score: 80,
                                            label: event.title))
