@@ -10,6 +10,7 @@ RUN_RELEASE_BUILD=${RUN_RELEASE_BUILD:-1}
 DRY_RUN=0
 MAKE_LATEST=1
 OPEN_RELEASE=0
+PATCH_EXISTING_NOTES=0
 EXTRA_NOTES_FILE=${EXTRA_NOTES_FILE:-}
 
 usage() {
@@ -25,6 +26,7 @@ Options:
   --skip-build      Reuse existing dist artifacts instead of running release-sparkle.sh
   --no-latest       Do not mark the GitHub release as latest
   --open            Open the created release page in the browser
+  --update-notes    Edit an existing release body instead of creating a new release
   -h, --help        Show help
 
 Environment variables:
@@ -64,6 +66,9 @@ while [[ $# -gt 0 ]]; do
     --open)
       OPEN_RELEASE=1
       ;;
+    --update-notes|--patch-notes)
+      PATCH_EXISTING_NOTES=1
+      ;;
     -h|--help)
       usage
       exit 0
@@ -88,6 +93,11 @@ if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
+# Keep the local tag view aligned with the remote release tags before we derive
+# the changelog range. Without this, a fresh clone only knows about the oldest
+# tag it happened to fetch, which makes release notes span far too much history.
+git fetch --tags --force origin >/dev/null 2>&1 || true
+
 BUILD_SETTINGS=$(xcodebuild -showBuildSettings -project Buffer.xcodeproj -scheme 'Buffer' -configuration Release)
 MARKETING_VERSION=$(printf '%s\n' "$BUILD_SETTINGS" | awk -F ' = ' '/MARKETING_VERSION/ {print $2; exit}')
 BUILD_NUMBER=$(printf '%s\n' "$BUILD_SETTINGS" | awk -F ' = ' '/CURRENT_PROJECT_VERSION/ {print $2; exit}')
@@ -105,41 +115,159 @@ DIST_DIR="$ROOT_DIR/dist/${RELEASE_BASENAME}"
 DMG_PATH="$DIST_DIR/${RELEASE_BASENAME}.dmg"
 ZIP_PATH="$DIST_DIR/${RELEASE_BASENAME}.zip"
 RELEASE_URL="https://github.com/${REPO}/releases/tag/${TAG_NAME}"
+CHANGELOG_START="<!-- buffer-release-notes:start -->"
+CHANGELOG_END="<!-- buffer-release-notes:end -->"
 
-last_tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+is_release_note_commit() {
+  local subject=$1
+
+  case "$subject" in
+    chore\(release\):\ cut\ *|chore\(release\):*)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+is_release_automation_commit() {
+  local subject=$1
+
+  case "$subject" in
+    chore\(release\):\ cut\ *|chore\(release\):*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+collect_changelog_entries() {
+  local range=$1
+  local subject hash
+
+  while IFS=$'\t' read -r subject hash; do
+    [[ -z "${subject// }" ]] && continue
+    if is_release_note_commit "$subject"; then
+      printf -- '- %s (%s)\n' "$subject" "$hash"
+    fi
+  done < <(git log --reverse --format='%s%x09%h' "$range")
+}
+
+collect_any_commit_entries() {
+  local range=$1
+  local subject hash
+
+  while IFS=$'\t' read -r subject hash; do
+    [[ -z "${subject// }" ]] && continue
+    if ! is_release_automation_commit "$subject"; then
+      printf -- '- %s (%s)\n' "$subject" "$hash"
+    fi
+  done < <(git log --reverse --format='%s%x09%h' "$range")
+}
+
+collect_all_commit_entries() {
+  local range=$1
+  local subject hash
+
+  while IFS=$'\t' read -r subject hash; do
+    [[ -z "${subject// }" ]] && continue
+    printf -- '- %s (%s)\n' "$subject" "$hash"
+  done < <(git log --reverse --format='%s%x09%h' "$range")
+}
+
+if git rev-parse --verify --quiet "${TAG_NAME}^{commit}" >/dev/null; then
+  last_tag=$(git describe --tags --abbrev=0 --match "${TAG_PREFIX}*" "${TAG_NAME}^" 2>/dev/null || true)
+else
+  last_tag=$(git describe --tags --abbrev=0 --match "${TAG_PREFIX}*" 2>/dev/null || true)
+fi
 if [[ -n "$last_tag" ]]; then
   log_range="${last_tag}..HEAD"
 else
   log_range="HEAD"
 fi
 
-NOTES_FILE=$(mktemp)
-{
-  echo "## Changelog"
-  echo
-  if git log --oneline "$log_range" >/dev/null 2>&1 && [[ -n "$(git log --oneline "$log_range")" ]]; then
-    git log --reverse --pretty='- %s (%h)' "$log_range"
-  else
-    echo "- Initial release"
-  fi
-  echo
-  echo "## Artifacts"
-  echo
-  printf -- '- DMG: `%s`\n' "${RELEASE_BASENAME}.dmg"
-  printf -- '- Sparkle ZIP: `%s`\n' "${RELEASE_BASENAME}.zip"
-  echo "- Sparkle appcast: https://raw.githubusercontent.com/wattsjs/buffer-updates/main/appcast.xml"
-  echo
-  if [[ -n "$EXTRA_NOTES_FILE" && -f "$EXTRA_NOTES_FILE" ]]; then
-    echo "## Notes"
+generate_notes_file() {
+  local notes_file=$1
+  local include_artifacts=$2
+  local changelog_entries fallback_entries raw_commit_count
+
+  changelog_entries=$(collect_changelog_entries "$log_range")
+  fallback_entries=$(collect_any_commit_entries "$log_range")
+  raw_commit_count=$(git rev-list --count "$log_range" 2>/dev/null || echo 0)
+
+  {
+    echo "$CHANGELOG_START"
+    echo "## Changelog"
     echo
-    cat "$EXTRA_NOTES_FILE"
+    if [[ -n "$changelog_entries" ]]; then
+      printf '%s\n' "$changelog_entries"
+    elif [[ -n "$fallback_entries" ]]; then
+      printf '%s\n' "$fallback_entries"
+    elif [[ "$raw_commit_count" -gt 0 ]]; then
+      collect_all_commit_entries "$log_range"
+    else
+      echo "- Initial release"
+    fi
+    echo "$CHANGELOG_END"
     echo
-  fi
-} > "$NOTES_FILE"
+
+    if [[ "$include_artifacts" == "1" ]]; then
+      echo "## Artifacts"
+      echo
+      printf -- '- DMG: `%s`\n' "${RELEASE_BASENAME}.dmg"
+      printf -- '- Sparkle ZIP: `%s`\n' "${RELEASE_BASENAME}.zip"
+      echo "- Sparkle appcast: https://raw.githubusercontent.com/wattsjs/buffer-updates/main/appcast.xml"
+      echo
+    fi
+
+    if [[ -n "$EXTRA_NOTES_FILE" && -f "$EXTRA_NOTES_FILE" ]]; then
+      echo "## Notes"
+      echo
+      cat "$EXTRA_NOTES_FILE"
+      echo
+    fi
+  } > "$notes_file"
+}
 
 if gh release view "$TAG_NAME" --repo "$REPO" >/dev/null 2>&1; then
-  echo "Release tag already exists on GitHub: $TAG_NAME" >&2
-  exit 1
+  if [[ "$PATCH_EXISTING_NOTES" != "1" ]]; then
+    echo "Release tag already exists on GitHub: $TAG_NAME" >&2
+    echo "Use --update-notes to patch the existing release body instead." >&2
+    exit 1
+  fi
+
+  CHANGELOG_BLOCK=$(mktemp)
+  CURRENT_BODY_FILE=$(mktemp)
+  UPDATED_BODY_FILE=$(mktemp)
+  generate_notes_file "$CHANGELOG_BLOCK" 0
+  gh release view "$TAG_NAME" --repo "$REPO" --json body --jq .body > "$CURRENT_BODY_FILE"
+  BLOCK_FILE="$CHANGELOG_BLOCK" perl -0ne '
+    my $replacement = do { local(@ARGV, $/) = $ENV{BLOCK_FILE}; <> };
+    if (index($_, "<!-- buffer-release-notes:start -->") >= 0 && index($_, "<!-- buffer-release-notes:end -->") >= 0) {
+      s/<!-- buffer-release-notes:start -->.*?<!-- buffer-release-notes:end -->/$replacement/s;
+    } else {
+      s/## Changelog\n.*?(?=\n## |\z)/$replacement/s;
+    }
+    print;
+  ' "$CURRENT_BODY_FILE" > "$UPDATED_BODY_FILE"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] would update notes for: $TAG_NAME"
+    echo "[dry-run] notes:"
+    cat "$UPDATED_BODY_FILE"
+    exit 0
+  fi
+
+  gh release edit "$TAG_NAME" --repo "$REPO" --title "$RELEASE_TITLE" --notes-file "$UPDATED_BODY_FILE"
+
+  echo "Updated release notes: $RELEASE_URL"
+  if [[ "$OPEN_RELEASE" == "1" ]]; then
+    gh release view "$TAG_NAME" --repo "$REPO" --web
+  fi
+  exit 0
 fi
 
 if [[ "$RUN_RELEASE_BUILD" == "1" ]]; then
@@ -159,6 +287,8 @@ fi
 
 DMG_SHA=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
 ZIP_SHA=$(shasum -a 256 "$ZIP_PATH" | awk '{print $1}')
+NOTES_FILE=$(mktemp)
+generate_notes_file "$NOTES_FILE" 1
 {
   echo "### Checksums"
   echo
