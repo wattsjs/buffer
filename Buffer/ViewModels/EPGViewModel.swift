@@ -5,6 +5,7 @@ enum SidebarSelection: Hashable {
     case home
     case sports
     case reminders
+    case recordings
     case search
     case favorites
     case allChannels
@@ -27,14 +28,25 @@ class EPGViewModel {
     var isRefreshing = false
     var loadingStage: String? = nil
     var errorMessage: String?
-    var serverConfig: ServerConfig?
+    var playlists: [ServerConfig] = []
+    var activePlaylistID: UUID?
     var lastUpdated: Date? = nil
     var serverStatus: ServerAccountStatus?
+
+    /// The currently active playlist, if any. Most existing code treats this as
+    /// "the server config"; new code should prefer the explicit name.
+    var serverConfig: ServerConfig? { activePlaylist }
+
+    var activePlaylist: ServerConfig? {
+        guard let id = activePlaylistID else { return nil }
+        return playlists.first(where: { $0.id == id })
+    }
 
     var searchEntries: [ProgramSearchEntry] = []
     var searchIndexVersion: Int = 0
     private var indexBuildTask: Task<Void, Never>?
-    private var syncSchedulerTask: Task<Void, Never>?
+    private var playlistSchedulerTask: Task<Void, Never>?
+    private var epgSchedulerTask: Task<Void, Never>?
     private var activeSyncTask: Task<Void, Never>?
     private var hydrationTask: Task<Void, Never>?
 
@@ -200,10 +212,15 @@ class EPGViewModel {
 
     // MARK: - Sync
 
+    enum SyncScope {
+        case all    // channels + EPG
+        case epg    // EPG only
+    }
+
     /// Fetch fresh channels + EPG. Fully async and non-blocking: parsing
     /// happens on background tasks, UI state only flips the small top banner.
     /// Pass `silent: true` for scheduled background syncs (no banner).
-    func sync(silent: Bool = false) {
+    func sync(silent: Bool = false, scope: SyncScope = .all) {
         guard let config = serverConfig else {
             errorMessage = nil
             hasLoadedOnce = true
@@ -216,23 +233,23 @@ class EPGViewModel {
         }
 
         activeSyncTask = Task { [weak self] in
-            await self?.performSync(config: config, silent: silent)
+            await self?.performSync(config: config, silent: silent, scope: scope)
         }
     }
 
     /// Await the current (or newly started) sync — used by the refresh button.
-    func syncAndWait(silent: Bool = false) async {
-        sync(silent: silent)
+    func syncAndWait(silent: Bool = false, scope: SyncScope = .all) async {
+        sync(silent: silent, scope: scope)
         await activeSyncTask?.value
     }
 
-    private func performSync(config: ServerConfig, silent: Bool) async {
+    private func performSync(config: ServerConfig, silent: Bool, scope: SyncScope) async {
         let cacheKey = DataCache.cacheKey(for: config)
         var syncedStatus = ServerAccountStatus.initial(for: config, cacheKey: cacheKey)
 
         if !silent {
             isRefreshing = true
-            loadingStage = "Loading channels…"
+            loadingStage = scope == .epg ? "Loading guide…" : "Loading channels…"
             errorMessage = nil
         }
 
@@ -246,21 +263,26 @@ class EPGViewModel {
         }
 
         do {
-            if config.type == .xtream,
-               let accountInfo = try? await XtreamClient(config: config).fetchAccountInfo() {
-                syncedStatus.apply(accountInfo)
-            }
-
-            let freshChannels = try await fetchChannels(config: config)
-            syncedStatus.channelCount = freshChannels.count
-
-            if !freshChannels.isEmpty {
-                channels = freshChannels
-                rebuildSearchIndex()
-
-                Task.detached(priority: .utility) {
-                    DataCache.saveChannels(freshChannels, key: cacheKey)
+            if scope == .all {
+                if config.type == .xtream,
+                   let accountInfo = try? await XtreamClient(config: config).fetchAccountInfo() {
+                    syncedStatus.apply(accountInfo)
                 }
+
+                let freshChannels = try await fetchChannels(config: config)
+                syncedStatus.channelCount = freshChannels.count
+
+                if !freshChannels.isEmpty {
+                    channels = freshChannels
+                    rebuildSearchIndex()
+
+                    Task.detached(priority: .utility) {
+                        DataCache.saveChannels(freshChannels, key: cacheKey)
+                    }
+                }
+            } else {
+                // EPG-only: preserve existing channel count in status
+                syncedStatus.channelCount = channels.count
             }
 
             if let epgURL = epgURL(for: config) {
@@ -288,7 +310,7 @@ class EPGViewModel {
 
             lastUpdated = Date()
             updateServerStatus(syncedStatus)
-            print("[Buffer] Synced \(channels.count) channels in \(groups.count) groups (silent=\(silent))")
+            print("[Buffer] Synced \(channels.count) channels in \(groups.count) groups (scope=\(scope), silent=\(silent))")
 
         } catch {
             print("[Buffer] Sync failed: \(error)")
@@ -300,29 +322,46 @@ class EPGViewModel {
 
     // MARK: - Scheduler
 
-    /// Start (or restart) the periodic background sync timer.
-    /// Waits a full interval before its first fire — does NOT sync on startup.
+    /// Start (or restart) the periodic background sync timers.
+    /// Playlist + EPG run on independent cadences. Each waits a full interval
+    /// before its first fire — startup syncs are kicked off separately.
     func startSyncScheduler() {
-        syncSchedulerTask?.cancel()
-        syncSchedulerTask = Task { [weak self] in
+        playlistSchedulerTask?.cancel()
+        playlistSchedulerTask = Task { [weak self] in
             while !Task.isCancelled {
-                let hours = UserDefaults.standard.object(forKey: SyncInterval.appStorageKey) as? Int
-                    ?? SyncInterval.default.hours
-                let seconds = Double(hours) * 3600
+                let hours = UserDefaults.standard.object(forKey: SyncInterval.playlistStorageKey) as? Int
+                    ?? SyncInterval.playlistDefault.hours
                 do {
-                    try await Task.sleep(for: .seconds(seconds))
+                    try await Task.sleep(for: .seconds(Double(hours) * 3600))
                 } catch {
                     return
                 }
                 if Task.isCancelled { return }
-                self?.sync(silent: true)
+                self?.sync(silent: true, scope: .all)
+            }
+        }
+
+        epgSchedulerTask?.cancel()
+        epgSchedulerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let hours = UserDefaults.standard.object(forKey: SyncInterval.epgStorageKey) as? Int
+                    ?? SyncInterval.epgDefault.hours
+                do {
+                    try await Task.sleep(for: .seconds(Double(hours) * 3600))
+                } catch {
+                    return
+                }
+                if Task.isCancelled { return }
+                self?.sync(silent: true, scope: .epg)
             }
         }
     }
 
     func stopSyncScheduler() {
-        syncSchedulerTask?.cancel()
-        syncSchedulerTask = nil
+        playlistSchedulerTask?.cancel()
+        playlistSchedulerTask = nil
+        epgSchedulerTask?.cancel()
+        epgSchedulerTask = nil
     }
 
     func refreshServerStatus() async {
@@ -366,25 +405,6 @@ class EPGViewModel {
         case .m3u:
             return config.epgSourceURL
         }
-    }
-
-    // MARK: - Cache hydration
-
-    @discardableResult
-    private func hydrateFromCache(key: String) -> Bool {
-        var hydrated = false
-        if let cached = DataCache.loadChannels(key: key), !cached.channels.isEmpty {
-            channels = cached.channels
-            lastUpdated = cached.savedAt
-            hydrated = true
-        }
-        if let cachedPrograms = DataCache.loadPrograms(key: key) {
-            programs = cachedPrograms.programs
-        }
-        if hydrated || !programs.isEmpty {
-            rebuildSearchIndex()
-        }
-        return hydrated
     }
 
     // MARK: - Search index
@@ -443,11 +463,159 @@ class EPGViewModel {
         return organized
     }
 
+    // MARK: - Playlist CRUD
+
+    /// Insert a new playlist. If `makeActive` is true (default) it becomes the
+    /// active one and per-playlist state is swapped in.
+    func addPlaylist(_ config: ServerConfig, makeActive: Bool = true) {
+        playlists.append(config)
+        _ = ServerPasswordStore.savePassword(config.password, for: config.id)
+        savePlaylists()
+        if makeActive {
+            setActivePlaylist(id: config.id)
+        }
+    }
+
+    /// Replace an existing playlist in-place (matched by id). If it is the
+    /// active playlist, per-playlist state is refreshed (cache key may have
+    /// changed if the URL/username changed).
+    func updatePlaylist(_ config: ServerConfig) {
+        guard let index = playlists.firstIndex(where: { $0.id == config.id }) else {
+            addPlaylist(config, makeActive: false)
+            return
+        }
+        let previous = playlists[index]
+        playlists[index] = config
+        _ = ServerPasswordStore.savePassword(config.password, for: config.id)
+        savePlaylists()
+
+        if activePlaylistID == config.id {
+            let previousKey = DataCache.cacheKey(for: previous)
+            let newKey = DataCache.cacheKey(for: config)
+            if previousKey != newKey {
+                swapInActivePlaylistState(previousKey: previousKey)
+            }
+        }
+    }
+
+    /// Delete a playlist. If it was active, the first remaining playlist (if
+    /// any) becomes active. Passwords are removed from the keychain; cached
+    /// channel/program files are left alone (cheap to keep and re-usable if
+    /// the user re-adds the same source).
+    func removePlaylist(id: UUID) {
+        guard let index = playlists.firstIndex(where: { $0.id == id }) else { return }
+        let removed = playlists.remove(at: index)
+        _ = ServerPasswordStore.deletePassword(for: removed.id)
+        NotificationManager.shared.cancelReminders(forPlaylistID: id)
+        savePlaylists()
+
+        if activePlaylistID == id {
+            if let fallback = playlists.first {
+                setActivePlaylist(id: fallback.id)
+            } else {
+                clearActivePlaylist()
+            }
+        }
+    }
+
+    /// Activate the reminder's playlist (if it differs from the current one),
+    /// wait for channels to load from cache (syncing if the cache is empty),
+    /// and return the matching channel if the playlist still contains it.
+    func resolveReminder(_ reminder: ProgramReminder) async -> Channel? {
+        if activePlaylistID != reminder.playlistID {
+            setActivePlaylist(id: reminder.playlistID)
+        }
+        await hydrate()
+        if channels.isEmpty {
+            await syncAndWait()
+        }
+        return channels.first(where: { $0.id == reminder.channelID })
+    }
+
+    /// Switch the active playlist and reload its per-playlist state.
+    func setActivePlaylist(id: UUID) {
+        guard playlists.contains(where: { $0.id == id }) else { return }
+        if activePlaylistID == id { return }
+
+        // Abort any in-flight sync; it would finish by writing data from the
+        // old playlist into our (now reassigned) `channels`/`programs` slots.
+        activeSyncTask?.cancel()
+        activeSyncTask = nil
+
+        activePlaylistID = id
+        saveActivePlaylistID()
+        swapInActivePlaylistState(previousKey: nil)
+    }
+
+    /// Shared between `setActivePlaylist` and cache-key-changing updates.
+    /// Clears visible state, reloads per-playlist prefs (favorites/recents/
+    /// groups/status), hydrates from disk cache, and triggers a sync if the
+    /// cache was empty.
+    private func swapInActivePlaylistState(previousKey: String?) {
+        channels = []
+        programs = [:]
+        searchEntries = []
+        searchIndexVersion &+= 1
+        lastUpdated = nil
+        errorMessage = nil
+        loadingStage = nil
+        isRefreshing = false
+        revealChannelID = nil
+        // If the current selection references a group that won't exist in the
+        // new playlist, fall back to All Channels. The group list repopulates
+        // once channels hydrate.
+        if case .group = selection {
+            selection = .allChannels
+        }
+
+        loadServerStatus()
+        loadRecents()
+        loadFavorites()
+        loadGroupPreferences()
+
+        hydrationTask?.cancel()
+        hydrationTask = Task { [weak self] in
+            await self?.hydrateFromDisk()
+            // If the cache is empty, fetch fresh data so the user sees channels
+            // immediately rather than a blank window.
+            guard let self else { return }
+            if self.channels.isEmpty && self.serverConfig != nil {
+                self.sync()
+            }
+        }
+    }
+
+    private func clearActivePlaylist() {
+        activeSyncTask?.cancel()
+        activeSyncTask = nil
+        activePlaylistID = nil
+        saveActivePlaylistID()
+        channels = []
+        programs = [:]
+        searchEntries = []
+        searchIndexVersion &+= 1
+        lastUpdated = nil
+        errorMessage = nil
+        loadingStage = nil
+        isRefreshing = false
+        recentChannelIDs = []
+        favoriteChannelIDs = []
+        storedGroupOrder = []
+        hiddenGroupNames = []
+        serverStatus = nil
+    }
+
     // MARK: - Config Persistence
 
-    private static let configKey = "buffer_server_config"
-    private static let serverStatusKey = "buffer_server_status"
+    private static let playlistsKey = "buffer_playlists_v1"
+    private static let activePlaylistKey = "buffer_active_playlist_id"
+    private static let legacyConfigKey = "buffer_server_config"
+    private static let legacyServerStatusKey = "buffer_server_status"
     private static let recentsLimit = 24
+
+    private static func serverStatusKey(for cacheKey: String) -> String {
+        "buffer_server_status_\(cacheKey)"
+    }
 
     private struct StoredServerConfig: Codable {
         let id: UUID
@@ -482,45 +650,80 @@ class EPGViewModel {
         }
     }
 
-    func saveConfig() {
-        guard let config = serverConfig else { return }
-        let currentCacheKey = DataCache.cacheKey(for: config)
-        if serverStatus?.cacheKey != currentCacheKey {
-            clearServerStatus()
-        }
-        _ = ServerPasswordStore.savePassword(config.password, for: config.id)
-        let stored = StoredServerConfig(config)
+    private func savePlaylists() {
+        let stored = playlists.map(StoredServerConfig.init)
         if let data = try? JSONEncoder().encode(stored) {
-            UserDefaults.standard.set(data, forKey: Self.configKey)
+            UserDefaults.standard.set(data, forKey: Self.playlistsKey)
         }
-        loadRecents()
-        loadFavorites()
+    }
+
+    private func saveActivePlaylistID() {
+        if let id = activePlaylistID {
+            UserDefaults.standard.set(id.uuidString, forKey: Self.activePlaylistKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.activePlaylistKey)
+        }
     }
 
     func loadConfig() {
-        if let data = UserDefaults.standard.data(forKey: Self.configKey) {
-            if let stored = try? JSONDecoder().decode(StoredServerConfig.self, from: data) {
-                let password = ServerPasswordStore.loadPassword(for: stored.id) ?? ""
-                serverConfig = stored.serverConfig(password: password)
-            } else if let legacy = try? JSONDecoder().decode(ServerConfig.self, from: data) {
-                _ = ServerPasswordStore.savePassword(legacy.password, for: legacy.id)
-                let migrated = StoredServerConfig(legacy)
-                if let migratedData = try? JSONEncoder().encode(migrated) {
-                    UserDefaults.standard.set(migratedData, forKey: Self.configKey)
-                }
-                serverConfig = migrated.serverConfig(password: legacy.password)
+        if let data = UserDefaults.standard.data(forKey: Self.playlistsKey),
+           let stored = try? JSONDecoder().decode([StoredServerConfig].self, from: data) {
+            playlists = stored.map { entry in
+                let password = ServerPasswordStore.loadPassword(for: entry.id) ?? ""
+                return entry.serverConfig(password: password)
             }
+        } else {
+            migrateLegacyConfigIfNeeded()
         }
+
+        if let raw = UserDefaults.standard.string(forKey: Self.activePlaylistKey),
+           let id = UUID(uuidString: raw),
+           playlists.contains(where: { $0.id == id }) {
+            activePlaylistID = id
+        } else {
+            activePlaylistID = playlists.first?.id
+            saveActivePlaylistID()
+        }
+
         loadServerStatus()
         loadRecents()
         loadFavorites()
         loadGroupPreferences()
     }
 
+    /// One-time migration of the pre-multi-playlist single-config key. Leaves
+    /// the legacy key in place for a while in case an older build is opened
+    /// (they'll just see a stale single config, not a crash).
+    private func migrateLegacyConfigIfNeeded() {
+        guard let data = UserDefaults.standard.data(forKey: Self.legacyConfigKey) else { return }
+
+        if let stored = try? JSONDecoder().decode(StoredServerConfig.self, from: data) {
+            let password = ServerPasswordStore.loadPassword(for: stored.id) ?? ""
+            playlists = [stored.serverConfig(password: password)]
+        } else if let legacy = try? JSONDecoder().decode(ServerConfig.self, from: data) {
+            _ = ServerPasswordStore.savePassword(legacy.password, for: legacy.id)
+            playlists = [legacy]
+        }
+
+        if !playlists.isEmpty {
+            savePlaylists()
+            activePlaylistID = playlists.first?.id
+            saveActivePlaylistID()
+
+            // Migrate the old single-slot server status into the new
+            // per-cache-key slot so the user doesn't lose their status card.
+            if let data = UserDefaults.standard.data(forKey: Self.legacyServerStatusKey),
+               let stored = try? JSONDecoder().decode(ServerAccountStatus.self, from: data) {
+                UserDefaults.standard.set(data, forKey: Self.serverStatusKey(for: stored.cacheKey))
+                UserDefaults.standard.removeObject(forKey: Self.legacyServerStatusKey)
+            }
+        }
+    }
+
     private func updateServerStatus(_ status: ServerAccountStatus) {
         serverStatus = status
         if let data = try? JSONEncoder().encode(status) {
-            UserDefaults.standard.set(data, forKey: Self.serverStatusKey)
+            UserDefaults.standard.set(data, forKey: Self.serverStatusKey(for: status.cacheKey))
         }
     }
 
@@ -530,19 +733,14 @@ class EPGViewModel {
             return
         }
 
-        guard let data = UserDefaults.standard.data(forKey: Self.serverStatusKey),
-              let stored = try? JSONDecoder().decode(ServerAccountStatus.self, from: data),
-              stored.cacheKey == DataCache.cacheKey(for: config) else {
+        let cacheKey = DataCache.cacheKey(for: config)
+        guard let data = UserDefaults.standard.data(forKey: Self.serverStatusKey(for: cacheKey)),
+              let stored = try? JSONDecoder().decode(ServerAccountStatus.self, from: data) else {
             serverStatus = nil
             return
         }
 
         serverStatus = stored
-    }
-
-    private func clearServerStatus() {
-        serverStatus = nil
-        UserDefaults.standard.removeObject(forKey: Self.serverStatusKey)
     }
 
     // MARK: - Recents

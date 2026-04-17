@@ -9,8 +9,10 @@ enum SyncInterval: Int, CaseIterable, Identifiable {
     case threeDays = 72
     case sevenDays = 168
 
-    static let appStorageKey = "buffer_sync_interval_hours"
-    static let `default`: SyncInterval = .oneDay
+    static let playlistStorageKey = "buffer_playlist_sync_interval_hours"
+    static let epgStorageKey = "buffer_epg_sync_interval_hours"
+    static let playlistDefault: SyncInterval = .oneDay
+    static let epgDefault: SyncInterval = .sixHours
 
     var id: Int { rawValue }
     var hours: Int { rawValue }

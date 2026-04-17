@@ -48,10 +48,13 @@ struct RightClickCatcher: NSViewRepresentable {
 final class ClosureMenuItem: NSMenuItem {
     private let handler: () -> Void
 
-    init(title: String, handler: @escaping () -> Void) {
+    init(title: String, symbol: String? = nil, handler: @escaping () -> Void) {
         self.handler = handler
         super.init(title: title, action: #selector(fire), keyEquivalent: "")
         self.target = self
+        if let symbol {
+            self.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        }
     }
 
     required init(coder: NSCoder) {
@@ -69,17 +72,24 @@ enum ReminderMenuBuilder {
     /// location relative to `view`. Shared by the EPG grid (native right-click
     /// path) and anywhere else an NSMenu is appropriate.
     static func present(
+        playlistID: UUID,
         program: EPGProgram,
         channel: Channel,
         event: NSEvent,
         in view: NSView,
         onPlay: @escaping () -> Void
     ) {
-        let menu = buildMenu(program: program, channel: channel, onPlay: onPlay)
+        let menu = buildMenu(
+            playlistID: playlistID,
+            program: program,
+            channel: channel,
+            onPlay: onPlay
+        )
         NSMenu.popUpContextMenu(menu, with: event, for: view)
     }
 
     static func buildMenu(
+        playlistID: UUID,
         program: EPGProgram,
         channel: Channel,
         onPlay: @escaping () -> Void
@@ -94,43 +104,85 @@ enum ReminderMenuBuilder {
         menu.addItem(.separator())
 
         let manager = NotificationManager.shared
-        let existing = manager.reminder(for: program)
+        let existing = manager.reminder(playlistID: playlistID, for: program)
 
         if let existing {
             let title = "Cancel Reminder (" + leadDescription(minutes: existing.leadMinutes) + ")"
-            menu.addItem(ClosureMenuItem(title: title) {
-                manager.cancelReminder(for: program)
+            menu.addItem(ClosureMenuItem(title: title, symbol: "bell.slash") {
+                manager.cancelReminder(playlistID: playlistID, for: program)
             })
         } else if program.end <= Date() {
             let past = NSMenuItem(title: "Already aired", action: nil, keyEquivalent: "")
             past.isEnabled = false
             menu.addItem(past)
         } else {
-            menu.addItem(makeRemindItem(title: "Remind Me at Start", lead: 0, program: program, channel: channel))
-            menu.addItem(makeRemindItem(title: "Remind Me 5 min Before", lead: 5, program: program, channel: channel))
-            menu.addItem(makeRemindItem(title: "Remind Me 15 min Before", lead: 15, program: program, channel: channel))
-            menu.addItem(makeRemindItem(title: "Remind Me 1 hour Before", lead: 60, program: program, channel: channel))
+            menu.addItem(makeRemindItem(title: "Remind Me at Start", symbol: "bell", lead: 0, playlistID: playlistID, program: program, channel: channel))
+            menu.addItem(makeRemindItem(title: "Remind Me 5 min Before", symbol: "bell", lead: 5, playlistID: playlistID, program: program, channel: channel))
+            menu.addItem(makeRemindItem(title: "Remind Me 15 min Before", symbol: "bell", lead: 15, playlistID: playlistID, program: program, channel: channel))
+            menu.addItem(makeRemindItem(title: "Remind Me 1 hour Before", symbol: "bell", lead: 60, playlistID: playlistID, program: program, channel: channel))
         }
 
         menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem(title: "Play Channel", handler: onPlay))
+        addRecordingItems(to: menu, playlistID: playlistID, program: program, channel: channel)
+
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem(title: "Play Channel", symbol: "play.fill", handler: onPlay))
         return menu
+    }
+
+    private static func addRecordingItems(
+        to menu: NSMenu,
+        playlistID: UUID,
+        program: EPGProgram,
+        channel: Channel
+    ) {
+        let recorder = RecordingManager.shared
+        let existing = recorder.recordings.first { rec in
+            rec.programID == program.id
+                && rec.channelID == channel.id
+                && (rec.status == .scheduled || rec.status == .recording)
+        }
+
+        if let existing {
+            let isRec = existing.status == .recording
+            let label = isRec ? "Stop Recording" : "Cancel Scheduled Recording"
+            let symbol = isRec ? "stop.circle.fill" : "xmark.circle"
+            menu.addItem(ClosureMenuItem(title: label, symbol: symbol) {
+                recorder.cancel(id: existing.id)
+            })
+        } else if program.end <= Date() {
+            let past = NSMenuItem(title: "Can't record — already aired", action: nil, keyEquivalent: "")
+            past.isEnabled = false
+            menu.addItem(past)
+        } else {
+            menu.addItem(ClosureMenuItem(title: "Record This Program", symbol: "record.circle") {
+                _ = recorder.schedule(
+                    playlistID: playlistID,
+                    channel: channel,
+                    program: program
+                )
+            })
+        }
     }
 
     private static func makeRemindItem(
         title: String,
+        symbol: String? = nil,
         lead: Int,
+        playlistID: UUID,
         program: EPGProgram,
         channel: Channel
     ) -> ClosureMenuItem {
-        ClosureMenuItem(title: title) {
+        ClosureMenuItem(title: title, symbol: symbol) {
             Task { @MainActor in
                 let scheduled = await NotificationManager.shared.scheduleReminder(
+                    playlistID: playlistID,
                     program: program,
                     channel: channel,
                     leadMinutes: lead
                 )
                 AppFeedbackCenter.shared.showReminderResult(
+                    playlistID: playlistID,
                     program: program,
                     channel: channel,
                     leadMinutes: lead,

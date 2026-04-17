@@ -14,7 +14,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		7DD210DC2F8DDBCF00032A0F /* Buffer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Buffer.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		7DD210DC2F8DDBCF00032A0F /* Buffer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buffer.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -74,14 +74,14 @@
 			fileSystemSynchronizedGroups = (
 				7DD210DE2F8DDBCF00032A0F /* Buffer */,
 			);
-			name = "Buffer";
+			name = Buffer;
 			packageProductDependencies = (
 				7DEE000200000000000000AA /* NukeUI */,
 				7DEE000400000000000000AA /* Nuke */,
 				7DEE002200000000000000AA /* MPVKit */,
 				7DEE004200000000000000AA /* Sparkle */,
 			);
-			productName = "Buffer";
+			productName = Buffer;
 			productReference = 7DD210DC2F8DDBCF00032A0F /* Buffer.app */;
 			productType = "com.apple.product-type.application";
 		};
@@ -293,6 +293,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SDKROOT)/usr/include/libxml2",
+					"$(SRCROOT)/Buffer/ffmpeg-compat",
 				);
 				INFOPLIST_FILE = Config/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -301,7 +302,7 @@
 				);
 				MARKETING_VERSION = 1.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer;
-				PRODUCT_NAME = "Buffer";
+				PRODUCT_NAME = Buffer;
 				REGISTER_APP_GROUPS = YES;
 				SPARKLE_FEED_URL = "https://raw.githubusercontent.com/wattsjs/buffer-updates/main/appcast.xml";
 				SPARKLE_PUBLIC_ED_KEY = "OMX+wLJePbgnTruwM+CX+K8UKHe/mJZjv4CAzQxYNgE=";
@@ -310,6 +311,7 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Buffer/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Buffer/Buffer-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -343,6 +345,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SDKROOT)/usr/include/libxml2",
+					"$(SRCROOT)/Buffer/ffmpeg-compat",
 				);
 				INFOPLIST_FILE = Config/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -351,7 +354,7 @@
 				);
 				MARKETING_VERSION = 1.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer;
-				PRODUCT_NAME = "Buffer";
+				PRODUCT_NAME = Buffer;
 				REGISTER_APP_GROUPS = YES;
 				SPARKLE_FEED_URL = "https://raw.githubusercontent.com/wattsjs/buffer-updates/main/appcast.xml";
 				SPARKLE_PUBLIC_ED_KEY = "OMX+wLJePbgnTruwM+CX+K8UKHe/mJZjv4CAzQxYNgE=";
@@ -360,6 +363,7 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Buffer/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Buffer/Buffer-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};

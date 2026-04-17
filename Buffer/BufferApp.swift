@@ -27,6 +27,10 @@ private enum SparkleConfiguration {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        RecordingManager.shared.stopAll()
+    }
+
     private(set) lazy var updaterController: SPUStandardUpdaterController? = {
         guard SparkleConfiguration.isConfigured else {
             return nil
@@ -53,6 +57,7 @@ struct BufferApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var viewModel = EPGViewModel()
     @State private var notificationManager = NotificationManager.shared
+    @State private var recordingManager = RecordingManager.shared
     @Environment(\.openWindow) private var openWindow
 
     init() {
@@ -61,6 +66,14 @@ struct BufferApp: App {
         // the UNUserNotificationCenter delegate and registers categories.
         // Actual permission + reconciliation happens in `.task` below.
         _ = NotificationManager.shared
+        // StreamProxy.start() blocks up to ~1s on a semaphore waiting for the
+        // NWListener to bind. Run it off the main thread so app launch isn't
+        // gated on it — proxiedURL() calls start() again and will wait only
+        // if the listener isn't ready yet (first PlayerSlot open).
+        DispatchQueue.global(qos: .userInitiated).async {
+            StreamProxy.shared.start()
+        }
+        RecordingManager.shared.bootstrap()
     }
 
     var body: some Scene {
@@ -69,13 +82,6 @@ struct BufferApp: App {
                 .frame(minWidth: 800, minHeight: 500)
                 .task {
                     await notificationManager.bootstrap()
-                }
-                .onReceive(
-                    NotificationCenter.default.publisher(
-                        for: NotificationManager.openStreamNotification
-                    )
-                ) { note in
-                    handleReminderOpen(note)
                 }
         }
         .commands {
@@ -108,6 +114,15 @@ struct BufferApp: App {
         .defaultSize(width: 854, height: 480)
         .restorationBehavior(.disabled)
 
+        WindowGroup("Recording", for: Recording.self) { $recording in
+            if let recording {
+                PlayerView(recording: recording)
+            }
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 854, height: 480)
+        .restorationBehavior(.disabled)
+
         Settings {
             SettingsView(viewModel: viewModel)
         }
@@ -119,16 +134,4 @@ struct BufferApp: App {
         .restorationBehavior(.disabled)
     }
 
-    private func handleReminderOpen(_ note: Notification) {
-        guard let info = note.userInfo,
-              let channelID = info["channelID"] as? String,
-              let channel = viewModel.channels.first(where: { $0.id == channelID })
-        else { return }
-        viewModel.addRecent(channel)
-        if ExternalPlayer.isEnabled {
-            ExternalPlayer.launch(streamURL: channel.streamURL)
-        } else {
-            openWindow(value: channel)
-        }
-    }
 }

@@ -63,6 +63,17 @@ struct AppFeedbackMessage: Identifiable, Equatable {
             showsActivity: false
         )
     }
+
+    static func reminderChannelMissing(playlistName: String, channelName: String) -> Self {
+        let where_ = playlistName.isEmpty ? "the selected playlist" : "“\(playlistName)”"
+        return .init(
+            title: "Channel no longer in \(where_)",
+            message: "\(channelName) was removed from the playlist since you set the reminder.",
+            symbol: "exclamationmark.triangle.fill",
+            tone: .warning,
+            showsActivity: false
+        )
+    }
 }
 
 @MainActor
@@ -97,6 +108,7 @@ final class AppFeedbackCenter {
     }
 
     func showReminderResult(
+        playlistID: UUID,
         program: EPGProgram,
         channel: Channel,
         leadMinutes: Int,
@@ -108,7 +120,8 @@ final class AppFeedbackCenter {
         }
 
         let preferredFire = program.start.addingTimeInterval(-Double(leadMinutes) * 60)
-        let notifyAt = NotificationManager.shared.reminder(for: program)?.notifyAt
+        let notifyAt = NotificationManager.shared
+            .reminder(playlistID: playlistID, for: program)?.notifyAt
             ?? max(preferredFire, Date().addingTimeInterval(2))
 
         show(

@@ -241,6 +241,26 @@ private struct SportEventCard: View {
     @State private var matches: [StreamMatch]?
     @State private var isMatching = false
     @State private var notificationManager = NotificationManager.shared
+    @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
+
+    /// Subtitle for tournament-style events (no head-to-head teams): round
+    /// detail and/or venue, e.g. "Rd 2 · Harbour Town Golf Links".
+    private var tournamentSubtitle: String? {
+        var parts: [String] = []
+        if let detail = event.detail, !detail.isEmpty {
+            let lower = detail.lowercased()
+            // Skip if the detail only restates what the badge already shows.
+            let redundant = lower == "live" || lower == "final" || lower.hasPrefix("final/")
+            if !redundant { parts.append(detail) }
+        }
+        if let leader = event.leader {
+            parts.append("\(leader.name) \(leader.score)")
+        }
+        if let venue = event.venue, !venue.isEmpty {
+            parts.append(venue)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 
     /// Event is playable if live, halftime, or starting within 15 minutes.
     private var eventIsPlayable: Bool {
@@ -252,6 +272,7 @@ private struct SportEventCard: View {
     }
 
     private func setReminder(for channel: Channel) {
+        guard let playlistID = activePlaylistID else { return }
         // Create a synthetic EPGProgram to use with the existing reminder system
         let program = EPGProgram(
             id: "sport_\(event.id)",
@@ -263,11 +284,13 @@ private struct SportEventCard: View {
         )
         Task { @MainActor in
             let scheduled = await notificationManager.scheduleReminder(
+                playlistID: playlistID,
                 program: program,
                 channel: channel,
                 leadMinutes: 5
             )
             AppFeedbackCenter.shared.showReminderResult(
+                playlistID: playlistID,
                 program: program,
                 channel: channel,
                 leadMinutes: 5,
@@ -286,6 +309,17 @@ private struct SportEventCard: View {
                 Text(event.league.shortName)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
+                if let tournament = event.tournamentName,
+                   event.awayTeam != nil, event.homeTeam != nil {
+                    Text("·")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                    Text(tournament)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
                 Spacer()
                 statusBadge
             }
@@ -297,11 +331,19 @@ private struct SportEventCard: View {
                     .padding(.bottom, 6)
                 teamRow(home, isHome: true)
             } else {
-                Text(event.title)
-                    .font(.system(size: 14, weight: .semibold))
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .frame(height: 54, alignment: .center)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(event.title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .lineLimit(2)
+                    if let subtitle = tournamentSubtitle {
+                        Text(subtitle)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 54, alignment: .center)
             }
         }
         .padding(14)
@@ -532,8 +574,8 @@ private struct StreamMatchRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            ChannelLogoTile(channel: match.channel)
-                .frame(width: 32, height: 32)
+            ChannelLogoTile(channel: match.channel, contentInset: 2)
+                .frame(width: 40, height: 40)
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {

@@ -64,11 +64,20 @@ final class MPVPlayer {
     private(set) var errorMessage: String?
     private(set) var cacheSeconds: Double = 0
     private(set) var isBuffering = false
+    /// True from the moment `loadURL` is called until the first frame is
+    /// rendered (or the load fails). mpv's `paused-for-cache` only flips after
+    /// the demuxer has parsed the stream, so without this flag there's a
+    /// visible gap where the UI shows "play" while the network fetch is still
+    /// in flight.
+    private(set) var isLoading = false
     private(set) var volume: Double = 100
     private(set) var isMuted = false
     private(set) var timePos: Double = 0
     private(set) var duration: Double = 0
     private(set) var isSeekable: Bool = false
+    /// Last URL handed to `loadURL`. Used by callers to avoid redundant
+    /// `loadURL` calls when handing off a player.
+    private(set) var currentURL: URL?
 
     /// True if we have no rewind window, or playback is within a few seconds of
     /// the live edge. Streams without a DVR window are considered always-live.
@@ -146,7 +155,7 @@ final class MPVPlayer {
 
     // MARK: - Public API
 
-    func loadURL(_ url: URL, autoplay: Bool = false) {
+    func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false) {
         guard let handle else { return }
         errorMessage = nil
         resetMediaTrackState()
@@ -157,6 +166,25 @@ final class MPVPlayer {
             setFlag("pause", false)
             isPlaying = true
         }
+        isLoading = true
+        currentURL = url
+
+        // Fast-probe path is used for known local MPEG-TS sources (recording
+        // files + the tail-follow proxy). With the default 1 MiB probesize +
+        // 2 s analyzeduration, mpv's ffmpeg demuxer can spend 5–10 s scanning
+        // the head of a multi-gigabyte .ts file before reporting stream info.
+        // For MPEG-TS the SPS usually lands in the first few KB, so shrinking
+        // the probe window by ~16x trims the open delay without losing
+        // detection. Restored to the safe HLS defaults on the next non-fast
+        // load so channel streams aren't affected.
+        if fastProbe {
+            setRuntimeProperty(handle, "demuxer-lavf-probesize", "65536")
+            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "0.1")
+        } else {
+            setRuntimeProperty(handle, "demuxer-lavf-probesize", "1048576")
+            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "2.0")
+        }
+
         let path = url.absoluteString
         command(handle, ["loadfile", path])
         if autoplay {
@@ -417,6 +445,12 @@ final class MPVPlayer {
 
         startEventPump(handle: newHandle)
         startStatePolling()
+
+        // Pull info+ logs from mpv into our console so diagnostics from
+        // async commands (dump-cache open/close, recorder errors, muxer
+        // warnings) surface instead of disappearing into mpv's internal
+        // logger. Noisy but invaluable when something silently fails.
+        mpv_request_log_messages(newHandle, "info")
     }
 
     private func reloadBufferSetting() {
@@ -455,10 +489,18 @@ final class MPVPlayer {
             mpv_render_context_free(ctx)
             renderContext = nil
         }
-        if let handle {
-            mpv_terminate_destroy(handle)
+        // `mpv_terminate_destroy` synchronously waits for mpv's internal
+        // worker threads to unwind — which can take tens of seconds when
+        // the demuxer is mid-reconnect or waiting on a socket read. Hand
+        // the handle to a detached queue so main doesn't pin waiting for
+        // teardown. Everything else on `self` has already been released
+        // above, so it's safe to let the handle die outside this actor.
+        if let capturedHandle = handle {
+            handle = nil
+            DispatchQueue.global(qos: .userInitiated).async {
+                mpv_terminate_destroy(capturedHandle)
+            }
         }
-        handle = nil
     }
 
     // MARK: - Event pump
@@ -555,6 +597,7 @@ final class MPVPlayer {
     private func handleEndFileEvent(_ event: mpv_event_end_file) {
         setState(\.isPlaying, false)
         setState(\.isBuffering, false)
+        setState(\.isLoading, false)
 
         guard event.reason == MPV_END_FILE_REASON_ERROR else { return }
 
@@ -751,6 +794,9 @@ final class MPVPlayer {
         }
         if let timePos = pending.timePos {
             setApproxState(\.timePos, timePos, epsilon: Tuning.timePosEpsilon)
+            if isLoading, timePos > 0 {
+                setState(\.isLoading, false)
+            }
         }
         if let duration = pending.duration {
             setApproxState(\.duration, duration, epsilon: Tuning.stateEpsilon)
@@ -857,6 +903,7 @@ final class MPVPlayer {
             _ = mpv_command(handle, buf.baseAddress)
         }
     }
+
 }
 
 private extension Double {

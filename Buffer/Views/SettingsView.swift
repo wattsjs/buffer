@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -6,11 +7,14 @@ struct SettingsView: View {
 
     var body: some View {
         TabView {
-            GeneralSettingsTab(viewModel: viewModel)
-                .tabItem { Label("Account", systemImage: "server.rack") }
+            PlaylistsSettingsTab(viewModel: viewModel)
+                .tabItem { Label("Playlists", systemImage: "server.rack") }
 
             PlaybackSettingsTab()
                 .tabItem { Label("Playback", systemImage: "play.rectangle") }
+
+            RecordingsSettingsTab()
+                .tabItem { Label("Recordings", systemImage: "record.circle") }
 
             SyncSettingsTab(viewModel: viewModel)
                 .tabItem { Label("Sync", systemImage: "arrow.triangle.2.circlepath") }
@@ -18,40 +22,326 @@ struct SettingsView: View {
             GeneralAppSettingsTab()
                 .tabItem { Label("General", systemImage: "gearshape") }
         }
-        .frame(width: 560, height: 520)
+        .frame(width: 720, height: 560)
     }
 }
 
-// MARK: - General
+// MARK: - Playlists
 
-private struct GeneralSettingsTab: View {
+private struct PlaylistsSettingsTab: View {
     @Bindable var viewModel: EPGViewModel
+    @State private var selection: PlaylistEditorSelection = .none
+
+    var body: some View {
+        Group {
+            if viewModel.playlists.isEmpty && !selection.isNewDraft {
+                firstRunView
+            } else {
+                HStack(spacing: 0) {
+                    PlaylistSidebar(viewModel: viewModel, selection: $selection)
+                        .frame(width: 220)
+
+                    Divider()
+
+                    PlaylistDetail(viewModel: viewModel, selection: $selection)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+        }
+        .onAppear { ensureSelectionIsValid() }
+        .onChange(of: viewModel.playlists.map(\.id)) { _, _ in ensureSelectionIsValid() }
+    }
+
+    private var firstRunView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "tv.badge.wifi")
+                .font(.system(size: 40))
+                .foregroundStyle(.secondary)
+            Text("Add your first playlist")
+                .font(.title3.weight(.semibold))
+            Text("Connect Buffer to an Xtream Codes provider or an M3U playlist to start watching.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 360)
+            Button {
+                selection = .new(ServerConfig())
+            } label: {
+                Label("Add Playlist", systemImage: "plus.circle.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func ensureSelectionIsValid() {
+        switch selection {
+        case .none:
+            if viewModel.playlists.isEmpty {
+                selection = .new(ServerConfig())
+            } else if let active = viewModel.activePlaylist {
+                selection = .existing(active.id)
+            } else if let first = viewModel.playlists.first {
+                selection = .existing(first.id)
+            }
+        case .existing(let id):
+            if !viewModel.playlists.contains(where: { $0.id == id }) {
+                if let active = viewModel.activePlaylist {
+                    selection = .existing(active.id)
+                } else if let first = viewModel.playlists.first {
+                    selection = .existing(first.id)
+                } else {
+                    selection = .new(ServerConfig())
+                }
+            }
+        case .new:
+            break
+        }
+    }
+}
+
+private enum PlaylistEditorSelection {
+    case none
+    case existing(UUID)
+    case new(ServerConfig)
+
+    var isExistingID: Bool {
+        if case .existing = self { return true }
+        return false
+    }
+
+    var isNewDraft: Bool {
+        if case .new = self { return true }
+        return false
+    }
+
+    var existingID: UUID? {
+        if case .existing(let id) = self { return id }
+        return nil
+    }
+}
+
+// MARK: - Sidebar
+
+private struct PlaylistSidebar: View {
+    @Bindable var viewModel: EPGViewModel
+    @Binding var selection: PlaylistEditorSelection
+
+    var body: some View {
+        VStack(spacing: 0) {
+            List(selection: sidebarBinding) {
+                ForEach(viewModel.playlists) { playlist in
+                    PlaylistRow(
+                        playlist: playlist,
+                        isActive: viewModel.activePlaylistID == playlist.id
+                    )
+                    .tag(PlaylistRowTag.existing(playlist.id))
+                    .contextMenu { rowMenu(for: playlist) }
+                }
+
+                if case .new = selection {
+                    Label("New Playlist", systemImage: "plus.circle")
+                        .foregroundStyle(.secondary)
+                        .tag(PlaylistRowTag.new)
+                }
+            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            Divider()
+
+            HStack(spacing: 4) {
+                Button {
+                    selection = .new(ServerConfig())
+                } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 22, height: 22)
+                }
+                .help("Add playlist")
+
+                Button {
+                    if let id = selection.existingID {
+                        viewModel.removePlaylist(id: id)
+                    }
+                } label: {
+                    Image(systemName: "minus")
+                        .frame(width: 22, height: 22)
+                }
+                .disabled(selection.existingID == nil)
+                .help("Delete playlist")
+
+                Spacer()
+            }
+            .buttonStyle(.borderless)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .background(Color(nsColor: .controlBackgroundColor))
+        }
+    }
+
+    @ViewBuilder
+    private func rowMenu(for playlist: ServerConfig) -> some View {
+        if viewModel.activePlaylistID != playlist.id {
+            Button("Use This Playlist") {
+                viewModel.setActivePlaylist(id: playlist.id)
+            }
+        }
+        Button("Duplicate") { duplicate(playlist) }
+        Divider()
+        Button("Delete", role: .destructive) {
+            viewModel.removePlaylist(id: playlist.id)
+        }
+    }
+
+    private var sidebarBinding: Binding<PlaylistRowTag?> {
+        Binding(
+            get: {
+                switch selection {
+                case .existing(let id): return .existing(id)
+                case .new: return .new
+                case .none: return nil
+                }
+            },
+            set: { tag in
+                switch tag {
+                case .existing(let id): selection = .existing(id)
+                case .new: selection = .new(ServerConfig())
+                case .none: break
+                }
+            }
+        )
+    }
+
+    private func duplicate(_ playlist: ServerConfig) {
+        let copy = ServerConfig(
+            id: UUID(),
+            name: playlist.name.isEmpty ? "Playlist Copy" : "\(playlist.name) Copy",
+            type: playlist.type,
+            serverURL: playlist.serverURL,
+            username: playlist.username,
+            password: playlist.password,
+            m3uURL: playlist.m3uURL,
+            epgURL: playlist.epgURL
+        )
+        viewModel.addPlaylist(copy, makeActive: false)
+        selection = .existing(copy.id)
+    }
+}
+
+private enum PlaylistRowTag: Hashable {
+    case existing(UUID)
+    case new
+}
+
+private struct PlaylistRow: View {
+    let playlist: ServerConfig
+    let isActive: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(isActive ? Color.accentColor : Color.secondary.opacity(0.4))
+                .font(.system(size: 13))
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(playlist.name.isEmpty ? "Untitled Playlist" : playlist.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                Text(playlist.type.rawValue)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
+// MARK: - Detail (editor)
+
+private struct PlaylistDetail: View {
+    @Bindable var viewModel: EPGViewModel
+    @Binding var selection: PlaylistEditorSelection
+
+    var body: some View {
+        switch selection {
+        case .none:
+            emptyDetail
+        case .existing(let id):
+            if let playlist = viewModel.playlists.first(where: { $0.id == id }) {
+                PlaylistEditor(
+                    viewModel: viewModel,
+                    mode: .existing(id: id, original: playlist)
+                )
+                .id(id)
+            } else {
+                emptyDetail
+            }
+        case .new(let draft):
+            PlaylistEditor(
+                viewModel: viewModel,
+                mode: .new(initial: draft),
+                onCreated: { newID in
+                    selection = .existing(newID)
+                }
+            )
+            .id("new-editor")
+        }
+    }
+
+    private var emptyDetail: some View {
+        VStack {
+            Spacer()
+            Text("Select a playlist to edit its details.")
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+    }
+}
+
+private struct PlaylistEditor: View {
+    enum Mode {
+        case new(initial: ServerConfig)
+        case existing(id: UUID, original: ServerConfig)
+
+        var initialConfig: ServerConfig {
+            switch self {
+            case .new(let initial): return initial
+            case .existing(_, let original): return original
+            }
+        }
+
+        var isNew: Bool {
+            if case .new = self { return true }
+            return false
+        }
+
+        var existingID: UUID? {
+            if case .existing(let id, _) = self { return id }
+            return nil
+        }
+    }
+
+    @Bindable var viewModel: EPGViewModel
+    let mode: Mode
+    var onCreated: ((UUID) -> Void)? = nil
+
     @State private var draft: ServerConfig
-    @State private var hasSubmittedFirstAccount = false
     @State private var connectionTestState: ConnectionTestState = .idle
     @State private var statusPreview: ServerAccountStatus?
-    private let isCreatingFirstAccount: Bool
+    @State private var justApplied = false
 
-    init(viewModel: EPGViewModel) {
+    init(viewModel: EPGViewModel, mode: Mode, onCreated: ((UUID) -> Void)? = nil) {
         self.viewModel = viewModel
-        self._draft = State(initialValue: viewModel.serverConfig ?? ServerConfig())
-        self.isCreatingFirstAccount = viewModel.serverConfig == nil
+        self.mode = mode
+        self.onCreated = onCreated
+        self._draft = State(initialValue: mode.initialConfig)
     }
 
     var body: some View {
         Form {
-            if isCreatingFirstAccount {
-                Section {
-                    SetupFeedbackCard(
-                        title: "Add your first account",
-                        message: "Choose a provider, enter the details, then click Apply & Sync.",
-                        systemImage: "sparkles",
-                        tint: .accentColor
-                    )
-                }
-            }
-
-            Section("Server") {
+            Section("Playlist") {
                 TextField("Name", text: $draft.name, prompt: Text("My provider"))
                 Picker("Type", selection: $draft.type) {
                     ForEach(ServerType.allCases, id: \.self) { type in
@@ -74,8 +364,10 @@ private struct GeneralSettingsTab: View {
                 }
             }
 
-            Section("Account") {
-                AccountStatusCard(status: displayedStatus, config: displayConfig)
+            if isActive {
+                Section("Account") {
+                    AccountStatusCard(status: displayedStatus, config: displayConfig)
+                }
             }
 
             Section {
@@ -102,31 +394,46 @@ private struct GeneralSettingsTab: View {
                 }
 
                 HStack {
-                    if let updated = viewModel.lastUpdated {
+                    if isActive, let updated = viewModel.lastUpdated {
                         Text("Last sync: \(updated.formatted(date: .abbreviated, time: .shortened))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else {
+                    } else if isActive {
                         Text("Not synced yet")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+
                     Button {
-                        Task {
-                            await testConnection()
-                        }
+                        Task { await testConnection() }
                     } label: {
                         Label(connectionTestState.buttonTitle, systemImage: connectionTestState.buttonSymbol)
                     }
                     .disabled(!isValid || connectionTestState.isTesting || viewModel.isRefreshing)
 
-                    Button("Apply & Sync") {
-                        hasSubmittedFirstAccount = true
-                        viewModel.serverConfig = draft
-                        viewModel.saveConfig()
-                        viewModel.startSyncScheduler()
-                        viewModel.sync()
+                    if !isActive && !mode.isNew {
+                        Button("Use This Playlist") {
+                            applyEdits()
+                            if let id = mode.existingID {
+                                viewModel.setActivePlaylist(id: id)
+                            }
+                        }
+                        .disabled(!isValid)
+                    }
+
+                    Button(primaryButtonTitle) {
+                        justApplied = true
+                        if mode.isNew {
+                            viewModel.addPlaylist(draft, makeActive: true)
+                            viewModel.startSyncScheduler()
+                            onCreated?(draft.id)
+                        } else {
+                            applyEdits()
+                            if isActive {
+                                viewModel.sync()
+                            }
+                        }
                     }
                     .keyboardShortcut(.defaultAction)
                     .disabled(!isValid)
@@ -146,12 +453,30 @@ private struct GeneralSettingsTab: View {
         }
     }
 
-    private var firstAccountFeedback: (title: String, message: String, systemImage: String, tint: Color, showsProgress: Bool)? {
-        guard isCreatingFirstAccount else { return nil }
+    private var isActive: Bool {
+        mode.existingID != nil && viewModel.activePlaylistID == mode.existingID
+    }
 
-        if let error = viewModel.errorMessage, hasSubmittedFirstAccount {
+    private var primaryButtonTitle: String {
+        if mode.isNew {
+            return "Add & Sync"
+        }
+        if isActive {
+            return "Apply & Sync"
+        }
+        return "Save"
+    }
+
+    private func applyEdits() {
+        viewModel.updatePlaylist(draft)
+    }
+
+    private var firstAccountFeedback: (title: String, message: String, systemImage: String, tint: Color, showsProgress: Bool)? {
+        guard mode.isNew || (justApplied && isActive) else { return nil }
+
+        if let error = viewModel.errorMessage, justApplied {
             return (
-                title: "Couldn’t add that account",
+                title: "Couldn’t add that playlist",
                 message: "\(error) Check the details and try again.",
                 systemImage: "exclamationmark.triangle.fill",
                 tint: .red,
@@ -159,7 +484,7 @@ private struct GeneralSettingsTab: View {
             )
         }
 
-        if viewModel.isRefreshing, hasSubmittedFirstAccount {
+        if viewModel.isRefreshing, justApplied {
             return (
                 title: "Syncing your channels",
                 message: viewModel.loadingStage ?? "Connecting and downloading channels.",
@@ -169,22 +494,12 @@ private struct GeneralSettingsTab: View {
             )
         }
 
-        if hasSubmittedFirstAccount, viewModel.lastUpdated != nil {
+        if justApplied, viewModel.lastUpdated != nil {
             return (
-                title: "Account added",
+                title: "Playlist ready",
                 message: "Sync complete. You can close Settings.",
                 systemImage: "checkmark.circle.fill",
                 tint: .green,
-                showsProgress: false
-            )
-        }
-
-        if hasSubmittedFirstAccount {
-            return (
-                title: "Account saved",
-                message: "Starting the first sync.",
-                systemImage: "clock.badge.checkmark",
-                tint: .accentColor,
                 showsProgress: false
             )
         }
@@ -216,11 +531,12 @@ private struct GeneralSettingsTab: View {
     }
 
     private var displayConfig: ServerConfig? {
-        if let current = viewModel.serverConfig,
+        if isActive,
+           let current = viewModel.activePlaylist,
            DataCache.cacheKey(for: current) == DataCache.cacheKey(for: draft) {
             return current
         }
-        return isValid ? draft : viewModel.serverConfig
+        return isValid ? draft : viewModel.activePlaylist
     }
 
     private var displayedStatus: ServerAccountStatus? {
@@ -228,7 +544,8 @@ private struct GeneralSettingsTab: View {
     }
 
     private var shouldRefreshStoredStatus: Bool {
-        guard let current = viewModel.serverConfig,
+        guard isActive,
+              let current = viewModel.activePlaylist,
               current.type == .xtream,
               DataCache.cacheKey(for: current) == DataCache.cacheKey(for: draft),
               statusPreview == nil,
@@ -237,12 +554,11 @@ private struct GeneralSettingsTab: View {
               !connectionTestState.isTesting else {
             return false
         }
-
         return true
     }
 
     private var autoRefreshKey: String {
-        [draftFingerprint, viewModel.serverConfig?.id.uuidString ?? "none"]
+        [draftFingerprint, mode.existingID?.uuidString ?? "new"]
             .joined(separator: "|")
     }
 
@@ -513,48 +829,39 @@ private struct AccountStatusCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
-                Text(config?.name.isEmpty == false ? config?.name ?? "Account" : "Account")
-                    .font(.headline)
-
-                Spacer()
-
                 Text(statusLabel)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                if status?.isTrial == true {
+                    Text("Trial")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                 GridRow {
                     accountField("Channels", channelCountText)
                     accountField("Guide", status?.guideStatus ?? "Unknown")
                 }
 
                 GridRow {
-                    accountField("Active Connections", activeConnectionsText)
-                    accountField("Max Connections", maxConnectionsText)
-                }
-
-                GridRow {
+                    accountField("Connections", "\(activeConnectionsText) / \(maxConnectionsText)")
                     accountField("Expiry", expiryText)
-                    accountField("Username", status?.username ?? (config?.username.isEmpty == false ? config?.username ?? "—" : "—"))
                 }
             }
 
-            if status?.isTrial == true {
-                Text("Trial account")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else if status == nil {
+            if status == nil {
                 Text("Use Test Connection or Apply & Sync to load details.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            } else {
+                Text(lastUpdatedText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-
-            Text(lastUpdatedText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -690,21 +997,106 @@ private struct PlaybackSettingsTab: View {
     }
 }
 
+// MARK: - Recordings
+
+private struct RecordingsSettingsTab: View {
+    @State private var manager = RecordingManager.shared
+
+    var body: some View {
+        Form {
+            Section("Output") {
+                HStack {
+                    Text("Save to")
+                    Spacer()
+                    Text(manager.outputDirectory.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button("Choose…") { chooseDirectory() }
+                }
+                Text("Scheduled and realtime recordings are saved as .ts files grouped by channel name.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Padding") {
+                Stepper(value: Binding(
+                    get: { manager.preRollSeconds },
+                    set: { manager.preRollSeconds = $0 }
+                ), in: 0...300, step: 10) {
+                    HStack {
+                        Text("Start early")
+                        Spacer()
+                        Text("\(manager.preRollSeconds) s")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Stepper(value: Binding(
+                    get: { manager.postRollSeconds },
+                    set: { manager.postRollSeconds = $0 }
+                ), in: 0...600, step: 30) {
+                    HStack {
+                        Text("Stop late")
+                        Spacer()
+                        Text("\(manager.postRollSeconds) s")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("Small safety margins around each scheduled recording so stream start-up lag and program overruns don't clip the episode.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Wake from sleep") {
+                Toggle("Wake Mac for scheduled recordings", isOn: Binding(
+                    get: { manager.wakeMacForRecordings },
+                    set: { manager.wakeMacForRecordings = $0 }
+                ))
+                Text("Uses macOS power-event scheduling to wake the Mac about two minutes before each recording starts. Buffer still needs to be running in the background.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .scrollDisabled(true)
+    }
+
+    private func chooseDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = manager.outputDirectory
+        if panel.runModal() == .OK, let url = panel.url {
+            manager.setOutputDirectory(url, fromPicker: true)
+        }
+    }
+}
+
 // MARK: - Sync
 
 private struct SyncSettingsTab: View {
     @Bindable var viewModel: EPGViewModel
-    @AppStorage(SyncInterval.appStorageKey) private var syncIntervalHours: Int = SyncInterval.default.hours
+    @AppStorage(SyncInterval.playlistStorageKey) private var playlistIntervalHours: Int = SyncInterval.playlistDefault.hours
+    @AppStorage(SyncInterval.epgStorageKey) private var epgIntervalHours: Int = SyncInterval.epgDefault.hours
 
     var body: some View {
         Form {
             Section("Automatic Refresh") {
-                Picker("Refresh every", selection: $syncIntervalHours) {
+                Picker("Refresh playlist every", selection: $playlistIntervalHours) {
                     ForEach(SyncInterval.allCases) { interval in
                         Text(interval.title).tag(interval.hours)
                     }
                 }
-                Text("Refreshes in the background while Buffer is open.")
+                Picker("Refresh guide every", selection: $epgIntervalHours) {
+                    ForEach(SyncInterval.allCases) { interval in
+                        Text(interval.title).tag(interval.hours)
+                    }
+                }
+                Text("Refreshes in the background while Buffer is open. The guide also refreshes on launch.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -722,13 +1114,16 @@ private struct SyncSettingsTab: View {
                     Button("Refresh Now") {
                         viewModel.sync()
                     }
-                    .disabled(viewModel.isRefreshing || viewModel.serverConfig == nil)
+                    .disabled(viewModel.isRefreshing || viewModel.activePlaylist == nil)
                 }
             }
         }
         .formStyle(.grouped)
         .scrollDisabled(true)
-        .onChange(of: syncIntervalHours) { _, _ in
+        .onChange(of: playlistIntervalHours) { _, _ in
+            viewModel.startSyncScheduler()
+        }
+        .onChange(of: epgIntervalHours) { _, _ in
             viewModel.startSyncScheduler()
         }
     }

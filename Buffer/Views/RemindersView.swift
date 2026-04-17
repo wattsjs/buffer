@@ -2,7 +2,7 @@ import SwiftUI
 
 struct RemindersView: View {
     let channels: [Channel]
-    let onChannelSelected: (Channel) -> Void
+    let onPlayReminder: (ProgramReminder) -> Void
 
     @State private var notificationManager = NotificationManager.shared
     @State private var tick = Date()
@@ -47,7 +47,7 @@ struct RemindersView: View {
                     ReminderRow(
                         reminder: reminder,
                         channel: channels.first { $0.id == reminder.channelID },
-                        onPlay: { channel in onChannelSelected(channel) },
+                        onPlay: { onPlayReminder(reminder) },
                         onCancel: { notificationManager.cancelReminder(id: reminder.id) }
                     )
                     .id(reminder.id)
@@ -86,7 +86,7 @@ struct RemindersView: View {
 private struct ReminderRow: View {
     let reminder: ProgramReminder
     let channel: Channel?
-    let onPlay: (Channel) -> Void
+    let onPlay: () -> Void
     let onCancel: () -> Void
 
     @State private var hovered = false
@@ -202,12 +202,12 @@ private struct ReminderRow: View {
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
         .contextMenu {
+            Button {
+                onPlay()
+            } label: {
+                Label("Play Channel", systemImage: "play.fill")
+            }
             if let channel {
-                Button {
-                    onPlay(channel)
-                } label: {
-                    Label("Play Channel", systemImage: "play.fill")
-                }
                 AddToMultiViewMenuItem(channel: channel)
             }
             Button(role: .destructive, action: onCancel) {
@@ -215,7 +215,7 @@ private struct ReminderRow: View {
             }
         }
         .onTapGesture {
-            if let channel { onPlay(channel) }
+            onPlay()
         }
     }
 }

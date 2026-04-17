@@ -57,21 +57,15 @@ final class PlayerSlot: Identifiable {
     var channel: Channel
     var currentProgram: EPGProgram?
 
+    /// StreamProxy token + localhost URL the mpv player connects to. The
+    /// proxy fans bytes out from one upstream broadcaster, so viewer and
+    /// recorder share the same provider connection.
+    @ObservationIgnored private(set) var proxyToken: UUID
+    @ObservationIgnored private(set) var proxiedURL: URL
+
     // MPVPlayer is created lazily on first access. SwiftUI re-invokes view
-    // inits on every parent re-render, which means
-    // `State(initialValue: PlayerSession(...))` evaluates the PlayerSession
-    // eagerly on every render — allocating and discarding all the extras.
-    // If the slot eagerly constructed an MPVPlayer, each orphan would spin
-    // up a libmpv handle and (before this fix) load a URL and play audio,
-    // producing the phantom overlapping audio in single-stream mode.
-    //
-    // With lazy init, discarded slots touch zero libmpv state. Only the
-    // slot that actually lands in the @State-held session has its `player`
-    // accessed, which triggers `MPVPlayer()` exactly once.
-    //
-    // `lazy var` can't be used because `@Observable` rewrites stored
-    // properties into computed ones, so we roll our own lazy with an
-    // `@ObservationIgnored` backing store.
+    // inits on every parent re-render; a discarded slot must not spawn an
+    // mpv instance just to be torn down a moment later.
     @ObservationIgnored private var _player: MPVPlayer?
     @ObservationIgnored var player: MPVPlayer {
         if let existing = _player { return existing }
@@ -83,6 +77,25 @@ final class PlayerSlot: Identifiable {
     init(channel: Channel, currentProgram: EPGProgram?) {
         self.channel = channel
         self.currentProgram = currentProgram
+        let ref = StreamProxy.shared.proxiedURL(for: channel.streamURL)
+        self.proxyToken = ref.token
+        self.proxiedURL = ref.url
+    }
+
+    func unregisterFromRegistry() {
+        // no-op now; kept for call-site compatibility.
+    }
+
+    /// Mint a fresh proxy token for the current channel. Proxy URLs are
+    /// single-use (the route handler clears the token once mpv connects), so
+    /// any reconnect after the first load — e.g. returning from catchup —
+    /// needs a new token so bytes still flow through the shared broadcaster
+    /// instead of mpv opening a second direct upstream connection.
+    func freshProxiedURL() -> URL {
+        let ref = StreamProxy.shared.proxiedURL(for: channel.streamURL)
+        self.proxyToken = ref.token
+        self.proxiedURL = ref.url
+        return ref.url
     }
 }
 
@@ -102,17 +115,17 @@ final class PlayerSession {
         self.layout = .single
     }
 
-    /// Called from `PlayerView.onAppear`. Must not run from `init` — SwiftUI
-    /// re-invokes view initializers on every parent re-render, so any side
-    /// effects in `init` (like `loadURL` / `play`) would briefly spawn an
-    /// orphan libmpv instance and play overlapping audio before being
-    /// discarded. `@State` only keeps the first value; all the extras leak
-    /// audio on their way to deinit.
-    func start() {
+    /// Called from `PlayerView.onAppear`. Side effects (loadURL/play) must
+    /// not run in `init` since SwiftUI may discard the PlayerSession.
+    /// Pass `skipInitialLoad: true` when the caller is about to issue its own
+    /// `loadURL` (e.g. a pending-catchup hand-off) so we don't fire a throw-
+    /// away live load that mpv immediately replaces.
+    func start(skipInitialLoad: Bool = false) {
         guard !started else { return }
         started = true
+        guard !skipInitialLoad else { return }
         let first = slots[0]
-        first.player.loadURL(first.channel.streamURL)
+        first.player.loadURL(first.proxiedURL)
         first.player.play()
     }
 
@@ -136,7 +149,7 @@ final class PlayerSession {
         let slot = PlayerSlot(channel: channel, currentProgram: currentProgram)
         slots.append(slot)
 
-        slot.player.loadURL(channel.streamURL)
+        slot.player.loadURL(slot.proxiedURL)
         slot.player.play()
         // Apply mute AFTER loadURL+play: mpv initializes its audio output on
         // file load, and setting `mute` before that can race (a burst of
@@ -150,14 +163,10 @@ final class PlayerSession {
         guard slots.count > 1 else { return }
         guard let index = slots.firstIndex(where: { $0.id == id }) else { return }
 
-        // Stop playback + mute BEFORE removing the slot from the array so
-        // audio dies the moment the user clicks the close button. The slot
-        // itself stays alive while SwiftUI tears down its MPVOpenGLView
-        // (which holds a strong ref to the MPVPlayer), then the player's
-        // deinit fires once the view teardown has completed.
         let removed = slots[index]
         removed.player.setMute(true)
         removed.player.pause()
+        removed.unregisterFromRegistry()
 
         slots.remove(at: index)
 

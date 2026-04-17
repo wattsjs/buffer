@@ -233,6 +233,22 @@ private struct HomeLiveEventCard: View {
     @State private var matches: [StreamMatch]?
     @State private var isMatching = false
 
+    private var tournamentSubtitle: String? {
+        var parts: [String] = []
+        if let detail = event.detail, !detail.isEmpty {
+            let lower = detail.lowercased()
+            let redundant = lower == "live" || lower == "final" || lower.hasPrefix("final/")
+            if !redundant { parts.append(detail) }
+        }
+        if let leader = event.leader {
+            parts.append("\(leader.name) \(leader.score)")
+        }
+        if let venue = event.venue, !venue.isEmpty {
+            parts.append(venue)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
@@ -252,10 +268,19 @@ private struct HomeLiveEventCard: View {
                     .padding(.bottom, 6)
                 teamRow(home)
             } else {
-                Text(event.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(event.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(2)
+                    if let subtitle = tournamentSubtitle {
+                        Text(subtitle)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 52, alignment: .center)
             }
         }
         .padding(14)
