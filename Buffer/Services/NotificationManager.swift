@@ -61,13 +61,21 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
 
     // MARK: - Queries
 
-    func hasReminder(for program: EPGProgram) -> Bool {
-        let id = ProgramReminder.makeID(channelID: program.channelID, programID: program.id)
+    func hasReminder(playlistID: UUID, for program: EPGProgram) -> Bool {
+        let id = ProgramReminder.makeID(
+            playlistID: playlistID,
+            channelID: program.channelID,
+            programID: program.id
+        )
         return reminders.contains { $0.id == id }
     }
 
-    func reminder(for program: EPGProgram) -> ProgramReminder? {
-        let id = ProgramReminder.makeID(channelID: program.channelID, programID: program.id)
+    func reminder(playlistID: UUID, for program: EPGProgram) -> ProgramReminder? {
+        let id = ProgramReminder.makeID(
+            playlistID: playlistID,
+            channelID: program.channelID,
+            programID: program.id
+        )
         return reminders.first { $0.id == id }
     }
 
@@ -75,6 +83,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
 
     @discardableResult
     func scheduleReminder(
+        playlistID: UUID,
         program: EPGProgram,
         channel: Channel,
         leadMinutes: Int = 5
@@ -97,7 +106,11 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         // gets a "now playing" nudge.
         let fireDate = max(preferredFire, now.addingTimeInterval(2))
 
-        let id = ProgramReminder.makeID(channelID: program.channelID, programID: program.id)
+        let id = ProgramReminder.makeID(
+            playlistID: playlistID,
+            channelID: program.channelID,
+            programID: program.id
+        )
 
         // Remove any existing request under the same id first.
         UNUserNotificationCenter.current()
@@ -110,9 +123,9 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         content.sound = .default
         content.categoryIdentifier = Self.categoryID
         content.userInfo = [
+            "playlistID": playlistID.uuidString,
             "channelID": channel.id,
-            "programID": program.id,
-            "streamURL": channel.streamURL.absoluteString
+            "programID": program.id
         ]
         content.threadIdentifier = channel.id
 
@@ -132,6 +145,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
 
         let reminder = ProgramReminder(
             id: id,
+            playlistID: playlistID,
             programID: program.id,
             channelID: channel.id,
             channelName: channel.name,
@@ -150,8 +164,12 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         return true
     }
 
-    func cancelReminder(for program: EPGProgram) {
-        let id = ProgramReminder.makeID(channelID: program.channelID, programID: program.id)
+    func cancelReminder(playlistID: UUID, for program: EPGProgram) {
+        let id = ProgramReminder.makeID(
+            playlistID: playlistID,
+            channelID: program.channelID,
+            programID: program.id
+        )
         cancelReminder(id: id)
     }
 
@@ -159,6 +177,18 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         UNUserNotificationCenter.current()
             .removePendingNotificationRequests(withIdentifiers: [id])
         reminders.removeAll { $0.id == id }
+        saveReminders()
+    }
+
+    /// Remove every reminder owned by the given playlist. Called when the
+    /// playlist is deleted.
+    func cancelReminders(forPlaylistID playlistID: UUID) {
+        let doomed = reminders.filter { $0.playlistID == playlistID }
+        guard !doomed.isEmpty else { return }
+        let ids = doomed.map(\.id)
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: ids)
+        reminders.removeAll { $0.playlistID == playlistID }
         saveReminders()
     }
 
@@ -259,20 +289,18 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        let info = response.notification.request.content.userInfo
-        guard let urlString = info["streamURL"] as? String,
-              let url = URL(string: urlString) else { return }
-
-        // Remove the fired reminder from local state.
         let id = response.notification.request.identifier
+        guard let reminder = reminders.first(where: { $0.id == id }) else { return }
+
+        // Consume the reminder now — the system will also clear its pending
+        // request by identifier since fire + activate implies completion.
         reminders.removeAll { $0.id == id }
         saveReminders()
 
         NSApp.activate(ignoringOtherApps: true)
         NotificationCenter.default.post(
             name: Self.openStreamNotification,
-            object: url,
-            userInfo: info
+            object: reminder
         )
     }
 }

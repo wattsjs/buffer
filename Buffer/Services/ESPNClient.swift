@@ -159,22 +159,59 @@ actor ESPNClient {
         let shortName = (json["shortName"] as? String) ?? name
         let startDate = parseDate(dateString)
 
-        let statusJSON = json["status"] as? [String: Any]
-        let statusType = statusJSON?["type"] as? [String: Any]
-        let status = parseStatus(statusType)
-
         let competition = competitions?.first
+
+        // Use event-level status for state (live/scheduled/final) since a
+        // tournament can be live even when a single round/session has
+        // completed. But fall back to the competition-level status text for
+        // the display detail, since some sports (golf) leave the event-level
+        // detail blank while the competition has "Round 1 - Play Complete".
+        let eventStatusType = (json["status"] as? [String: Any])?["type"] as? [String: Any]
+        let compStatusType = (competition?["status"] as? [String: Any])?["type"] as? [String: Any]
+        let eventShortDetail = eventStatusType?["shortDetail"] as? String
+        let eventDetail = eventStatusType?["detail"] as? String
+        let compShortDetail = compStatusType?["shortDetail"] as? String
+        let compDetail = compStatusType?["detail"] as? String
+        let bestShortDetail = (eventShortDetail?.isEmpty == false ? eventShortDetail : compShortDetail)
+        let bestDetail = (eventDetail?.isEmpty == false ? eventDetail : compDetail)
+
+        // Build a merged status type dict so parseStatus sees the event's
+        // state but the richer detail string.
+        var mergedStatus: [String: Any] = eventStatusType ?? [:]
+        if let bestShortDetail { mergedStatus["shortDetail"] = bestShortDetail }
+        if let bestDetail { mergedStatus["detail"] = bestDetail }
+        let status = parseStatus(mergedStatus)
 
         let competitors = competition?["competitors"] as? [[String: Any]]
         let (home, away) = parseTeams(competitors)
 
         let broadcasts = parseBroadcasts(competition)
 
-        let venueJSON = competition?["venue"] as? [String: Any]
+        let venueJSON = (competition?["venue"] as? [String: Any])
+            ?? (json["venue"] as? [String: Any])
         let venue = venueJSON?["fullName"] as? String
 
-        let detail = (statusType?["shortDetail"] as? String)
-            ?? (statusType?["detail"] as? String)
+        let detail = bestShortDetail ?? bestDetail
+
+        // Leader (golf-style events with many athlete competitors and no
+        // home/away distinction — first by `order` holds the lead).
+        let leader: LeaderInfo? = {
+            guard home == nil, away == nil,
+                  let comps = competitors, comps.count > 1 else { return nil }
+            let sorted = comps.sorted { (a, b) in
+                let ao = a["order"] as? Int ?? Int.max
+                let bo = b["order"] as? Int ?? Int.max
+                return ao < bo
+            }
+            guard let first = sorted.first,
+                  let athlete = first["athlete"] as? [String: Any],
+                  let name = (athlete["displayName"] as? String)
+                    ?? (athlete["shortName"] as? String),
+                  let score = first["score"] as? String, !score.isEmpty else {
+                return nil
+            }
+            return LeaderInfo(name: name, score: score)
+        }()
 
         return [SportEvent(
             id: "\(league.id)_\(id)",
@@ -189,7 +226,8 @@ actor ESPNClient {
             broadcast: broadcasts,
             venue: venue,
             detail: detail,
-            tournamentName: nil
+            tournamentName: nil,
+            leader: leader
         )]
     }
 
@@ -297,7 +335,8 @@ actor ESPNClient {
             broadcast: broadcasts,
             venue: venue,
             detail: detail,
-            tournamentName: tournamentName
+            tournamentName: tournamentName,
+            leader: nil
         )
     }
 
@@ -355,7 +394,8 @@ actor ESPNClient {
             broadcast: broadcasts,
             venue: venue,
             detail: detail,
-            tournamentName: tournamentName
+            tournamentName: tournamentName,
+            leader: nil
         )
     }
 

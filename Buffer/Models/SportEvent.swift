@@ -16,6 +16,7 @@ nonisolated struct SportEvent: Identifiable, Sendable {
     let venue: String?
     let detail: String?            // "3rd Quarter 5:42" or "Final"
     let tournamentName: String?    // "Barcelona Open" for expanded tournament matches
+    let leader: LeaderInfo?        // For tournament events without head-to-head teams (golf)
 
     var displayTitle: String {
         if let away = awayTeam, let home = homeTeam {
@@ -38,6 +39,11 @@ nonisolated struct SportEvent: Identifiable, Sendable {
         tokens.append(league.shortName.lowercased())
         return tokens
     }
+}
+
+nonisolated struct LeaderInfo: Sendable {
+    let name: String               // "Ludvig Åberg"
+    let score: String              // "-8"
 }
 
 nonisolated struct TeamInfo: Sendable {

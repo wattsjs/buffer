@@ -19,6 +19,13 @@ struct ContentView: View {
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
     @AppStorage("hideSport") private var hideSport = false
 
+    private var playlistSelectionBinding: Binding<UUID> {
+        Binding(
+            get: { viewModel.activePlaylistID ?? viewModel.playlists.first?.id ?? UUID() },
+            set: { viewModel.setActivePlaylist(id: $0) }
+        )
+    }
+
     private func openChannel(_ channel: Channel) {
         viewModel.addRecent(channel)
         if selectedPlayer != .none {
@@ -28,11 +35,32 @@ struct ContentView: View {
         }
     }
 
+    private func openReminder(_ reminder: ProgramReminder) {
+        Task { @MainActor in
+            if let channel = await viewModel.resolveReminder(reminder) {
+                openChannel(channel)
+            } else {
+                appFeedback.show(
+                    .reminderChannelMissing(
+                        playlistName: viewModel.activePlaylist?.name ?? "",
+                        channelName: reminder.channelName
+                    )
+                )
+            }
+        }
+    }
+
+    private func handleFiredReminder(_ note: Notification) {
+        guard let reminder = note.object as? ProgramReminder else { return }
+        openReminder(reminder)
+    }
+
     private var pageTitle: String {
         switch viewModel.selection {
         case .home:        return "Home"
         case .sports:      return "Sports"
         case .reminders:   return "Reminders"
+        case .recordings:  return "Recordings"
         case .search:      return "Search"
         case .favorites:   return "Favorites"
         case .allChannels: return "All Channels"
@@ -63,7 +91,12 @@ struct ContentView: View {
         case .reminders:
             RemindersView(
                 channels: viewModel.channels,
-                onChannelSelected: { openChannel($0) }
+                onPlayReminder: { openReminder($0) }
+            )
+        case .recordings:
+            RecordingsView(
+                channels: viewModel.channels,
+                onPlayChannel: { openChannel($0) }
             )
         case .search:
             ProgramSearchResultsPage(
@@ -181,14 +214,15 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if viewModel.serverConfig == nil {
+            if viewModel.playlists.isEmpty {
                 welcomeView
             } else {
                 mainNavigation
             }
         }
+        .environment(\.activePlaylistID, viewModel.activePlaylistID)
         .toolbar {
-            if viewModel.serverConfig != nil {
+            if viewModel.activePlaylist != nil {
                 ToolbarItem(placement: .primaryAction) {
                     Button {
                         viewModel.sync()
@@ -250,6 +284,13 @@ struct ContentView: View {
                 selectionBeforeSearch = nil
             }
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: NotificationManager.openStreamNotification
+            )
+        ) { note in
+            handleFiredReminder(note)
+        }
         .onChange(of: searchController.hasQuery) { _, hasQuery in
             if hasQuery && viewModel.selection != .search {
                 selectionBeforeSearch = viewModel.selection
@@ -264,19 +305,31 @@ struct ContentView: View {
             // If the cache is empty (first launch, or cache invalidated by a
             // schema bump) kick off an immediate sync so the user doesn't have
             // to hit refresh manually.
-            if viewModel.serverConfig != nil && viewModel.channels.isEmpty {
-                viewModel.sync()
+            if viewModel.activePlaylist != nil {
+                if viewModel.channels.isEmpty {
+                    viewModel.sync(scope: .all)
+                } else {
+                    // Cache had channels — refresh just the EPG so the guide
+                    // is current without re-fetching the whole playlist.
+                    viewModel.sync(silent: true, scope: .epg)
+                }
             }
             viewModel.startSyncScheduler()
 
-            // Pre-load sports data so live events show on the Home page
+            // Pre-load sports data so live events show on the Home page.
+            // Deferred by a short delay so app-launch paint + initial EPG sync
+            // aren't competing with the ESPN fetch + refresh timer start on
+            // the same runloop tick.
             if !hideSport {
-                sportsViewModel.channels = viewModel.channels
-                sportsViewModel.programs = viewModel.programs
-                sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
-                sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
-                sportsViewModel.refresh()
-                sportsViewModel.startAutoRefresh()
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(500))
+                    sportsViewModel.channels = viewModel.channels
+                    sportsViewModel.programs = viewModel.programs
+                    sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
+                    sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
+                    sportsViewModel.refresh()
+                    sportsViewModel.startAutoRefresh()
+                }
             }
         }
     }

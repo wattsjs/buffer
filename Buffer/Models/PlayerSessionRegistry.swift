@@ -24,6 +24,9 @@ final class PlayerSessionRegistry {
     }
 }
 
+// StreamProxyRegistry was removed — the broadcaster architecture keys off
+// the upstream URL directly, so no external lookup table is needed.
+
 /// Context-menu item for the main window's channel rows. Shows only when
 /// there's an active player session that still has room for more slots.
 struct AddToMultiViewMenuItem: View {

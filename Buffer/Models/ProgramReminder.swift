@@ -2,6 +2,7 @@ import Foundation
 
 struct ProgramReminder: Identifiable, Codable, Equatable, Sendable {
     let id: String
+    let playlistID: UUID
     let programID: String
     let channelID: String
     let channelName: String
@@ -14,7 +15,7 @@ struct ProgramReminder: Identifiable, Codable, Equatable, Sendable {
     let leadMinutes: Int
     let streamURL: URL
 
-    static func makeID(channelID: String, programID: String) -> String {
-        "buffer.reminder|\(channelID)|\(programID)"
+    static func makeID(playlistID: UUID, channelID: String, programID: String) -> String {
+        "buffer.reminder|\(playlistID.uuidString)|\(channelID)|\(programID)"
     }
 }

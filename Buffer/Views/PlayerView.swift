@@ -5,13 +5,11 @@ import NukeUI
 enum MediaInfoDisplay: String, CaseIterable {
     case expanded
     case collapsed
-    case hidden
 
     var next: MediaInfoDisplay {
         switch self {
         case .expanded: return .collapsed
-        case .collapsed: return .hidden
-        case .hidden: return .expanded
+        case .collapsed: return .expanded
         }
     }
 
@@ -19,15 +17,13 @@ enum MediaInfoDisplay: String, CaseIterable {
         switch self {
         case .expanded: return "info.circle.fill"
         case .collapsed: return "info.circle"
-        case .hidden: return "eye.slash"
         }
     }
 
     var label: String {
         switch self {
-        case .expanded: return "Hide media details"
+        case .expanded: return "Collapse media details"
         case .collapsed: return "Expand media details"
-        case .hidden: return "Show media details"
         }
     }
 }
@@ -47,49 +43,107 @@ final class PlayerChromeState {
     }
 }
 
+/// One unified player view for both live channels and recorded files. The
+/// two modes share the same chrome layout and live pill semantics —
+/// controls that don't apply to a mode are simply hidden. The live state
+/// is latched: once the user is "at the live edge" the pill stays red
+/// through ordinary cache / frame jitter and only flips when the player
+/// drifts past `max(2 × buffer, buffer + 5s)` behind the live reference.
 struct PlayerView: View {
-    let viewModel: EPGViewModel
+    enum Mode {
+        case channel
+        case recording
+    }
+
+    let mode: Mode
+    /// Present only in channel mode — recordings don't need EPG lookups.
+    let viewModel: EPGViewModel?
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
-    @State private var session: PlayerSession
+
+    // Exactly one of these two is populated, keyed by `mode`.
+    @State private var channelSession: PlayerSession?
+    @State private var recordingPlayback: RecordingPlayback?
+
     @State private var chromeState = PlayerChromeState()
     @State private var showChrome = true
     @State private var chromeHideTask: Task<Void, Never>?
     @State private var showVolumePopover = false
     @State private var showChannelPicker = false
+
+    /// Recording-mode primary scrub position override while the user drags
+    /// the bottom scrubber. Also reused by channel mode's HLS-seekbar.
     @State private var scrubPosition: Double? = nil
+
+    /// Catchup step-slider scrub override (channel mode only).
     @State private var catchupScrubOffset: Double? = nil
-    /// Wall-clock start time of the currently loaded catchup clip.
-    /// `nil` means we're playing the live source.
+    /// Wall-clock start time of the currently loaded catchup clip. `nil`
+    /// means we're on the live source (or it's a recording).
     @State private var catchupStartDate: Date? = nil
-    /// True between the moment a catchup load is kicked off and the moment
-    /// playback of the new clip actually begins. Drives the inline spinner on
-    /// the offset pill so users know the step button registered.
+    /// True between the moment a catchup load is kicked off and the
+    /// moment playback of the new clip actually begins.
     @State private var isSeekingCatchup: Bool = false
     @State private var seekingTimeoutTask: Task<Void, Never>? = nil
-    /// Length of the catchup clip currently loaded, in seconds. We request a
-    /// window bracketing the user's target time so they can scrub a little.
     private let catchupClipDuration: TimeInterval = 2 * 60 * 60
 
+    /// Sticky live indicator. Starts true for any source that has a live
+    /// concept (channel + in-progress recording) and false for completed
+    /// recordings. Flipped to false only when the player has meaningfully
+    /// drifted behind the live reference; re-latched by a LIVE button
+    /// press or a seek back near the edge.
+    @State private var liveLatched: Bool
+
+    // MARK: - Init
+
     init(channel: Channel, currentProgram: EPGProgram?, viewModel: EPGViewModel) {
+        self.mode = .channel
         self.viewModel = viewModel
-        _session = State(initialValue: PlayerSession(initialChannel: channel, currentProgram: currentProgram))
+        _channelSession = State(initialValue: PlayerSession(
+            initialChannel: channel,
+            currentProgram: currentProgram
+        ))
+        _recordingPlayback = State(initialValue: nil)
+        _liveLatched = State(initialValue: true)
     }
 
-    // The focused slot is the source of truth for all chrome/controls. In
-    // single mode this is simply the only slot; in multi mode it's whichever
-    // cell the user has tapped most recently.
-    private var player: MPVPlayer { session.focusedSlot.player }
-    private var channel: Channel { session.focusedSlot.channel }
-    private var currentProgram: EPGProgram? { session.focusedSlot.currentProgram }
-    private var liveProgram: EPGProgram? { viewModel.currentProgram(for: channel) }
+    init(recording: Recording) {
+        self.mode = .recording
+        self.viewModel = nil
+        _channelSession = State(initialValue: nil)
+        _recordingPlayback = State(initialValue: RecordingPlayback(recording: recording))
+        _liveLatched = State(initialValue: recording.status == .recording)
+    }
 
-    private var isLive: Bool { catchupStartDate == nil }
-    private var supportsRewind: Bool { !session.isMulti && channel.supportsRewind }
+    // MARK: - Source accessors
 
-    /// Wall-clock time the user is currently watching. In catchup mode, this
-    /// advances as the clip plays.
+    private var isRecordingMode: Bool { mode == .recording }
+    private var isChannelMode: Bool { mode == .channel }
+
+    private var session: PlayerSession? { channelSession }
+    private var playback: RecordingPlayback? { recordingPlayback }
+
+    private var player: MPVPlayer {
+        playback?.player ?? session!.focusedSlot.player
+    }
+
+    private var channel: Channel? { session?.focusedSlot.channel }
+    private var currentProgram: EPGProgram? { session?.focusedSlot.currentProgram }
+    private var liveProgram: EPGProgram? {
+        guard let c = channel else { return nil }
+        return viewModel?.currentProgram(for: c)
+    }
+
+    private var isMulti: Bool { session?.isMulti ?? false }
+    private var supportsRewind: Bool {
+        guard let s = session else { return false }
+        return !s.isMulti && (channel?.supportsRewind ?? false)
+    }
+
+    private var isCatchup: Bool { catchupStartDate != nil }
+
+    /// Wall-clock time the user is currently watching in catchup mode. For
+    /// live / recording it's just "now".
     private var effectiveWallClock: Date {
         if let start = catchupStartDate {
             return start.addingTimeInterval(player.timePos)
@@ -97,40 +151,77 @@ struct PlayerView: View {
         return Date()
     }
 
-    private var isAtDisplayedLiveState: Bool {
-        if supportsRewind || player.canReplay {
-            return player.isAtPreferredLivePosition && !isSeekingCatchup
-        }
-        return catchupCurrentOffset >= -30 && !isSeekingCatchup
+    private var displayedProgram: EPGProgram? {
+        guard let c = channel, let vm = viewModel else { return nil }
+        return vm.program(for: c, at: effectiveWallClock) ?? currentProgram
     }
 
-    private var displayedProgram: EPGProgram? {
-        if let program = viewModel.program(for: channel, at: effectiveWallClock) {
-            return program
-        }
-        return currentProgram
+    // MARK: - Live reference + latch
+
+    /// Buffer budget used for the latch threshold. Pulled from the shared
+    /// mpv setting, never zero.
+    private var bufferSeconds: Double {
+        max(player.configuredBufferSeconds, 1)
     }
+
+    /// How far behind the live reference the playhead is, in seconds
+    /// (always ≥ 0). Nil when the source has no live concept (completed
+    /// recording; HLS with no DVR window and no cache insight).
+    private var secondsBehindLive: Double? {
+        if isRecordingMode {
+            guard let p = playback, p.isInProgress else { return nil }
+            return max(0, p.totalDuration - player.timePos)
+        }
+        if isCatchup {
+            return max(0, -catchupCurrentOffset)
+        }
+        if supportsRewind || player.canReplay {
+            return max(0, player.duration - player.timePos - player.preferredLiveDelay)
+        }
+        return nil
+    }
+
+    /// Threshold at which the latch flips off. Deliberately larger than
+    /// the buffer so a transient cache dip (e.g. mpv's `paused-for-cache`
+    /// briefly reporting lower `cacheSeconds`) doesn't churn the pill.
+    private var liveUnlockThreshold: Double {
+        max(2 * bufferSeconds, bufferSeconds + 5)
+    }
+
+    /// Chrome state the LIVE pill renders from: sticky, computed off the
+    /// latch instead of off the instantaneous offset.
+    private var isDisplayedLive: Bool { liveLatched && !isCatchup && !isSeekingCatchup }
+
+    /// Whether the LIVE button should be actionable (i.e. we're not
+    /// already at live). Keeps the button disabled while the latch is
+    /// held so the user can only click it once per drift.
+    private var canJumpToLive: Bool {
+        if isRecordingMode {
+            return (playback?.isInProgress ?? false) && !isDisplayedLive
+        }
+        return !isDisplayedLive
+    }
+
+    // MARK: - Body
 
     var body: some View {
         ZStack {
-            Color.black
-                .ignoresSafeArea()
+            Color.black.ignoresSafeArea()
 
-            // Single code path for both single and multi. `PlayerGridView`
-            // drives ONE `MPVSessionRenderView` (one NSOpenGLView + one GL
-            // context + N mpv render contexts). Using the same view for
-            // both layouts avoids the single→multi transition, which used
-            // to tear down an old NSOpenGLView while a new one was being
-            // created — racing mpv dispatch queues and triggering
-            // `mp_dispatch_queue_process: !queue->in_process` asserts.
-            PlayerGridView(session: session)
-                .padding(session.isMulti ? 8 : 0)
-                .ignoresSafeArea()
+            // Render stack differs by mode, but chrome is unified below.
+            if let s = session {
+                PlayerGridView(session: s)
+                    .padding(s.isMulti ? 8 : 0)
+                    .ignoresSafeArea()
+            } else {
+                MPVLayerView(player: player)
+                    .ignoresSafeArea()
+            }
 
-            // Tap-to-toggle-pause layer. Only the bottom 2/3 receives taps;
-            // the top 1/3 is a passthrough drag region for window movement.
-            // Disabled in multi-view mode because per-cell taps handle focus.
-            if !session.isMulti {
+            // Tap-to-toggle-pause layer. Only the bottom 2/3 receives
+            // taps; the top 1/3 is a passthrough drag region for window
+            // movement. Disabled in multi-view (per-cell taps handle focus).
+            if !isMulti {
                 GeometryReader { geo in
                     VStack(spacing: 0) {
                         Color.clear
@@ -146,7 +237,7 @@ struct PlayerView: View {
             }
         }
         .overlay(alignment: .topLeading) {
-            if showChrome && !session.isMulti {
+            if showChrome && !isMulti {
                 infoStack
                     .padding(16)
                     .allowsHitTesting(false)
@@ -162,14 +253,14 @@ struct PlayerView: View {
             }
         }
         .overlay(alignment: .bottomLeading) {
-            if showChrome && !session.isMulti {
+            if showChrome && !isMulti {
                 controlsBar
                     .padding(16)
                     .transition(.opacity)
             }
         }
         .overlay(alignment: .bottomTrailing) {
-            if showChrome && !session.isMulti && chromeState.mediaInfoDisplay != .hidden {
+            if showChrome && !isMulti {
                 mediaInfoCard
                     .padding(16)
                     .allowsHitTesting(false)
@@ -185,34 +276,22 @@ struct PlayerView: View {
         .preferredColorScheme(.dark)
         .environment(\.colorScheme, .dark)
         .frame(minWidth: 640, minHeight: 360)
-        .onAppear {
-            session.start()
-            PlayerSessionRegistry.shared.setActive(session)
-            // If the user launched this window from a past-program click in
-            // the EPG, immediately replace the live feed with the catchup
-            // clip for that program's start time.
-            if let start = PendingCatchup.consume(channelID: channel.id),
-               supportsRewind {
-                loadCatchup(startingAt: start)
-            }
-            scheduleChromeHide()
-        }
+        .onAppear { handleOnAppear() }
+        .onDisappear { handleOnDisappear() }
         .onChange(of: player.timePos) { _, _ in
             endSeekingIfPlaying()
+            reconcileLiveLatch()
         }
         .onChange(of: player.isBuffering) { _, _ in
             endSeekingIfPlaying()
         }
-        .onDisappear {
-            PlayerSessionRegistry.shared.unregister(session)
-            for slot in session.slots {
-                slot.player.pause()
-            }
+        .onChange(of: player.duration) { _, _ in
+            reconcileLiveLatch()
         }
         .background(WindowAccessor(
             showChrome: $showChrome,
             isPinned: chromeState.isPinned,
-            videoSize: session.isMulti
+            videoSize: isMulti
                 ? .zero
                 : CGSize(width: player.mediaInfo.width, height: player.mediaInfo.height)
         ))
@@ -224,7 +303,7 @@ struct PlayerView: View {
         .onContinuousHover(coordinateSpace: .local) { phase in
             switch phase {
             case .active:
-                PlayerSessionRegistry.shared.setActive(session)
+                if let s = session { PlayerSessionRegistry.shared.setActive(s) }
                 revealChrome()
             case .ended:
                 scheduleChromeHide()
@@ -241,12 +320,56 @@ struct PlayerView: View {
         .animation(.easeInOut(duration: 0.2), value: showChrome)
     }
 
-    // MARK: - Top-left: channel + EPG
+    // MARK: - Lifecycle
+
+    private func handleOnAppear() {
+        if let s = session {
+            // Consume any pending catchup BEFORE the session issues its
+            // default live load. Otherwise mpv briefly opens the live
+            // proxy URL, tears it down, then opens the catchup URL —
+            // visible as a blank player + a redundant probe on the live
+            // connection.
+            let pendingStart = channel.flatMap { PendingCatchup.consume(channelID: $0.id) }
+            let willCatchup = pendingStart != nil && supportsRewind
+            s.start(skipInitialLoad: willCatchup)
+            PlayerSessionRegistry.shared.setActive(s)
+            if let start = pendingStart, willCatchup {
+                loadCatchup(startingAt: start)
+            }
+        }
+        if let p = playback {
+            Task { @MainActor in
+                await p.start(renderContextReady: { [weak player = p.player] in
+                    player?.renderContextHandle != nil
+                })
+            }
+        }
+        scheduleChromeHide()
+    }
+
+    private func handleOnDisappear() {
+        if let s = session {
+            PlayerSessionRegistry.shared.unregister(s)
+            for slot in s.slots {
+                slot.player.pause()
+                slot.unregisterFromRegistry()
+            }
+        }
+        if let p = playback {
+            p.stop()
+        }
+    }
+
+    // MARK: - Top-left: info card
 
     @ViewBuilder
     private var infoStack: some View {
         VStack(alignment: .leading, spacing: 0) {
-            channelAndProgramCard
+            if isRecordingMode {
+                recordingInfoCard
+            } else {
+                channelAndProgramCard
+            }
             Spacer(minLength: 0)
         }
     }
@@ -254,26 +377,28 @@ struct PlayerView: View {
     @ViewBuilder
     private var channelAndProgramCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
-                if let logo = channel.logoURL {
-                    LazyImage(url: logo) { state in
-                        if let image = state.image {
-                            image.resizable().scaledToFit()
-                        } else {
-                            Color.clear
+            if let channel {
+                HStack(spacing: 12) {
+                    if let logo = channel.logoURL {
+                        LazyImage(url: logo) { state in
+                            if let image = state.image {
+                                image.resizable().scaledToFit()
+                            } else {
+                                Color.clear
+                            }
                         }
+                        .frame(width: 36, height: 36)
+                        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
                     }
-                    .frame(width: 36, height: 36)
-                    .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-                }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(channel.name)
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                    if !channel.group.isEmpty {
-                        Text(channel.group)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.7))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(channel.name)
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                        if !channel.group.isEmpty {
+                            Text(channel.group)
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.7))
+                        }
                     }
                 }
             }
@@ -283,7 +408,7 @@ struct PlayerView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
-                        Text(isLive ? "NOW" : "WATCHING")
+                        Text(isCatchup ? "WATCHING" : "NOW")
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(.white.opacity(0.55))
                             .tracking(1.2)
@@ -304,7 +429,7 @@ struct PlayerView: View {
                     }
                 }
 
-                if !isLive, let liveProgram, liveProgram.id != program.id {
+                if isCatchup, let liveProgram, liveProgram.id != program.id {
                     Divider().overlay(.white.opacity(0.12))
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -330,7 +455,59 @@ struct PlayerView: View {
         .chromeSurface(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    // MARK: - Top-right: chrome buttons (sized to sit inside the titlebar)
+    @ViewBuilder
+    private var recordingInfoCard: some View {
+        if let rec = playback?.recording {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(rec.title)
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Text(rec.channelName)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+
+                Divider().overlay(.white.opacity(0.15))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(rec.status == .recording ? "RECORDING" : "RECORDED")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(
+                                rec.status == .recording
+                                    ? Color.red.opacity(0.9)
+                                    : .white.opacity(0.55)
+                            )
+                            .tracking(1.2)
+                        Text(recordingTimestamp(rec))
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+                    if !rec.programDescription.isEmpty {
+                        Text(rec.programDescription)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.85))
+                            .lineLimit(3)
+                            .padding(.top, 2)
+                    }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: 420, alignment: .leading)
+            .chromeSurface(in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+    }
+
+    private func recordingTimestamp(_ rec: Recording) -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMM d, h:mma"
+        fmt.amSymbol = "am"
+        fmt.pmSymbol = "pm"
+        return fmt.string(from: rec.actualStart ?? rec.scheduledStart)
+    }
+
+    // MARK: - Top-right: chrome buttons
 
     @ViewBuilder
     private var chromeButtons: some View {
@@ -348,12 +525,43 @@ struct PlayerView: View {
             .foregroundStyle(.white)
             .help(chromeState.mediaInfoDisplay.label)
 
-            favoriteButton
+            if isChannelMode {
+                favoriteButton
+                recordButton
 
-            if session.isMulti {
-                MultiViewLayoutMenu(session: session)
+                if isMulti {
+                    if let s = session {
+                        MultiViewLayoutMenu(session: s)
+                    }
+                }
+
+                multiViewToggle
+
+                if selectedPlayer != .none, let c = channel {
+                    Button {
+                        ExternalPlayer.launch(streamURL: c.streamURL, using: selectedPlayer)
+                        dismiss()
+                    } label: {
+                        Image(systemName: "rectangle.on.rectangle.angled")
+                            .font(.callout)
+                            .frame(width: 20, height: 20)
+                            .frame(width: 30, height: 30)
+                            .chromeSurface(in: RoundedRectangle(cornerRadius: 10, style: .continuous), fill: Color.black.opacity(0.42))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white)
+                    .help("Open in \(selectedPlayer.displayName)")
+                }
             }
 
+            pinButton
+                .help(chromeState.isPinned ? "Unpin from top" : "Pin to top")
+        }
+    }
+
+    @ViewBuilder
+    private var multiViewToggle: some View {
+        if let s = session {
             Button {
                 showChannelPicker.toggle()
             } label: {
@@ -365,60 +573,90 @@ struct PlayerView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white)
-            .help(session.isMulti ? "Add channel" : "Open in multi-view")
-            .disabled(!session.canAddMoreSlots())
+            .help(s.isMulti ? "Add channel" : "Open in multi-view")
+            .disabled(!s.canAddMoreSlots())
             .popover(isPresented: $showChannelPicker, arrowEdge: .bottom) {
-                ChannelPickerPopover(
-                    viewModel: viewModel,
-                    session: session,
-                    onDismiss: { showChannelPicker = false }
-                )
-            }
-
-            if selectedPlayer != .none {
-                Button {
-                    ExternalPlayer.launch(streamURL: channel.streamURL, using: selectedPlayer)
-                    dismiss()
-                } label: {
-                    Image(systemName: "rectangle.on.rectangle.angled")
-                        .font(.callout)
-                        .frame(width: 20, height: 20)
-                        .frame(width: 30, height: 30)
-                        .chromeSurface(in: RoundedRectangle(cornerRadius: 10, style: .continuous), fill: Color.black.opacity(0.42))
+                if let vm = viewModel {
+                    ChannelPickerPopover(
+                        viewModel: vm,
+                        session: s,
+                        onDismiss: { showChannelPicker = false }
+                    )
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .help("Open in \(selectedPlayer.displayName)")
             }
+        }
+    }
 
-            pinButton
-                .help(chromeState.isPinned ? "Unpin from top" : "Pin to top")
+    @ViewBuilder
+    private var recordButton: some View {
+        if let c = channel {
+            let isRecording = RecordingManager.shared.isLiveRecording(forChannel: c.streamURL)
+            Button {
+                toggleRecording()
+            } label: {
+                Image(systemName: isRecording ? "stop.circle.fill" : "record.circle")
+                    .font(.callout)
+                    .frame(width: 20, height: 20)
+                    .frame(width: 30, height: 30)
+                    .chromeSurface(
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous),
+                        fill: isRecording ? Color.red.opacity(0.4) : Color.black.opacity(0.42)
+                    )
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(isRecording ? Color.red : .white)
+            .help(isRecording ? "Stop recording" : "Record this channel")
+        }
+    }
+
+    private func toggleRecording() {
+        guard let c = channel, let vm = viewModel else { return }
+        let manager = RecordingManager.shared
+        if manager.isLiveRecording(forChannel: c.streamURL) {
+            if let entry = manager.recordings.first(where: { rec in
+                rec.status == .recording && rec.channelID == c.id && rec.source == .live
+            }) {
+                manager.stopLiveRecording(id: entry.id)
+            }
+            return
+        }
+        guard let playlistID = vm.activePlaylistID else { return }
+        let capturedChannel = c
+        let capturedProgram = displayedProgram
+        Task { @MainActor in
+            _ = await manager.startLiveRecording(
+                playlistID: playlistID,
+                channel: capturedChannel,
+                program: capturedProgram
+            )
         }
     }
 
     @ViewBuilder
     private var favoriteButton: some View {
-        let isFavorite = viewModel.isFavorite(channel)
-        Button {
-            viewModel.toggleFavorite(channel)
-        } label: {
-            Image(systemName: isFavorite ? "star.fill" : "star")
-                .font(.callout)
-                .frame(width: 20, height: 20)
-                .frame(width: 30, height: 30)
-                .chromeSurface(
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous),
-                    fill: isFavorite ? Color.yellow.opacity(0.35) : Color.black.opacity(0.42)
-                )
+        if let c = channel, let vm = viewModel {
+            let isFavorite = vm.isFavorite(c)
+            Button {
+                vm.toggleFavorite(c)
+            } label: {
+                Image(systemName: isFavorite ? "star.fill" : "star")
+                    .font(.callout)
+                    .frame(width: 20, height: 20)
+                    .frame(width: 30, height: 30)
+                    .chromeSurface(
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous),
+                        fill: isFavorite ? Color.yellow.opacity(0.35) : Color.black.opacity(0.42)
+                    )
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(isFavorite ? Color.yellow : .white)
+            .help(isFavorite ? "Remove from Favorites" : "Add to Favorites")
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(isFavorite ? Color.yellow : .white)
-        .help(isFavorite ? "Remove from Favorites" : "Add to Favorites")
     }
 
     @ViewBuilder
     private var pinButton: some View {
-        let button = Button {
+        Button {
             chromeState.isPinned.toggle()
         } label: {
             Image(systemName: chromeState.isPinned ? "pin.fill" : "pin")
@@ -432,8 +670,6 @@ struct PlayerView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
-
-        button
     }
 
     // MARK: - Bottom-left: controls bar
@@ -444,7 +680,14 @@ struct PlayerView: View {
             playPauseButton
             volumeButton
 
-            if supportsRewind {
+            // Source-specific middle section. Recording mode always gets
+            // a full scrubber. Channel-rewind gets step controls. Plain
+            // live gets the compact live-status group with optional
+            // HLS-DVR seek bar.
+            if isRecordingMode {
+                Divider().frame(height: 18)
+                recordingTransport
+            } else if supportsRewind {
                 Divider().frame(height: 18)
                 catchupStepControls
             } else {
@@ -468,14 +711,14 @@ struct PlayerView: View {
         }
     }
 
-    /// Current playhead expressed as seconds relative to now (≤ 0).
+    // MARK: - Catchup (channel-rewind) controls
+
     private var catchupCurrentOffset: Double {
         -max(0, Date().timeIntervalSince(effectiveWallClock))
     }
 
-    /// Full catchup window expressed as a negative-going range.
     private var catchupWindowSeconds: Double {
-        Double(max(channel.catchup?.days ?? 0, 1)) * 86400
+        Double(max(channel?.catchup?.days ?? 0, 1)) * 86400
     }
 
     private static let catchupSeekChunkSeconds: Double = 5 * 60
@@ -483,7 +726,6 @@ struct PlayerView: View {
     @ViewBuilder
     private var catchupStepControls: some View {
         let offset = catchupCurrentOffset
-
         HStack(spacing: 10) {
             catchupMiniSeekBar
             catchupStatusPill(offset: offset)
@@ -530,12 +772,9 @@ struct PlayerView: View {
         return max(1, Int(ceil(behind / chunk)) + 1)
     }
 
-    /// The "LIVE" / "-15m" pill next to the step buttons. Shows an inline
-    /// spinner while a catchup load is in flight so step-button presses feel
-    /// acknowledged even though the network fetch takes ~half a second.
     @ViewBuilder
     private func catchupStatusPill(offset: Double) -> some View {
-        let atLive = isAtDisplayedLiveState
+        let atLive = isDisplayedLive
         Button {
             if !atLive {
                 returnToLive()
@@ -588,18 +827,153 @@ struct PlayerView: View {
         return mins == 0 ? "-\(hours)h" : "-\(hours)h\(mins)m"
     }
 
+    // MARK: - Recording transport (scrubber + LIVE pill)
+
+    @ViewBuilder
+    private var recordingTransport: some View {
+        if let rec = playback?.recording {
+            let total = playback?.totalDuration ?? 0
+            let inProgress = rec.status == .recording
+            HStack(spacing: 10) {
+                Text(formatHMS(player.timePos))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white)
+                    .frame(width: 52, alignment: .trailing)
+
+                recordingScrubBar(total: total, inProgress: inProgress)
+                    .frame(minWidth: 140, idealWidth: 260, maxWidth: 360)
+
+                Text(formatHMS(total))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.7))
+                    .frame(width: 52, alignment: .leading)
+
+                recordingLivePill(inProgress: inProgress)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func recordingScrubBar(total: Double, inProgress: Bool) -> some View {
+        if total > 0 {
+            // When live-latched on an in-progress recording, pin the
+            // fill to 100% so the bar visually sits at the edge — the
+            // actual playhead is a couple of seconds behind (mpv keeps
+            // a small decode buffer) but the UX "LIVE" contract says
+            // "this is as new as it gets".
+            let raw = scrubPosition ?? min(player.timePos, total)
+            let displayed = (isDisplayedLive && inProgress && scrubPosition == nil) ? total : raw
+            ScrubBar(
+                value: displayed,
+                total: total,
+                onScrub: { scrubPosition = $0 },
+                onCommit: { target in
+                    let clamped = min(target, total)
+                    player.seek(to: clamped)
+                    scrubPosition = nil
+                    // User scrubbed; if they landed near the edge we keep
+                    // the latch; otherwise drop it so the button becomes
+                    // clickable again.
+                    let behind = max(0, total - clamped)
+                    liveLatched = inProgress && behind < 5
+                }
+            )
+        } else {
+            ProgressView()
+                .controlSize(.small)
+                .tint(.white)
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private func recordingLivePill(inProgress: Bool) -> some View {
+        let canJump = inProgress && !isDisplayedLive
+        let showRed = inProgress && isDisplayedLive
+        Button {
+            if canJump { jumpToRecordingLive() }
+        } label: {
+            HStack(spacing: 8) {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(showRed ? Color.red : Color.white.opacity(inProgress ? 0.35 : 0.18))
+                        .frame(width: 6, height: 6)
+                    Text("LIVE")
+                        .font(.system(size: 10, weight: .bold))
+                        .tracking(0.6)
+                        .foregroundStyle(
+                            showRed
+                                ? Color.red.opacity(0.95)
+                                : Color.white.opacity(inProgress ? 0.75 : 0.35)
+                        )
+                        .monospacedDigit()
+                }
+
+                // In-progress recordings stream through a tail-follow proxy
+                // and can underrun just like a live catchup. Surface the same
+                // buffer ring so the control bar matches catchup-mode chrome.
+                if inProgress {
+                    bufferIndicator
+                }
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(
+                Capsule()
+                    .fill(showRed ? Color.red.opacity(0.16) : Color.white.opacity(inProgress ? 0.08 : 0.04))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(
+                        showRed
+                            ? Color.red.opacity(0.35)
+                            : Color.white.opacity(inProgress ? 0.15 : 0.08),
+                        lineWidth: 0.5
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!canJump)
+        .help(inProgress
+              ? (isDisplayedLive ? "At live edge" : "Jump to live")
+              : "No live — this recording is finished")
+    }
+
+    private func jumpToRecordingLive() {
+        guard let p = playback, p.isInProgress else { return }
+        let total = p.totalDuration
+        // Seek a hair back from the absolute end so mpv has a bit of
+        // decoded frames to play immediately; the latch logic treats
+        // anything under `liveUnlockThreshold` as "live".
+        let target = max(0, total - 1)
+        player.seek(to: target)
+        scrubPosition = nil
+        liveLatched = true
+    }
+
+    // MARK: - Channel play-controls
+
     @ViewBuilder
     private var playPauseButton: some View {
         Button {
             player.togglePause()
         } label: {
-            Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                .font(.title2)
-                .frame(width: 28, height: 28)
+            ZStack {
+                Color.clear.frame(width: 28, height: 28)
+                if player.isBuffering || player.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.white)
+                } else {
+                    Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.title2)
+                }
+            }
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white)
-        .help(player.isPlaying ? "Pause" : "Play")
+        .disabled(player.isBuffering || player.isLoading)
+        .help(player.isBuffering || player.isLoading ? "Loading…" : (player.isPlaying ? "Pause" : "Play"))
     }
 
     @ViewBuilder
@@ -668,10 +1042,11 @@ struct PlayerView: View {
 
     @ViewBuilder
     private var liveButton: some View {
-        let atLive = player.isAtPreferredLivePosition
+        let atLive = isDisplayedLive
         Button {
             if !atLive {
                 player.seekToPreferredLivePosition()
+                liveLatched = true
             }
         } label: {
             liveBadgeLabel(isHighlighted: atLive)
@@ -732,12 +1107,8 @@ struct PlayerView: View {
 
     private var liveOffsetLabel: String {
         let behind = max(0, player.duration - (scrubPosition ?? player.timePos))
-        if behind < 1 {
-            return "live"
-        }
-        if behind < 60 {
-            return String(format: "-%ds", Int(behind))
-        }
+        if behind < 1 { return "live" }
+        if behind < 60 { return String(format: "-%ds", Int(behind)) }
         let mins = Int(behind / 60)
         return "-\(mins)m"
     }
@@ -785,8 +1156,6 @@ struct PlayerView: View {
                     expandedMediaInfo(info)
                 case .collapsed:
                     collapsedMediaInfo(info)
-                case .hidden:
-                    EmptyView()
                 }
             }
             .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottomTrailing)))
@@ -850,7 +1219,7 @@ struct PlayerView: View {
     @ViewBuilder
     private func playbackErrorView(_ error: String) -> some View {
         ContentUnavailableView {
-            Label("Unable to play this channel", systemImage: "exclamationmark.triangle.fill")
+            Label("Unable to play this stream", systemImage: "exclamationmark.triangle.fill")
         } description: {
             Text(error)
                 .multilineTextAlignment(.center)
@@ -885,7 +1254,7 @@ struct PlayerView: View {
         }
     }
 
-    // MARK: - Rewind / catchup
+    // MARK: - Rewind / catchup (channel mode)
 
     private func commitCatchupScrub(offset: Double) {
         if offset >= -30 {
@@ -896,21 +1265,28 @@ struct PlayerView: View {
     }
 
     private func returnToLive() {
-        guard !isLive else { return }
+        guard isCatchup else { return }
+        guard let slot = session?.focusedSlot else { return }
         beginSeeking()
         catchupStartDate = nil
-        player.loadURL(channel.streamURL, autoplay: true)
+        // Route the live reconnect back through StreamProxy so a concurrent
+        // recording keeps sharing one upstream connection. Using the raw
+        // channel.streamURL here (as we used to) made mpv open a second
+        // direct provider connection, which some Xtream accounts refuse
+        // with a 403 — the source of the "catchup return fails" error.
+        let url = slot.freshProxiedURL()
+        player.loadURL(url, autoplay: true)
+        liveLatched = true
     }
 
     private func loadCatchup(startingAt start: Date) {
-        // Clamp start into the available catchup window so we never request
-        // something the server will reject.
-        let maxBack = TimeInterval((channel.catchup?.days ?? 0) * 86400)
+        guard let c = channel else { return }
+        let maxBack = TimeInterval((c.catchup?.days ?? 0) * 86400)
         let earliest = Date().addingTimeInterval(-maxBack + 60)
         let clamped = max(start, earliest)
 
         guard let url = CatchupURLBuilder.url(
-            for: channel,
+            for: c,
             start: clamped,
             duration: catchupClipDuration
         ) else {
@@ -920,10 +1296,9 @@ struct PlayerView: View {
         beginSeeking()
         catchupStartDate = clamped
         player.loadURL(url, autoplay: true)
+        liveLatched = false
     }
 
-    /// Kick off the inline spinner and arm a 6-second fallback so the UI
-    /// never gets stuck if the clip fails to start or the server stalls.
     private func beginSeeking() {
         isSeekingCatchup = true
         seekingTimeoutTask?.cancel()
@@ -941,6 +1316,29 @@ struct PlayerView: View {
         seekingTimeoutTask?.cancel()
     }
 
+    // MARK: - Live latch reconciliation
+
+    /// Drives the sticky `liveLatched` state from observed offset. Called
+    /// whenever `timePos` or `duration` changes. Only flips:
+    /// - unlatches when offset exceeds `liveUnlockThreshold`, so normal
+    ///   cache jitter doesn't knock the pill off.
+    /// - re-latches when offset shrinks back under `min(buffer, 3s)` —
+    ///   covers the case where mpv catches up on its own after a
+    ///   reconnect / cache-pause recovery.
+    private func reconcileLiveLatch() {
+        // Catchup mode is a deliberate drift — never treat it as live.
+        if isCatchup {
+            if liveLatched { liveLatched = false }
+            return
+        }
+        guard let behind = secondsBehindLive else { return }
+        if liveLatched {
+            if behind > liveUnlockThreshold { liveLatched = false }
+        } else {
+            if behind < min(bufferSeconds, 3) { liveLatched = true }
+        }
+    }
+
     private func handleKeyboardCommand(_ command: PlayerKeyboardCommand, in window: NSWindow) {
         revealChrome()
 
@@ -953,10 +1351,18 @@ struct PlayerView: View {
             seekByShortcut(10)
         case .toggleFullScreen:
             window.toggleFullScreen(nil)
+        case .dismiss:
+            if isRecordingMode { dismiss() }
         }
     }
 
     private func seekByShortcut(_ delta: Double) {
+        if isRecordingMode {
+            let total = playback?.totalDuration ?? player.duration
+            let target = (player.timePos + delta).clamped(to: 0...max(total, 0))
+            player.seek(to: target)
+            return
+        }
         if supportsRewind {
             let nextOffset = (catchupCurrentOffset + delta).clamped(to: -catchupWindowSeconds...0)
             commitCatchupScrub(offset: nextOffset)
@@ -968,6 +1374,7 @@ struct PlayerView: View {
         let target = (player.timePos + delta).clamped(to: 0...maxPosition)
         if target >= maxPosition - 1 {
             player.seekToPreferredLivePosition()
+            liveLatched = true
         } else {
             player.seek(to: target)
         }
@@ -981,6 +1388,63 @@ struct PlayerView: View {
         fmt.amSymbol = "am"
         fmt.pmSymbol = "pm"
         return "\(fmt.string(from: program.start)) – \(fmt.string(from: program.end))"
+    }
+}
+
+/// Format seconds as `H:MM:SS` or `M:SS`.
+fileprivate func formatHMS(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+    let total = Int(seconds)
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+    return String(format: "%d:%02d", m, s)
+}
+
+/// Thumbless scrub bar shared between recording playback and (future)
+/// any source needing a full-width drag-to-seek control.
+private struct ScrubBar: View {
+    let value: Double
+    let total: Double
+    let onScrub: (Double) -> Void
+    let onCommit: (Double) -> Void
+
+    @State private var isDragging = false
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let fraction = total > 0 ? max(0, min(1, value / total)) : 0
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.2))
+                    .frame(height: isDragging ? 5 : 3)
+                Capsule()
+                    .fill(Color.white)
+                    .frame(width: width * fraction, height: isDragging ? 5 : 3)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 16, alignment: .center)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        isDragging = true
+                        let x = max(0, min(width, g.location.x))
+                        let target = total * (x / max(width, 1))
+                        onScrub(target)
+                    }
+                    .onEnded { g in
+                        let x = max(0, min(width, g.location.x))
+                        let target = total * (x / max(width, 1))
+                        onCommit(target)
+                        isDragging = false
+                    }
+            )
+            .animation(.easeOut(duration: 0.12), value: isDragging)
+        }
+        .frame(height: 16)
     }
 }
 
@@ -1058,7 +1522,7 @@ private struct ChannelPickerPopover: View {
     }
 }
 
-private struct ChromeSurfaceModifier<S: Shape>: ViewModifier {
+struct ChromeSurfaceModifier<S: Shape>: ViewModifier {
     let shape: S
     var fill: Color
 
@@ -1073,7 +1537,7 @@ private struct ChromeSurfaceModifier<S: Shape>: ViewModifier {
     }
 }
 
-private extension View {
+extension View {
     func chromeSurface<S: Shape>(in shape: S, fill: Color = Color.black.opacity(0.52)) -> some View {
         modifier(ChromeSurfaceModifier(shape: shape, fill: fill))
     }
@@ -1091,9 +1555,6 @@ private struct ScrollWheelModifier: ViewModifier {
                 monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
                     let raw = event.scrollingDeltaY
                     guard raw != 0 else { return event }
-                    // Trackpad reports precise fractional deltas; mouse wheel
-                    // reports ±1 per click. Scale the mouse case up so one
-                    // click = ~4% volume.
                     let step = event.hasPreciseScrollingDeltas ? raw * 0.5 : raw * 4
                     onScroll(Double(step))
                     return nil
@@ -1173,8 +1634,6 @@ struct WindowAccessor: NSViewRepresentable {
 
         window.contentAspectRatio = NSSize(width: videoSize.width, height: videoSize.height)
 
-        // Fit the current window to the new aspect, anchoring the top-left so
-        // the titlebar and chrome don't jump under the cursor.
         let contentRect = window.contentRect(forFrameRect: window.frame)
         let newHeight = contentRect.width / targetRatio
         let newContent = NSRect(
@@ -1212,8 +1671,6 @@ final class SnappingWindowDelegate: NSObject {
 
         if mouseUpMonitor == nil {
             mouseUpMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] event in
-                // Defer until AppKit finishes routing this mouseUp so the
-                // window has settled at its drag-release frame before we snap.
                 DispatchQueue.main.async { self?.handleMouseUp() }
                 return event
             }
@@ -1250,8 +1707,6 @@ final class SnappingWindowDelegate: NSObject {
         let snapTop = topDistance < snapThreshold
         let snapBottom = bottomDistance < snapThreshold
 
-        // Only snap when the window is near a corner (close to both an
-        // X edge and a Y edge); edge proximity alone doesn't trigger.
         guard (snapLeft || snapRight) && (snapTop || snapBottom) else { return }
 
         if snapLeft {
@@ -1275,6 +1730,7 @@ private enum PlayerKeyboardCommand {
     case seekBackward
     case seekForward
     case toggleFullScreen
+    case dismiss
 }
 
 private struct PlayerKeyboardMonitor: NSViewRepresentable {
@@ -1356,6 +1812,8 @@ private struct PlayerKeyboardMonitor: NSViewRepresentable {
                 return .seekBackward
             case 124:
                 return .seekForward
+            case 53:
+                return .dismiss
             default:
                 break
             }

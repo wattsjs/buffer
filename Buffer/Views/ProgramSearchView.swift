@@ -619,9 +619,11 @@ private struct ProgramResultRow: View {
     @State private var hovered = false
     @State private var showPopover = false
     @State private var notificationManager = NotificationManager.shared
+    @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
 
     private var existingReminder: ProgramReminder? {
-        notificationManager.reminder(for: result.program)
+        guard let playlistID = activePlaylistID else { return nil }
+        return notificationManager.reminder(playlistID: playlistID, for: result.program)
     }
 
     private var canRemind: Bool {
@@ -698,7 +700,9 @@ private struct ProgramResultRow: View {
 
         if let existing = existingReminder {
             Button {
-                notificationManager.cancelReminder(for: result.program)
+                if let playlistID = activePlaylistID {
+                    notificationManager.cancelReminder(playlistID: playlistID, for: result.program)
+                }
             } label: {
                 Label(
                     "Cancel Reminder (\(existing.leadMinutes == 0 ? "at start" : "\(existing.leadMinutes) min before"))",
@@ -760,15 +764,18 @@ private struct ProgramResultRow: View {
     }
 
     private func schedule(lead: Int) {
+        guard let playlistID = activePlaylistID else { return }
         let program = result.program
         let channel = result.channel
         Task { @MainActor in
             let scheduled = await notificationManager.scheduleReminder(
+                playlistID: playlistID,
                 program: program,
                 channel: channel,
                 leadMinutes: lead
             )
             AppFeedbackCenter.shared.showReminderResult(
+                playlistID: playlistID,
                 program: program,
                 channel: channel,
                 leadMinutes: lead,

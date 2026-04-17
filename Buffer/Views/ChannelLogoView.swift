@@ -88,12 +88,11 @@ struct ChannelLogoTile: View {
         ZStack {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(bgColor)
-            ChannelLogoView(url: channel.logoURL) { color in
+            ChannelLogoView(url: channel.logoURL, contentInset: contentInset) { color in
                 withAnimation(.easeInOut(duration: 0.25)) {
                     bgColor = Color(nsColor: color)
                 }
             }
-            .padding(contentInset)
         }
     }
 }

@@ -9,6 +9,8 @@ struct EPGGridView: View {
     let onToggleFavorite: (Channel) -> Void
     let onChannelSelected: (Channel) -> Void
 
+    @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
+
     private let channelColumnWidth: CGFloat = 120
     private let rowHeight: CGFloat = 64
     private let pixelsPerMinute: CGFloat = 4
@@ -94,7 +96,8 @@ struct EPGGridView: View {
                         pixelsPerMinute: pixelsPerMinute,
                         rowHeight: rowHeight,
                         nowX: nowX,
-                        onPlay: { onChannelSelected(channel) }
+                        onPlay: { onChannelSelected(channel) },
+                        playlistID: activePlaylistID
                     )
                     .frame(width: width, height: rowHeight)
                     .overlay(alignment: .bottom) {
@@ -287,11 +290,15 @@ private struct ProgramRow: View {
     @State private var selectedProgram: EPGProgram?
     @State private var selectedRect: CGRect = .zero
 
+    let playlistID: UUID?
+
     private var reminderProgramIDs: Set<String> {
-        let ids = programs.map(\.id)
+        guard let playlistID else { return [] }
+        let ids = Set(programs.map(\.id))
         return Set(
             NotificationManager.shared.reminders
-                .filter { ids.contains($0.programID) }
+                .lazy
+                .filter { $0.playlistID == playlistID && ids.contains($0.programID) }
                 .map(\.programID)
         )
     }
@@ -312,13 +319,16 @@ private struct ProgramRow: View {
             },
             onEmptyTap: onPlay,
             onProgramRightClick: { program, event, view in
-                ReminderMenuBuilder.present(
-                    program: program,
-                    channel: channel,
-                    event: event,
-                    in: view,
-                    onPlay: onPlay
-                )
+                if let playlistID {
+                    ReminderMenuBuilder.present(
+                        playlistID: playlistID,
+                        program: program,
+                        channel: channel,
+                        event: event,
+                        in: view,
+                        onPlay: onPlay
+                    )
+                }
             }
         )
         .equatable()
@@ -544,6 +554,8 @@ struct ProgramDetailPopover: View {
     let onPlay: () -> Void
 
     @State private var notificationManager = NotificationManager.shared
+    @State private var recordingManager = RecordingManager.shared
+    @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
 
     private var timeRange: String {
         let formatter = DateFormatter()
@@ -576,8 +588,19 @@ struct ProgramDetailPopover: View {
     }
 
     private var existingReminder: ProgramReminder? {
-        notificationManager.reminder(for: program)
+        guard let playlistID = activePlaylistID else { return nil }
+        return notificationManager.reminder(playlistID: playlistID, for: program)
     }
+
+    private var existingRecording: Recording? {
+        recordingManager.recordings.first { rec in
+            rec.programID == program.id
+                && rec.channelID == channel.id
+                && (rec.status == .scheduled || rec.status == .recording || rec.status == .startingUp)
+        }
+    }
+
+    private var canRecord: Bool { program.end > Date() }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -639,6 +662,10 @@ struct ProgramDetailPopover: View {
                 if canRemind {
                     reminderButton
                 }
+
+                if canRecord {
+                    recordButton
+                }
             }
         }
         .padding(16)
@@ -646,10 +673,48 @@ struct ProgramDetailPopover: View {
     }
 
     @ViewBuilder
+    private var recordButton: some View {
+        if let existing = existingRecording {
+            let isRec = existing.status == .recording || existing.status == .startingUp
+            Button {
+                recordingManager.cancel(id: existing.id)
+            } label: {
+                Image(systemName: isRec ? "stop.circle.fill" : "record.circle.fill")
+                    .font(.system(size: 18))
+            }
+            .controlSize(.large)
+            .buttonStyle(.bordered)
+            .tint(.red)
+            .help(isRec ? "Stop recording" : "Cancel scheduled recording")
+        } else {
+            Button {
+                scheduleRecording()
+            } label: {
+                Image(systemName: "record.circle")
+                    .font(.system(size: 18))
+            }
+            .controlSize(.large)
+            .buttonStyle(.bordered)
+            .help("Record this program")
+        }
+    }
+
+    private func scheduleRecording() {
+        guard let playlistID = activePlaylistID else { return }
+        _ = recordingManager.schedule(
+            playlistID: playlistID,
+            channel: channel,
+            program: program
+        )
+    }
+
+    @ViewBuilder
     private var reminderButton: some View {
         if let existing = existingReminder {
             Button {
-                notificationManager.cancelReminder(for: program)
+                if let playlistID = activePlaylistID {
+                    notificationManager.cancelReminder(playlistID: playlistID, for: program)
+                }
             } label: {
                 Label("Cancel", systemImage: "bell.slash")
             }
@@ -673,13 +738,16 @@ struct ProgramDetailPopover: View {
     }
 
     private func scheduleReminder(lead: Int) {
+        guard let playlistID = activePlaylistID else { return }
         Task { @MainActor in
             let scheduled = await notificationManager.scheduleReminder(
+                playlistID: playlistID,
                 program: program,
                 channel: channel,
                 leadMinutes: lead
             )
             AppFeedbackCenter.shared.showReminderResult(
+                playlistID: playlistID,
                 program: program,
                 channel: channel,
                 leadMinutes: lead,
