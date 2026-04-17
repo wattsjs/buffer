@@ -271,6 +271,13 @@ private struct SportEventCard: View {
         }
     }
 
+    private var cardFill: Color {
+        if event.status.isLive {
+            return Color.red.opacity(hovered ? 0.1 : 0.05)
+        }
+        return Color(nsColor: .controlBackgroundColor).opacity(hovered ? 1 : 0.7)
+    }
+
     /// Synthetic EPGProgram used for reminder + recording integrations.
     /// ESPN scoreboards only give a start time, so we assume a 3-hour window.
     private func syntheticProgram(for channel: Channel) -> EPGProgram {
@@ -376,9 +383,7 @@ private struct SportEventCard: View {
         .frame(minHeight: 100)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(event.status.isLive
-                      ? Color.red.opacity(hovered ? 0.1 : 0.05)
-                      : Color(nsColor: .controlBackgroundColor).opacity(hovered ? 1 : 0.7))
+                .fill(cardFill)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -407,16 +412,16 @@ private struct SportEventCard: View {
             }
         }
         .popover(isPresented: $showStreams, arrowEdge: .trailing) {
-            StreamsPopover(
+            StreamMatchesPopover(
                 event: event,
                 matches: matches ?? [],
                 favoriteIDs: viewModel.favoriteChannelIDs,
-                isPlayable: eventIsPlayable,
-                onChannelSelected: { channel in
+                reminderHint: eventIsPlayable ? nil : "Set a reminder",
+                onPlay: eventIsPlayable ? { channel in
                     showStreams = false
                     onChannelSelected(channel)
-                },
-                onSetReminder: { channel in
+                } : nil,
+                onRemind: eventIsPlayable ? nil : { channel in
                     showStreams = false
                     setReminder(for: channel)
                 },
@@ -528,199 +533,3 @@ private struct SportEventCard: View {
 }
 
 // MARK: - Streams popover
-
-private struct StreamsPopover: View {
-    let event: SportEvent
-    let matches: [StreamMatch]
-    let favoriteIDs: Set<String>
-    let isPlayable: Bool
-    let onChannelSelected: (Channel) -> Void
-    let onSetReminder: (Channel) -> Void
-    let onRecord: (Channel) -> Void
-
-    /// ESPN scoreboards only surface a start time. We assume a 3-hour window
-    /// so the user can see roughly when the broadcast will wrap — matches the
-    /// duration used for the reminder + recording program window.
-    private var timeRange: String {
-        let end = event.startDate.addingTimeInterval(3 * 3600)
-        let cal = Calendar.current
-        let timeFmt = DateFormatter()
-        timeFmt.amSymbol = "am"
-        timeFmt.pmSymbol = "pm"
-        timeFmt.dateFormat = "h:mma"
-
-        let dayPrefix: String
-        if cal.isDateInToday(event.startDate) {
-            dayPrefix = "Today"
-        } else if cal.isDateInTomorrow(event.startDate) {
-            dayPrefix = "Tomorrow"
-        } else {
-            let dayFmt = DateFormatter()
-            dayFmt.dateFormat = "EEE d MMM"
-            dayPrefix = dayFmt.string(from: event.startDate)
-        }
-        return "\(dayPrefix) · \(timeFmt.string(from: event.startDate)) – \(timeFmt.string(from: end))"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(event.displayTitle)
-                    .font(.system(size: 14, weight: .semibold))
-                    .lineLimit(1)
-                HStack(spacing: 6) {
-                    Text(event.league.fullName)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    if !isPlayable {
-                        Text("·")
-                            .foregroundStyle(.tertiary)
-                        Text("Set a reminder")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                HStack(spacing: 5) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                    Text(timeRange)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-
-            Divider()
-
-            if matches.isEmpty {
-                Text("No matching streams found")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 24)
-            } else {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(matches) { match in
-                            StreamMatchRow(
-                                match: match,
-                                isFavorite: favoriteIDs.contains(match.channel.id),
-                                isPlayable: isPlayable,
-                                onPlay: { onChannelSelected(match.channel) },
-                                onRemind: { onSetReminder(match.channel) },
-                                onRecord: { onRecord(match.channel) }
-                            )
-                        }
-                    }
-                    .padding(.vertical, 6)
-                    .padding(.horizontal, 8)
-                }
-                .frame(maxHeight: 340)
-            }
-        }
-        .frame(width: 360)
-    }
-}
-
-// MARK: - Stream match row
-
-private struct StreamMatchRow: View {
-    let match: StreamMatch
-    let isFavorite: Bool
-    let isPlayable: Bool
-    let onPlay: () -> Void
-    let onRemind: () -> Void
-    let onRecord: () -> Void
-
-    @State private var hovered = false
-
-    var body: some View {
-        HStack(spacing: 10) {
-            ChannelLogoTile(channel: match.channel, contentInset: 2)
-                .frame(width: 40, height: 40)
-
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    Text(match.channel.name)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
-                    if isFavorite {
-                        Image(systemName: "heart.fill")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.pink)
-                    }
-                }
-                if !match.reason.isEmpty {
-                    Text(match.reason)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
-                if let title = match.programTitle, !title.isEmpty {
-                    Text(title)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            Spacer()
-
-            confidenceDots(score: match.score)
-
-            Button {
-                onRecord()
-            } label: {
-                Image(systemName: "record.circle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.red)
-            }
-            .buttonStyle(.borderless)
-            .help(isPlayable ? "Record now" : "Schedule recording")
-
-            if isPlayable {
-                Button {
-                    onPlay()
-                } label: {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.borderless)
-                .help("Play now")
-            } else {
-                Button {
-                    onRemind()
-                } label: {
-                    Image(systemName: "bell.fill")
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.borderless)
-                .help("Set reminder")
-            }
-        }
-        .padding(.vertical, 5)
-        .padding(.horizontal, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(hovered ? Color.accentColor.opacity(0.08) : Color.clear)
-        )
-        .contentShape(Rectangle())
-        .onHover { hovered = $0 }
-        .onTapGesture { isPlayable ? onPlay() : onRemind() }
-    }
-
-    private func confidenceDots(score: Double) -> some View {
-        let filled = score > 180 ? 3 : (score > 120 ? 2 : 1)
-        return HStack(spacing: 2) {
-            ForEach(0..<3, id: \.self) { i in
-                Circle()
-                    .fill(i < filled ? Color.green : Color.secondary.opacity(0.2))
-                    .frame(width: 5, height: 5)
-            }
-        }
-    }
-}

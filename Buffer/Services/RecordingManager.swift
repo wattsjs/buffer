@@ -321,10 +321,9 @@ final class RecordingManager {
     /// from the non-main StreamProxy tail handler to decide whether to
     /// keep polling for new bytes at EOF.
     // NSLock-guarded so the StreamProxy tail handler (non-main queue) can
-    // read status without crossing actor boundaries. `nonisolated(unsafe)`
-    // documents that we're opting out of the compiler's main-actor
-    // protection on these storage slots — the lock is the real guard.
-    @ObservationIgnored nonisolated(unsafe) private let activeIDsLock = NSLock()
+    // read status without crossing actor boundaries. NSLock is Sendable in
+    // modern SDKs, so no explicit actor escape annotation is required.
+    @ObservationIgnored private let activeIDsLock = NSLock()
     @ObservationIgnored nonisolated(unsafe) private var _activeIDs: Set<UUID> = []
 
     nonisolated func isStillRecording(id: UUID) -> Bool {

@@ -33,6 +33,9 @@ struct MPVMediaInfo: Equatable, Sendable {
     var audioCodec: String = ""
     var audioChannels: Int = 0
     var hwdec: String = ""
+    /// Estimated seconds behind the live edge, adjusted by preferred delay.
+    /// `nil` when the stream does not expose a replay window.
+    var liveLatencySeconds: Double?
 
     var resolutionLabel: String {
         width > 0 && height > 0 ? "\(width)×\(height)" : ""
@@ -50,6 +53,13 @@ final class MPVPlayer {
         static let stateEpsilon = 0.01
         static let timePosEpsilon = 0.05
         static let cacheEpsilon = 0.25
+        static let demuxerLavfProbeSize = 1_048_576
+        // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
+        // AVOption surface.
+        static let demuxerLavfAnalyzeDuration = 3.0
+        static let fastProbeSize = 65_536
+        static let fastAnalyzeDuration = 0.1
+        static let liveLatencyEpsilon = 0.5
 
         /// mpv's demuxer readahead still matters for how much data can build
         /// up while playback is manually paused. Match it to the user-facing
@@ -96,6 +106,9 @@ final class MPVPlayer {
     /// simple "show error to user" flow (e.g. recording playback of a finite
     /// file, where a retry makes no sense).
     var onPlaybackEnded: ((MPVEndReason) -> Void)?
+    /// Emitted when newly parsed media metadata becomes available. Intended for
+    /// lightweight consumers such as StreamProbeService cache updates.
+    var onMediaInfoChanged: ((MPVMediaInfo) -> Void)?
 
     /// True if we have no rewind window, or playback is within a few seconds of
     /// the live edge. Streams without a DVR window are considered always-live.
@@ -196,11 +209,11 @@ final class MPVPlayer {
         // detection. Restored to the safe HLS defaults on the next non-fast
         // load so channel streams aren't affected.
         if fastProbe {
-            setRuntimeProperty(handle, "demuxer-lavf-probesize", "65536")
-            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "0.1")
+            setRuntimeProperty(handle, "demuxer-lavf-probesize", "\(Tuning.fastProbeSize)")
+            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(Tuning.fastAnalyzeDuration)")
         } else {
-            setRuntimeProperty(handle, "demuxer-lavf-probesize", "1048576")
-            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "2.0")
+            setRuntimeProperty(handle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
+            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
         }
 
         let path = url.absoluteString
@@ -445,8 +458,8 @@ final class MPVPlayer {
         // startup latency for normal HLS — the larger window only kicks in
         // for pathological feeds that delay stream headers.
         setOption(newHandle, "demuxer-lavf-probe-info", "auto")
-        setOption(newHandle, "demuxer-lavf-probesize", "1048576")
-        setOption(newHandle, "demuxer-lavf-analyzeduration", "2.0")
+        setOption(newHandle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
+        setOption(newHandle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
         setOption(newHandle, "network-timeout", "10")
         // libavformat-level reconnect covers single-socket network hiccups
         // inside one segment fetch. It does NOT recover from HLS playlist
@@ -480,11 +493,10 @@ final class MPVPlayer {
         startEventPump(handle: newHandle)
         startStatePolling()
 
-        // Pull info+ logs from mpv into our console so diagnostics from
-        // async commands (dump-cache open/close, recorder errors, muxer
-        // warnings) surface instead of disappearing into mpv's internal
-        // logger. Noisy but invaluable when something silently fails.
-        mpv_request_log_messages(newHandle, "info")
+        // Pull warning-level logs into our console so transport/probe
+        // failures remain visible without spamming routine track/renderer
+        // state on every load.
+        mpv_request_log_messages(newHandle, "warn")
     }
 
     private func reloadBufferSetting() {
@@ -810,6 +822,20 @@ final class MPVPlayer {
         if let hwdec = pending.hwdec {
             nextMediaInfo.hwdec = hwdec
         }
+        let nextDuration = pending.duration ?? duration
+        let nextTimePos = pending.timePos ?? timePos
+        let nextIsSeekable = pending.isSeekable ?? isSeekable
+        let hasReplayWindow = nextIsSeekable && nextDuration > 0 && nextDuration.isFinite && nextTimePos.isFinite
+        if hasReplayWindow {
+            let targetDelay = min(Double(bufferSeconds), nextDuration)
+            let nextLatency = max(0, nextDuration - nextTimePos - targetDelay)
+            let currentLatency = nextMediaInfo.liveLatencySeconds ?? 0
+            if abs(currentLatency - nextLatency) >= Tuning.liveLatencyEpsilon {
+                nextMediaInfo.liveLatencySeconds = nextLatency
+            }
+        } else if nextMediaInfo.liveLatencySeconds != nil {
+            nextMediaInfo.liveLatencySeconds = nil
+        }
 
         var nextContainerFps = pending.containerFps ?? containerFps
         var nextEstimatedFps = pending.estimatedFps ?? estimatedFps
@@ -828,8 +854,10 @@ final class MPVPlayer {
         if abs(nextMediaInfo.fps - displayFps) >= Tuning.stateEpsilon {
             nextMediaInfo.fps = displayFps
         }
-        if mediaInfo != nextMediaInfo {
+        let didMediaInfoChange = mediaInfo != nextMediaInfo
+        if didMediaInfoChange {
             mediaInfo = nextMediaInfo
+            onMediaInfoChanged?(nextMediaInfo)
         }
 
         if let cacheSeconds = pending.cacheSeconds {

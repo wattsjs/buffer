@@ -242,6 +242,10 @@ struct ContentView: View {
                 programs: viewModel.searchEntries,
                 channels: viewModel.channels
             )
+            sportsViewModel.channels = viewModel.channels
+            sportsViewModel.programs = viewModel.programs
+            sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
+            sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
         }
         .onChange(of: viewModel.channels.count) { _, _ in
             sportsViewModel.channels = viewModel.channels
@@ -251,6 +255,9 @@ struct ContentView: View {
         }
         .onChange(of: viewModel.favoriteChannelIDs) { _, _ in
             sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
+        }
+        .onChange(of: viewModel.hiddenGroupNames) { _, _ in
+            sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
         }
         .onChange(of: hideSport) { _, hidden in
             if hidden {

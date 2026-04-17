@@ -1540,65 +1540,116 @@ struct WindowAccessor: NSViewRepresentable {
     var isPinned: Bool
     var videoSize: CGSize
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            updateWindow(view: view)
-        }
+        let view = NSView(frame: .zero)
+        context.coordinator.scheduleUpdate(
+            view: view,
+            showChrome: showChrome,
+            isPinned: isPinned,
+            videoSize: videoSize
+        )
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        updateWindow(view: nsView)
-    }
-
-    private func updateWindow(view: NSView) {
-        guard let window = view.window else { return }
-
-        window.level = isPinned ? .floating : .normal
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.isMovableByWindowBackground = true
-        window.styleMask.insert(.fullSizeContentView)
-        window.isOpaque = false
-        window.backgroundColor = .clear
-
-        installSnapDelegate(on: window)
-        applyAspectRatio(window: window)
-
-        let hidden = !showChrome
-        window.standardWindowButton(.closeButton)?.isHidden = hidden
-        window.standardWindowButton(.miniaturizeButton)?.isHidden = hidden
-        window.standardWindowButton(.zoomButton)?.isHidden = hidden
-    }
-
-    private func installSnapDelegate(on window: NSWindow) {
-        if objc_getAssociatedObject(window, &snapDelegateKey) != nil { return }
-        let snap = SnappingWindowDelegate()
-        snap.attach(to: window)
-        objc_setAssociatedObject(window, &snapDelegateKey, snap, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-    }
-
-    private func applyAspectRatio(window: NSWindow) {
-        guard videoSize.width > 0, videoSize.height > 0 else { return }
-        let targetRatio = videoSize.width / videoSize.height
-        let currentAspect = window.contentAspectRatio
-        let currentRatio = currentAspect.height > 0 ? currentAspect.width / currentAspect.height : 0
-        if abs(currentRatio - targetRatio) < 0.001 { return }
-
-        window.contentAspectRatio = NSSize(width: videoSize.width, height: videoSize.height)
-
-        let contentRect = window.contentRect(forFrameRect: window.frame)
-        let newHeight = contentRect.width / targetRatio
-        let newContent = NSRect(
-            x: contentRect.minX,
-            y: contentRect.maxY - newHeight,
-            width: contentRect.width,
-            height: newHeight
+        context.coordinator.scheduleUpdate(
+            view: nsView,
+            showChrome: showChrome,
+            isPinned: isPinned,
+            videoSize: videoSize
         )
-        let newFrame = window.frameRect(forContentRect: newContent)
-        if !newFrame.equalTo(window.frame) {
-            window.setFrame(newFrame, display: true, animate: true)
+    }
+
+    final class Coordinator {
+        private struct PendingState {
+            let showChrome: Bool
+            let isPinned: Bool
+            let videoSize: CGSize
+        }
+
+        private var pendingState: PendingState?
+        private var updateScheduled = false
+
+        func scheduleUpdate(view: NSView, showChrome: Bool, isPinned: Bool, videoSize: CGSize) {
+            pendingState = PendingState(
+                showChrome: showChrome,
+                isPinned: isPinned,
+                videoSize: videoSize
+            )
+            requestFlush(for: view)
+        }
+
+        private func requestFlush(for view: NSView) {
+            guard !updateScheduled else { return }
+            updateScheduled = true
+            DispatchQueue.main.async { [weak self, weak view] in
+                guard let self else { return }
+                self.updateScheduled = false
+                guard let view else { return }
+                self.applyPendingUpdate(to: view)
+                if self.pendingState != nil {
+                    self.requestFlush(for: view)
+                }
+            }
+        }
+
+        private func applyPendingUpdate(to view: NSView) {
+            guard let state = pendingState else { return }
+            pendingState = nil
+            guard let window = view.window else {
+                pendingState = state
+                return
+            }
+
+            window.level = state.isPinned ? .floating : .normal
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.isMovableByWindowBackground = true
+            window.styleMask.insert(.fullSizeContentView)
+            window.isOpaque = false
+            window.backgroundColor = .clear
+
+            installSnapDelegate(on: window)
+            applyAspectRatio(window: window, videoSize: state.videoSize)
+
+            let hidden = !state.showChrome
+            window.standardWindowButton(.closeButton)?.isHidden = hidden
+            window.standardWindowButton(.miniaturizeButton)?.isHidden = hidden
+            window.standardWindowButton(.zoomButton)?.isHidden = hidden
+        }
+
+        private func installSnapDelegate(on window: NSWindow) {
+            if objc_getAssociatedObject(window, &snapDelegateKey) != nil { return }
+            let snap = SnappingWindowDelegate()
+            snap.attach(to: window)
+            objc_setAssociatedObject(window, &snapDelegateKey, snap, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        }
+
+        private func applyAspectRatio(window: NSWindow, videoSize: CGSize) {
+            guard videoSize.width > 0, videoSize.height > 0 else { return }
+            let targetRatio = videoSize.width / videoSize.height
+            let currentAspect = window.contentAspectRatio
+            let currentRatio = currentAspect.height > 0 ? currentAspect.width / currentAspect.height : 0
+            if abs(currentRatio - targetRatio) < 0.001 { return }
+
+            window.contentAspectRatio = NSSize(width: videoSize.width, height: videoSize.height)
+
+            let contentRect = window.contentRect(forFrameRect: window.frame)
+            let newHeight = contentRect.width / targetRatio
+            let newContent = NSRect(
+                x: contentRect.minX,
+                y: contentRect.maxY - newHeight,
+                width: contentRect.width,
+                height: newHeight
+            )
+            let newFrame = window.frameRect(forContentRect: newContent)
+            if !newFrame.equalTo(window.frame) {
+                window.setFrame(newFrame, display: true, animate: false)
+            }
         }
     }
 }

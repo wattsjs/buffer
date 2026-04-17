@@ -78,6 +78,19 @@ final class PlayerSlot: Identifiable {
         new.onPlaybackEnded = { [weak self] reason in
             self?.handlePlaybackEnded(reason)
         }
+        new.onMediaInfoChanged = { [weak self] info in
+            guard let self else { return }
+            StreamProbeService.shared.recordPlaybackInfo(
+                channelID: self.channel.id,
+                width: info.width,
+                height: info.height,
+                fps: info.fps,
+                videoCodec: info.videoCodec,
+                audioCodec: info.audioCodec,
+                audioChannels: info.audioChannels,
+                liveLatencySeconds: info.liveLatencySeconds
+            )
+        }
         _player = new
         return new
     }
@@ -330,6 +343,9 @@ final class PlayerSlot: Identifiable {
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(proxiedURL, autoplay: true)
         armRecoveryWatchdogs()
+        // The user is actively watching this channel — bump probe priority so
+        // the badge populates quickly even if scrolling hadn't requested it.
+        StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
     }
 
     func loadLive() {
@@ -340,6 +356,7 @@ final class PlayerSlot: Identifiable {
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(url, autoplay: true)
         armRecoveryWatchdogs()
+        StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
     }
 
     func loadCatchup(_ url: URL) {

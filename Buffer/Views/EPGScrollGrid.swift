@@ -541,7 +541,6 @@ final class ChannelLabelOverlayView: NSView {
             guard !data.blocks.isEmpty else { continue }
 
             let rowY = CGFloat(i) * rowHeight - scrollOffsetY
-            let docLeftEdge = scrollOffsetX
             let hasName = !data.channelName.isEmpty
             let nameSize = hasName ? (data.channelName as NSString).size(withAttributes: nameAttrs) : .zero
             let nameWidth = min(nameSize.width + 1, bounds.width * 0.35)

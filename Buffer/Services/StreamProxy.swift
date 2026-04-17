@@ -383,6 +383,7 @@ nonisolated final class StreamProxy: @unchecked Sendable {
                                    referer: String?,
                                    caller: String = #function) throws -> BroadcasterHandle {
         let key = upstreamURL.absoluteString
+        var waitDelay: TimeInterval = 0.002
         while true {
             stateLock.lock()
             if let existing = broadcasters[key], existing.ptr != nil {
@@ -395,8 +396,10 @@ nonisolated final class StreamProxy: @unchecked Sendable {
                 stateLock.unlock()
                 break
             }
-            stateLock.wait()
             stateLock.unlock()
+            Thread.sleep(forTimeInterval: waitDelay)
+            waitDelay = min(waitDelay * 2, 0.05)
+            continue
         }
         defer {
             stateLock.lock()
@@ -482,8 +485,12 @@ nonisolated final class StreamProxy: @unchecked Sendable {
             // on the upstream HLS socket. Detach so the caller (often
             // `detachRecording` from a MainActor-isolated RecordingManager
             // path) doesn't block main.
+            struct BroadcastFreeToken: @unchecked Sendable {
+                let pointer: OpaquePointer
+            }
+            let freeToken = BroadcastFreeToken(pointer: toFree)
             DispatchQueue.global(qos: .userInitiated).async {
-                buffer_broadcaster_free(toFree)
+                buffer_broadcaster_free(freeToken.pointer)
             }
         }
     }
@@ -497,7 +504,7 @@ nonisolated final class StreamProxy: @unchecked Sendable {
                 connection.cancel()
                 return
             }
-            Task.detached { [weak self] in
+            Task.detached(priority: .userInitiated) { [weak self] in
                 await self?.route(path: path, headers: headers, connection: connection)
             }
         }
@@ -790,7 +797,7 @@ private final class ConnectionSinkAdapter: @unchecked Sendable {
     /// `remove_sink` returns, so the lifetime is safe.
     private var retainToken: Unmanaged<ConnectionSinkAdapter>?
 
-    init(connection: NWConnection, onClose: @escaping (ConnectionSinkAdapter) -> Void) {
+    nonisolated init(connection: NWConnection, onClose: @escaping (ConnectionSinkAdapter) -> Void) {
         self.connection = connection
         self.onClose = onClose
         connection.stateUpdateHandler = { [weak self] state in
@@ -803,7 +810,7 @@ private final class ConnectionSinkAdapter: @unchecked Sendable {
         }
     }
 
-    func attach(broadcaster: OpaquePointer?) {
+    nonisolated func attach(broadcaster: OpaquePointer?) {
         guard let broadcaster else { return }
         broadcasterPtr = broadcaster
         retainToken = Unmanaged.passRetained(self)
@@ -865,11 +872,11 @@ private final class ConnectionSinkAdapter: @unchecked Sendable {
     private var detached = false
     private let detachLock = NSLock()
 
-    func detach() {
+    nonisolated func detach() {
         detach(removeSink: true)
     }
 
-    private func detach(removeSink: Bool) {
+    nonisolated private func detach(removeSink: Bool) {
         detachLock.lock()
         if detached { detachLock.unlock(); return }
         detached = true
@@ -888,7 +895,7 @@ private final class ConnectionSinkAdapter: @unchecked Sendable {
         retainToken = nil
     }
 
-    private func detachFromBroadcasterEOF() {
+    nonisolated private func detachFromBroadcasterEOF() {
         // notify_eof already marked the sink dead and is currently running
         // inside the broadcaster's delivery pass, so calling
         // remove_sink here would wait for the callback that we're in.

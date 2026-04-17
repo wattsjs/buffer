@@ -57,6 +57,9 @@ class EPGViewModel {
         hydrationTask = Task { [weak self] in
             await self?.hydrateFromDisk()
         }
+        if let config = serverConfig {
+            StreamProbeService.shared.setActiveCacheKey(DataCache.cacheKey(for: config))
+        }
     }
 
     /// All known groups in user-preferred order. Stored order wins for known names;
@@ -545,6 +548,9 @@ class EPGViewModel {
         activePlaylistID = id
         saveActivePlaylistID()
         swapInActivePlaylistState(previousKey: nil)
+        if let config = serverConfig {
+            StreamProbeService.shared.setActiveCacheKey(DataCache.cacheKey(for: config))
+        }
     }
 
     /// Shared between `setActivePlaylist` and cache-key-changing updates.

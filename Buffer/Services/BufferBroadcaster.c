@@ -554,6 +554,8 @@ static int open_input_with_options(BufferBroadcaster *b, char *error, size_t err
     // lets ffmpeg paper over most provider-side glitches before we escalate
     // to a full reopen. `m3u8_hold_counters` and `max_reload` stay at their
     // generous defaults (1000).
+    av_dict_set_int(&opts, "probesize", 1 * 1024 * 1024, 0);
+    av_dict_set_int(&opts, "analyzeduration", 3 * 1000 * 1000, 0);
     av_dict_set_int(&opts, "seg_max_retry", 5, 0);
 
     AVFormatContext *ctx = avformat_alloc_context();

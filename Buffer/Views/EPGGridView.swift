@@ -85,6 +85,7 @@ struct EPGGridView: View {
                         onToggleFavorite: { onToggleFavorite(channel) }
                     )
                     .id(channel.id)
+                    .fadeIfStreamDead(channelID: channel.id)
                 },
                 programContent: { channel in
                     ProgramRow(
@@ -103,6 +104,7 @@ struct EPGGridView: View {
                     .overlay(alignment: .bottom) {
                         Divider().opacity(0.5)
                     }
+                    .fadeIfStreamDead(channelID: channel.id)
                 },
                 headerContent: { timeStrip(timelineStart: timelineStart) },
                 cornerContent: { cornerLabel }
@@ -252,6 +254,10 @@ private struct ChannelCell: View {
                         .help("Rewind available")
                 }
             }
+            .overlay(alignment: .bottomLeading) {
+                StreamProbeBadge(channelID: channel.id, style: .compact)
+                    .padding(6)
+            }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .frame(width: width, height: height)
@@ -259,6 +265,7 @@ private struct ChannelCell: View {
         }
         .buttonStyle(.plain)
         .help(channel.name)
+        .requestStreamProbe(for: channel)
         .contextMenu {
             Button(action: onToggleFavorite) {
                 Label(
