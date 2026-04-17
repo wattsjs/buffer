@@ -45,6 +45,19 @@ struct BufferBroadcaster {
     Sink sinks[MAX_SINKS];
     int next_token;
 
+    // Delivery-drain gate. `write_to_sinks` / `notify_eof` snapshot the
+    // sink list under `sinks_mutex`, release the lock, then invoke
+    // callbacks with stack-local copies of `cb` (ctx included). Without
+    // this counter, `remove_sink` could return while a worker was still
+    // about to invoke the just-cleared sink's callback — the Swift caller
+    // then releases the adapter, and the delayed callback dereferences
+    // freed memory inside `NWConnection.send`. `deliveries_in_flight` is
+    // bumped before the unlocked callback loop runs and drained after;
+    // `remove_sink` waits on the condvar until it's 0, guaranteeing no
+    // further callback can fire against a ctx it has cleared.
+    pthread_cond_t delivery_cond;
+    int deliveries_in_flight;
+
     // Stop flag set from free(); worker checks between packets.
     volatile int stop_requested;
 
@@ -180,6 +193,7 @@ static int write_to_sinks(void *opaque, const uint8_t *buf, int buf_size) {
             snapshot[n++] = b->sinks[i].cb;
         }
     }
+    b->deliveries_in_flight++;
     pthread_mutex_unlock(&b->sinks_mutex);
 
     for (int i = 0; i < n; i++) {
@@ -187,6 +201,13 @@ static int write_to_sinks(void *opaque, const uint8_t *buf, int buf_size) {
             snapshot[i].on_bytes(snapshot[i].ctx, buf, (size_t)buf_size);
         }
     }
+
+    pthread_mutex_lock(&b->sinks_mutex);
+    b->deliveries_in_flight--;
+    if (b->deliveries_in_flight == 0) {
+        pthread_cond_broadcast(&b->delivery_cond);
+    }
+    pthread_mutex_unlock(&b->sinks_mutex);
     return buf_size;
 }
 
@@ -200,12 +221,19 @@ static void notify_eof(BufferBroadcaster *b) {
             b->sinks[i].alive = 0;
         }
     }
+    b->deliveries_in_flight++;
     pthread_mutex_unlock(&b->sinks_mutex);
     for (int i = 0; i < n; i++) {
         if (snapshot[i].on_eof) {
             snapshot[i].on_eof(snapshot[i].ctx);
         }
     }
+    pthread_mutex_lock(&b->sinks_mutex);
+    b->deliveries_in_flight--;
+    if (b->deliveries_in_flight == 0) {
+        pthread_cond_broadcast(&b->delivery_cond);
+    }
+    pthread_mutex_unlock(&b->sinks_mutex);
 }
 
 // Build output AVFormatContext with mpegts muxer writing into write_to_sinks.
@@ -533,11 +561,13 @@ BufferBroadcaster *buffer_broadcaster_create(const char *input_url,
     if (!b) { snprintf(error, error_size, "calloc failed"); return NULL; }
 
     pthread_mutex_init(&b->sinks_mutex, NULL);
+    pthread_cond_init(&b->delivery_cond, NULL);
     b->next_token = 1;
     b->ring_capacity = REPLAY_RING_CAPACITY;
     b->ring = (uint8_t *)malloc(b->ring_capacity);
     if (!b->ring) {
         snprintf(error, error_size, "ring alloc failed");
+        pthread_cond_destroy(&b->delivery_cond);
         pthread_mutex_destroy(&b->sinks_mutex);
         free(b);
         return NULL;
@@ -611,6 +641,14 @@ void buffer_broadcaster_remove_sink(BufferBroadcaster *b, int token) {
             b->sinks[i].cb.on_eof = NULL;
             break;
         }
+    }
+    // Wait for any in-flight fan-out to finish. A worker may have
+    // snapshotted this sink's cb before we cleared it and still be
+    // mid-call; returning now would let the Swift caller release the
+    // adapter out from under that callback. The worker is single-threaded
+    // per broadcaster, so this waits for at most one delivery pass.
+    while (b->deliveries_in_flight > 0) {
+        pthread_cond_wait(&b->delivery_cond, &b->sinks_mutex);
     }
     pthread_mutex_unlock(&b->sinks_mutex);
 }
@@ -686,6 +724,7 @@ void buffer_broadcaster_free(BufferBroadcaster *b) {
     free(b->user_agent);
     free(b->referer);
     free(b->ring);
+    pthread_cond_destroy(&b->delivery_cond);
     pthread_mutex_destroy(&b->sinks_mutex);
     free(b);
 }
