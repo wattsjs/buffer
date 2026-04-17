@@ -535,12 +535,14 @@ nonisolated enum StreamMatcher {
     /// Generic sport keywords that EPG listings commonly use.
     private static func sportKeywords(for event: SportEvent) -> [String] {
         switch event.sport {
-        case .tennis:     return ["tennis"]
-        case .golf:       return ["golf"]
-        case .motorsport: return ["racing", "motorsport"]
-        case .cricket:    return ["cricket"]
-        case .mma:        return ["ufc", "mma", "fight"]
-        default:          return [normalise(event.sport.rawValue)]
+        case .tennis:             return ["tennis"]
+        case .golf:               return ["golf"]
+        case .motorsport:         return ["racing", "motorsport"]
+        case .cricket:            return ["cricket"]
+        case .mma:                return ["ufc", "mma", "fight"]
+        case .rugbyLeague:        return ["rugby", "league"]
+        case .australianFootball: return ["afl", "aussie", "australian", "footy"]
+        default:                  return [normalise(event.sport.rawValue)]
         }
     }
 
@@ -561,14 +563,33 @@ nonisolated enum StreamMatcher {
         case (.soccer, "ita.1"):          kw.append("serie")
         case (.soccer, "fra.1"):          kw.append("ligue")
         case (.soccer, "usa.1"):          kw.append("mls")
+        case (.soccer, "aus.1"):          kw.append(contentsOf: ["a-league", "aleague"])
+        case (.soccer, "aus.w.1"):        kw.append(contentsOf: ["a-league", "aleague", "women"])
+        case (.soccer, "eng.fa"):         kw.append(contentsOf: ["fa", "cup"])
+        case (.soccer, "eng.2"):          kw.append(contentsOf: ["championship", "efl"])
         case (.mma, _):                   kw.append(contentsOf: ["ufc", "fight"])
         case (.motorsport, "f1"):         kw.append(contentsOf: ["formula", "grand prix", "f1"])
-        case (.motorsport, "nascar-cup"): kw.append("nascar")
+        case (.motorsport, "nascar-premier"): kw.append("nascar")
+        case (.motorsport, "nascar-secondary"): kw.append(contentsOf: ["nascar", "xfinity"])
+        case (.motorsport, "irl"):        kw.append(contentsOf: ["indycar", "indy"])
         case (.tennis, "atp"):            kw.append(contentsOf: ["atp", "tennis"])
         case (.tennis, "wta"):            kw.append(contentsOf: ["wta", "tennis"])
-        case (.golf, _):                  kw.append(contentsOf: ["pga", "golf"])
+        case (.golf, "pga"):              kw.append(contentsOf: ["pga", "golf"])
+        case (.golf, "liv"):              kw.append(contentsOf: ["liv", "golf"])
+        case (.golf, "lpga"):             kw.append(contentsOf: ["lpga", "golf"])
+        case (.golf, "eur"):              kw.append(contentsOf: ["dp world", "european tour", "golf"])
+        case (.golf, _):                  kw.append("golf")
         case (.cricket, "8048"):          kw.append(contentsOf: ["ipl", "cricket", "t20"])
+        case (.cricket, "8044"):          kw.append(contentsOf: ["bbl", "big bash", "cricket", "t20"])
+        case (.cricket, "8043"):          kw.append(contentsOf: ["sheffield shield", "cricket"])
+        case (.cricket, "8039"):          kw.append(contentsOf: ["world cup", "cricket", "icc"])
         case (.cricket, _):               kw.append("cricket")
+        case (.rugbyLeague, _):           kw.append(contentsOf: ["nrl", "rugby league"])
+        case (.rugby, "242041"):          kw.append(contentsOf: ["super rugby", "rugby"])
+        case (.rugby, "244293"):          kw.append(contentsOf: ["rugby championship", "rugby"])
+        case (.rugby, "270557"):          kw.append(contentsOf: ["urc", "united rugby", "rugby"])
+        case (.rugby, "180659"):          kw.append(contentsOf: ["six nations", "rugby"])
+        case (.australianFootball, _):    kw.append(contentsOf: ["afl", "aussie rules", "footy"])
         default: break
         }
         return kw

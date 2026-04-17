@@ -77,22 +77,26 @@ nonisolated enum Sport: String, CaseIterable, Sendable, Identifiable {
     case golf = "Golf"
     case cricket = "Cricket"
     case rugby = "Rugby"
+    case rugbyLeague = "Rugby League"
+    case australianFootball = "AFL"
 
     var id: String { rawValue }
 
     var icon: String {
         switch self {
-        case .football:   "football.fill"
-        case .basketball: "basketball.fill"
-        case .baseball:   "baseball.fill"
-        case .hockey:     "hockey.puck.fill"
-        case .soccer:     "soccerball"
-        case .mma:        "figure.martial.arts"
-        case .motorsport: "car.fill"
-        case .tennis:     "tennisball.fill"
-        case .golf:       "figure.golf"
-        case .cricket:    "cricket.ball.fill"
-        case .rugby:      "rugbyball.fill"
+        case .football:          "football.fill"
+        case .basketball:        "basketball.fill"
+        case .baseball:          "baseball.fill"
+        case .hockey:            "hockey.puck.fill"
+        case .soccer:            "soccerball"
+        case .mma:               "figure.martial.arts"
+        case .motorsport:        "car.fill"
+        case .tennis:            "tennisball.fill"
+        case .golf:              "figure.golf"
+        case .cricket:           "cricket.ball.fill"
+        case .rugby:             "rugbyball.fill"
+        case .rugbyLeague:       "rugbyball.fill"
+        case .australianFootball:"figure.australian.football"
         }
     }
 }
@@ -121,6 +125,8 @@ nonisolated struct League: Sendable, Hashable, Identifiable {
         case .golf:       "golf"
         case .cricket:    "cricket"
         case .rugby:      "rugby"
+        case .rugbyLeague: "rugby-league"
+        case .australianFootball: "australian-football"
         }
     }
 
@@ -148,13 +154,19 @@ nonisolated struct League: Sendable, Hashable, Identifiable {
         League(sport: .soccer, slug: "ger.1", shortName: "Bundesliga", fullName: "Bundesliga"),
         League(sport: .soccer, slug: "ita.1", shortName: "Serie A", fullName: "Serie A"),
         League(sport: .soccer, slug: "fra.1", shortName: "Ligue 1", fullName: "Ligue 1"),
+        League(sport: .soccer, slug: "aus.1", shortName: "A-League", fullName: "A-League Men"),
+        League(sport: .soccer, slug: "aus.w.1", shortName: "A-League W", fullName: "A-League Women"),
+        League(sport: .soccer, slug: "eng.fa", shortName: "FA Cup", fullName: "FA Cup"),
+        League(sport: .soccer, slug: "eng.2", shortName: "Championship", fullName: "EFL Championship"),
 
         // MMA
         League(sport: .mma, slug: "ufc", shortName: "UFC", fullName: "Ultimate Fighting Championship"),
 
         // Motorsport
         League(sport: .motorsport, slug: "f1", shortName: "F1", fullName: "Formula 1"),
-        League(sport: .motorsport, slug: "nascar-cup", shortName: "NASCAR", fullName: "NASCAR Cup Series"),
+        League(sport: .motorsport, slug: "nascar-premier", shortName: "NASCAR", fullName: "NASCAR Cup Series"),
+        League(sport: .motorsport, slug: "nascar-secondary", shortName: "Xfinity", fullName: "NASCAR Xfinity Series"),
+        League(sport: .motorsport, slug: "irl", shortName: "IndyCar", fullName: "IndyCar Series"),
 
         // Tennis
         League(sport: .tennis, slug: "atp", shortName: "ATP", fullName: "ATP Tour"),
@@ -162,13 +174,27 @@ nonisolated struct League: Sendable, Hashable, Identifiable {
 
         // Golf
         League(sport: .golf, slug: "pga", shortName: "PGA", fullName: "PGA Tour"),
+        League(sport: .golf, slug: "liv", shortName: "LIV", fullName: "LIV Golf"),
+        League(sport: .golf, slug: "lpga", shortName: "LPGA", fullName: "LPGA Tour"),
+        League(sport: .golf, slug: "eur", shortName: "DP World", fullName: "DP World Tour"),
 
         // Cricket
         League(sport: .cricket, slug: "8048", shortName: "IPL", fullName: "Indian Premier League"),
-        League(sport: .cricket, slug: "icc-world-cup", shortName: "ICC", fullName: "ICC Cricket World Cup"),
+        League(sport: .cricket, slug: "8039", shortName: "ICC", fullName: "ICC Cricket World Cup"),
+        League(sport: .cricket, slug: "8044", shortName: "BBL", fullName: "Big Bash League"),
+        League(sport: .cricket, slug: "8043", shortName: "Shield", fullName: "Sheffield Shield"),
 
-        // Rugby
-        League(sport: .rugby, slug: "six-nations", shortName: "Six Nations", fullName: "Six Nations Championship"),
+        // Rugby Union
+        League(sport: .rugby, slug: "180659", shortName: "Six Nations", fullName: "Six Nations Championship"),
+        League(sport: .rugby, slug: "242041", shortName: "Super Rugby", fullName: "Super Rugby Pacific"),
+        League(sport: .rugby, slug: "244293", shortName: "Rugby Champs", fullName: "The Rugby Championship"),
+        League(sport: .rugby, slug: "270557", shortName: "URC", fullName: "United Rugby Championship"),
+
+        // Rugby League
+        League(sport: .rugbyLeague, slug: "3", shortName: "NRL", fullName: "National Rugby League"),
+
+        // Australian Rules Football
+        League(sport: .australianFootball, slug: "afl", shortName: "AFL", fullName: "Australian Football League"),
     ]
 }
 

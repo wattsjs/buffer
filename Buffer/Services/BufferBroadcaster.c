@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <Libavformat/avformat.h>
 #include <Libavformat/avio.h>
@@ -279,43 +280,223 @@ static int build_output(BufferBroadcaster *b, char *error, size_t error_size) {
     return 0;
 }
 
+// Open `b->in_ctx` against `b->input_url` with the same libavformat options
+// used at first-open. Caller owns deciding whether to tear down the old
+// context first. Returns 0 on success; populates `error` on failure.
+static int open_input_with_options(BufferBroadcaster *b, char *error, size_t error_size) {
+    AVDictionary *opts = NULL;
+    if (b->user_agent && b->user_agent[0]) {
+        av_dict_set(&opts, "user_agent", b->user_agent, 0);
+    }
+    if (b->referer && b->referer[0]) {
+        av_dict_set(&opts, "referer", b->referer, 0);
+    }
+    // libavformat reconnect (covers single-socket network hiccups without
+    // tearing down the demuxer).
+    av_dict_set(&opts, "reconnect", "1", 0);
+    av_dict_set(&opts, "reconnect_streamed", "1", 0);
+    av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
+    av_dict_set(&opts, "reconnect_on_http_error", "5xx", 0);
+    av_dict_set_int(&opts, "reconnect_delay_max", 5, 0);
+    av_dict_set_int(&opts, "rw_timeout", 20 * 1000 * 1000, 0);
+
+    // HLS demuxer tuning. `seg_max_retry` is the biggest win: its default
+    // of 0 means a single bad segment kills the demuxer. Setting it to 5
+    // lets ffmpeg paper over most provider-side glitches before we escalate
+    // to a full reopen. `m3u8_hold_counters` and `max_reload` stay at their
+    // generous defaults (1000).
+    av_dict_set_int(&opts, "seg_max_retry", 5, 0);
+
+    int rc = avformat_open_input(&b->in_ctx, b->input_url, NULL, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) {
+        format_error(rc, error, error_size);
+        return rc;
+    }
+
+    rc = avformat_find_stream_info(b->in_ctx, NULL);
+    if (rc < 0) {
+        format_error(rc, error, error_size);
+        avformat_close_input(&b->in_ctx);
+        return rc;
+    }
+    return 0;
+}
+
+// Check that a freshly re-opened input has the same stream topology as the
+// one we initially built the output muxer against. If codecs or stream
+// count differ, the new input can't be mapped onto the existing PAT/PMT
+// and we have to tear down. Returns 1 if compatible, 0 otherwise.
+static int streams_compatible_with_mapping(BufferBroadcaster *b) {
+    if (!b->in_ctx || !b->stream_mapping) return 0;
+    if ((int)b->in_ctx->nb_streams != b->stream_mapping_size) return 0;
+    for (int i = 0; i < b->stream_mapping_size; i++) {
+        int out_idx = b->stream_mapping[i];
+        AVStream *in_s = b->in_ctx->streams[i];
+        if (!in_s || !in_s->codecpar) return 0;
+        int type = in_s->codecpar->codec_type;
+        int is_av = (type == AVMEDIA_TYPE_AUDIO || type == AVMEDIA_TYPE_VIDEO);
+        // Skip-streams (mapping == -1) were non-av originally; they must
+        // still be non-av now.
+        if (out_idx < 0) {
+            if (is_av) return 0;
+            continue;
+        }
+        if (!is_av) return 0;
+        if (out_idx >= (int)b->out_ctx->nb_streams) return 0;
+        AVStream *out_s = b->out_ctx->streams[out_idx];
+        if (!out_s || !out_s->codecpar) return 0;
+        if (in_s->codecpar->codec_id != out_s->codecpar->codec_id) return 0;
+    }
+    return 1;
+}
+
+// Sleep for `seconds` while periodically re-checking stop_requested so
+// teardown isn't held up by a long backoff.
+static void interruptible_sleep(BufferBroadcaster *b, double seconds) {
+    const double tick = 0.1;
+    double remaining = seconds;
+    while (remaining > 0 && !b->stop_requested) {
+        double slice = remaining < tick ? remaining : tick;
+        struct timespec ts;
+        ts.tv_sec = (time_t)slice;
+        ts.tv_nsec = (long)((slice - (double)ts.tv_sec) * 1e9);
+        nanosleep(&ts, NULL);
+        remaining -= slice;
+    }
+}
+
+// Time-window budget for continuous reopen failures before we give up and
+// signal EOF to sinks. Shorter than mpv's own retry deadline so the app
+// still gets a chance to escalate.
+#define REOPEN_TOTAL_WINDOW_SECONDS 60.0
+
 static void *worker_main(void *arg) {
     BufferBroadcaster *b = (BufferBroadcaster *)arg;
     AVPacket *pkt = av_packet_alloc();
     if (!pkt) return NULL;
 
+    int reopen_attempt = 0;
+    struct timespec failure_start = {0};
+    int in_failure_window = 0;
+
     while (!b->stop_requested) {
         int rc = av_read_frame(b->in_ctx, pkt);
-        if (rc < 0) {
-            // AVERROR_EOF or transient. Break — caller will close.
-            break;
-        }
+        if (rc >= 0) {
+            // Healthy read — reset the failure tracker.
+            reopen_attempt = 0;
+            in_failure_window = 0;
 
-        if (pkt->stream_index < 0 || pkt->stream_index >= b->stream_mapping_size) {
+            if (pkt->stream_index < 0 || pkt->stream_index >= b->stream_mapping_size) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            int out_idx = b->stream_mapping[pkt->stream_index];
+            if (out_idx < 0) {
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            AVStream *in_s = b->in_ctx->streams[pkt->stream_index];
+            AVStream *out_s = b->out_ctx->streams[out_idx];
+
+            // Rescale timestamps from input's time_base to the output
+            // stream. After a reopen the input's PTS origin may jump
+            // forward — mpegts downstream tolerates this (mpv treats it
+            // as a discontinuity and resyncs) so we don't bother
+            // synthesising an offset here.
+            av_packet_rescale_ts(pkt, in_s->time_base, out_s->time_base);
+            pkt->stream_index = out_idx;
+            pkt->pos = -1;
+
+            int werr = av_interleaved_write_frame(b->out_ctx, pkt);
             av_packet_unref(pkt);
+            if (werr < 0) {
+                // Muxer error — our own pipeline, not the upstream. Not
+                // recoverable.
+                fprintf(stderr, "[broadcaster] muxer write failed rc=%d — stopping\n", werr);
+                break;
+            }
             continue;
         }
-        int out_idx = b->stream_mapping[pkt->stream_index];
-        if (out_idx < 0) {
-            av_packet_unref(pkt);
-            continue;
+
+        // Read error: either upstream EOF, network hiccup, or malformed
+        // segment. Try to reopen the input so sinks never see EOF.
+        if (b->stop_requested) break;
+
+        char rdmsg[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(rc, rdmsg, sizeof(rdmsg));
+        fprintf(stderr, "[broadcaster] av_read_frame rc=%d (%s) — attempting reopen #%d\n",
+                rc, rdmsg, reopen_attempt + 1);
+
+        if (!in_failure_window) {
+            clock_gettime(CLOCK_MONOTONIC, &failure_start);
+            in_failure_window = 1;
+        } else {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (double)(now.tv_sec - failure_start.tv_sec)
+                           + (double)(now.tv_nsec - failure_start.tv_nsec) / 1e9;
+            if (elapsed > REOPEN_TOTAL_WINDOW_SECONDS) {
+                fprintf(stderr, "[broadcaster] reopen window exhausted (%.1fs) — giving up\n",
+                        elapsed);
+                break;
+            }
         }
 
-        AVStream *in_s = b->in_ctx->streams[pkt->stream_index];
-        AVStream *out_s = b->out_ctx->streams[out_idx];
+        // Exponential backoff capped at 5s: 0.25, 0.5, 1, 2, 4, 5, 5, ...
+        double delay = 0.25 * (double)(1 << (reopen_attempt < 5 ? reopen_attempt : 5));
+        if (delay > 5.0) delay = 5.0;
+        interruptible_sleep(b, delay);
+        reopen_attempt++;
+        if (b->stop_requested) break;
 
-        // Rescale timestamps from input's time_base to the output stream.
-        av_packet_rescale_ts(pkt, in_s->time_base, out_s->time_base);
-        pkt->stream_index = out_idx;
-        pkt->pos = -1;
+        // Discard the old input; keep the muxer + avio intact so PAT/PMT
+        // and continuity counters keep flowing from the sinks' point of
+        // view.
+        avformat_close_input(&b->in_ctx);
 
-        rc = av_interleaved_write_frame(b->out_ctx, pkt);
-        av_packet_unref(pkt);
-        if (rc < 0) {
-            // Muxer error — give up.
-            break;
+        // Retry loop: keep trying to reopen within the failure window. On
+        // each failure, back off again (up to the 5s cap). The outer read
+        // loop needs `in_ctx` non-NULL before it can run av_read_frame,
+        // so we can't just `continue` to it.
+        int reopened = 0;
+        while (!b->stop_requested) {
+            char err[256] = {0};
+            if (open_input_with_options(b, err, sizeof(err)) == 0) {
+                if (!streams_compatible_with_mapping(b)) {
+                    fprintf(stderr, "[broadcaster] reopen produced incompatible stream topology — giving up\n");
+                    avformat_close_input(&b->in_ctx);
+                    // Escape the outer loop too.
+                    goto fatal;
+                }
+                fprintf(stderr, "[broadcaster] reopen OK — resuming\n");
+                reopened = 1;
+                break;
+            }
+            fprintf(stderr, "[broadcaster] reopen failed: %s — will retry\n", err);
+
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (double)(now.tv_sec - failure_start.tv_sec)
+                           + (double)(now.tv_nsec - failure_start.tv_nsec) / 1e9;
+            if (elapsed > REOPEN_TOTAL_WINDOW_SECONDS) {
+                fprintf(stderr, "[broadcaster] reopen window exhausted (%.1fs) — giving up\n",
+                        elapsed);
+                goto fatal;
+            }
+
+            double d = 0.25 * (double)(1 << (reopen_attempt < 5 ? reopen_attempt : 5));
+            if (d > 5.0) d = 5.0;
+            interruptible_sleep(b, d);
+            reopen_attempt++;
         }
+        if (!reopened) break; // stop_requested during retry
     }
+    goto done;
+
+fatal:
+done:;
 
     av_packet_free(&pkt);
 
@@ -366,42 +547,21 @@ BufferBroadcaster *buffer_broadcaster_create(const char *input_url,
     copy_str(&b->user_agent, user_agent);
     copy_str(&b->referer, referer);
 
-    // Open input with HLS-friendly options.
-    AVDictionary *opts = NULL;
-    if (user_agent && user_agent[0]) av_dict_set(&opts, "user_agent", user_agent, 0);
-    if (referer && referer[0]) av_dict_set(&opts, "referer", referer, 0);
-    av_dict_set(&opts, "reconnect", "1", 0);
-    av_dict_set(&opts, "reconnect_streamed", "1", 0);
-    av_dict_set(&opts, "reconnect_on_network_error", "1", 0);
-    av_dict_set_int(&opts, "rw_timeout", 20 * 1000 * 1000, 0);
-
     fprintf(stderr, "[broadcaster] avformat_open_input START url=%s ua=%s referer=%s\n",
             input_url,
             user_agent ? user_agent : "(none)",
             referer ? referer : "(none)");
-    int rc = avformat_open_input(&b->in_ctx, input_url, NULL, &opts);
-    av_dict_free(&opts);
+    int rc = open_input_with_options(b, error, error_size);
     if (rc < 0) {
-        format_error(rc, error, error_size);
         fprintf(stderr, "[broadcaster] avformat_open_input FAILED url=%s: %s\n",
                 input_url, error);
         buffer_broadcaster_free(b);
         return NULL;
     }
-    fprintf(stderr, "[broadcaster] avformat_open_input OK url=%s format=%s\n",
+    fprintf(stderr, "[broadcaster] avformat_open_input + find_stream_info OK url=%s format=%s nb_streams=%u\n",
             input_url,
-            b->in_ctx && b->in_ctx->iformat ? b->in_ctx->iformat->name : "?");
-
-    rc = avformat_find_stream_info(b->in_ctx, NULL);
-    if (rc < 0) {
-        format_error(rc, error, error_size);
-        fprintf(stderr, "[broadcaster] find_stream_info FAILED url=%s: %s\n",
-                input_url, error);
-        buffer_broadcaster_free(b);
-        return NULL;
-    }
-    fprintf(stderr, "[broadcaster] find_stream_info OK url=%s nb_streams=%u\n",
-            input_url, b->in_ctx->nb_streams);
+            b->in_ctx && b->in_ctx->iformat ? b->in_ctx->iformat->name : "?",
+            b->in_ctx ? b->in_ctx->nb_streams : 0);
 
     if (build_output(b, error, error_size) != 0) {
         buffer_broadcaster_free(b);

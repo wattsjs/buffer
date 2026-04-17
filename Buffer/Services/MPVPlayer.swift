@@ -15,6 +15,16 @@ enum BufferSetting {
     }
 }
 
+enum MPVEndReason: Equatable, Sendable {
+    /// Playback was stopped by a `stop` command or a new `loadfile`.
+    case stopped
+    /// mpv reached EOF. For live streams this is usually a false EOF and the
+    /// owner should reconnect; for finite files it's the end of playback.
+    case eof
+    /// An mpv error code (see `mpv_error_string`).
+    case error(code: Int32, message: String)
+}
+
 struct MPVMediaInfo: Equatable, Sendable {
     var width: Int = 0
     var height: Int = 0
@@ -78,6 +88,14 @@ final class MPVPlayer {
     /// Last URL handed to `loadURL`. Used by callers to avoid redundant
     /// `loadURL` calls when handing off a player.
     private(set) var currentURL: URL?
+
+    /// Called whenever mpv fires MPV_EVENT_END_FILE. When non-nil, MPVPlayer
+    /// suppresses its automatic `errorMessage` for error/EOF reasons — the
+    /// handler owns recovery policy (silent reconnect, user-facing error, etc).
+    /// Leaving this `nil` keeps the legacy behaviour for callers that prefer a
+    /// simple "show error to user" flow (e.g. recording playback of a finite
+    /// file, where a retry makes no sense).
+    var onPlaybackEnded: ((MPVEndReason) -> Void)?
 
     /// True if we have no rewind window, or playback is within a few seconds of
     /// the live edge. Streams without a DVR window are considered always-live.
@@ -240,6 +258,18 @@ final class MPVPlayer {
 
     func toggleMute() {
         setMute(!isMuted)
+    }
+
+    /// Called by owners (e.g. PlayerSlot) that are running their own
+    /// reconnect policy. Sets `errorMessage` without going through the
+    /// automatic END_FILE path — used to raise a soft "stream offline"
+    /// banner once silent retries have been failing for long enough.
+    func setReconnectingErrorMessage(_ message: String) {
+        errorMessage = message
+    }
+
+    func clearReconnectingErrorMessage() {
+        errorMessage = nil
     }
 
     // MARK: - Resource scaling
@@ -420,7 +450,13 @@ final class MPVPlayer {
         setOption(newHandle, "demuxer-lavf-probesize", "1048576")
         setOption(newHandle, "demuxer-lavf-analyzeduration", "2.0")
         setOption(newHandle, "network-timeout", "10")
-        setOption(newHandle, "stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,reconnect_on_http_error=5xx")
+        // libavformat-level reconnect covers single-socket network hiccups
+        // inside one segment fetch. It does NOT recover from HLS playlist
+        // errors, demuxer parse failures, or false-EOF — those surface as
+        // MPV_EVENT_END_FILE and are handled by the owner via `onPlaybackEnded`
+        // (see PlayerSlot's reconnect policy).
+        setOption(newHandle, "stream-lavf-o",
+                  "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=5")
         setOption(newHandle, "user-agent", "Buffer/1.0")
 
         let initErr = mpv_initialize(newHandle)
@@ -599,16 +635,34 @@ final class MPVPlayer {
         setState(\.isBuffering, false)
         setState(\.isLoading, false)
 
-        guard event.reason == MPV_END_FILE_REASON_ERROR else { return }
-
-        let reason: String
-        if event.error < 0 {
-            reason = String(cString: mpv_error_string(event.error))
-        } else {
-            reason = "unknown playback error"
+        let endReason: MPVEndReason
+        switch event.reason {
+        case MPV_END_FILE_REASON_STOP, MPV_END_FILE_REASON_QUIT, MPV_END_FILE_REASON_REDIRECT:
+            endReason = .stopped
+        case MPV_END_FILE_REASON_EOF:
+            endReason = .eof
+        case MPV_END_FILE_REASON_ERROR:
+            let message = event.error < 0
+                ? String(cString: mpv_error_string(event.error))
+                : "unknown playback error"
+            endReason = .error(code: event.error, message: message)
+        default:
+            endReason = .stopped
         }
 
-        errorMessage = "Playback failed: \(reason)"
+        // If an owner has installed a recovery handler, let it decide what
+        // the user sees — it may be about to silently reconnect, in which
+        // case surfacing an error banner would flicker the UI for no reason.
+        if let handler = onPlaybackEnded {
+            handler(endReason)
+            return
+        }
+
+        // Legacy path for callers that don't handle reconnect themselves
+        // (e.g. RecordingPlayback): surface errors directly.
+        if case .error(_, let message) = endReason {
+            errorMessage = "Playback failed: \(message)"
+        }
     }
 
     private func resetMediaTrackState() {
