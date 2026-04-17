@@ -705,10 +705,7 @@ struct PlayerView: View {
 
     @ViewBuilder
     private var liveStatusGroup: some View {
-        HStack(spacing: 8) {
-            liveButton
-            bufferIndicator
-        }
+        liveButton
     }
 
     // MARK: - Catchup (channel-rewind) controls
@@ -780,27 +777,23 @@ struct PlayerView: View {
                 returnToLive()
             }
         } label: {
-            HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    if isSeekingCatchup {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(.white)
-                            .scaleEffect(0.7)
-                            .frame(width: 10, height: 10)
-                    } else {
-                        Circle()
-                            .fill(atLive ? Color.red : Color.white.opacity(0.35))
-                            .frame(width: 6, height: 6)
-                    }
-                    Text(offsetLabel(offset))
-                        .font(.system(size: 10, weight: .bold))
-                        .tracking(0.6)
-                        .foregroundStyle(atLive ? Color.red.opacity(0.95) : .white.opacity(0.75))
-                        .monospacedDigit()
+            HStack(spacing: 5) {
+                if isSeekingCatchup {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(.white)
+                        .scaleEffect(0.7)
+                        .frame(width: 10, height: 10)
+                } else {
+                    Circle()
+                        .fill(atLive ? Color.red : Color.white.opacity(0.35))
+                        .frame(width: 6, height: 6)
                 }
-
-                bufferIndicator
+                Text(offsetLabel(offset))
+                    .font(.system(size: 10, weight: .bold))
+                    .tracking(0.6)
+                    .foregroundStyle(atLive ? Color.red.opacity(0.95) : .white.opacity(0.75))
+                    .monospacedDigit()
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
@@ -893,28 +886,19 @@ struct PlayerView: View {
         Button {
             if canJump { jumpToRecordingLive() }
         } label: {
-            HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(showRed ? Color.red : Color.white.opacity(inProgress ? 0.35 : 0.18))
-                        .frame(width: 6, height: 6)
-                    Text("LIVE")
-                        .font(.system(size: 10, weight: .bold))
-                        .tracking(0.6)
-                        .foregroundStyle(
-                            showRed
-                                ? Color.red.opacity(0.95)
-                                : Color.white.opacity(inProgress ? 0.75 : 0.35)
-                        )
-                        .monospacedDigit()
-                }
-
-                // In-progress recordings stream through a tail-follow proxy
-                // and can underrun just like a live catchup. Surface the same
-                // buffer ring so the control bar matches catchup-mode chrome.
-                if inProgress {
-                    bufferIndicator
-                }
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(showRed ? Color.red : Color.white.opacity(inProgress ? 0.35 : 0.18))
+                    .frame(width: 6, height: 6)
+                Text("LIVE")
+                    .font(.system(size: 10, weight: .bold))
+                    .tracking(0.6)
+                    .foregroundStyle(
+                        showRed
+                            ? Color.red.opacity(0.95)
+                            : Color.white.opacity(inProgress ? 0.75 : 0.35)
+                    )
+                    .monospacedDigit()
             }
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
@@ -1113,35 +1097,6 @@ struct PlayerView: View {
         return "-\(mins)m"
     }
 
-    @ViewBuilder
-    private var bufferIndicator: some View {
-        let target = max(player.configuredBufferSeconds, 1)
-        let fraction = min(max(player.cacheSeconds / target, 0), 1)
-
-        ZStack {
-            Circle()
-                .stroke(.white.opacity(0.18), lineWidth: 1.5)
-            Circle()
-                .trim(from: 0, to: fraction)
-                .stroke(
-                    player.isBuffering ? Color.yellow : Color.white.opacity(0.85),
-                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-                .animation(.easeInOut(duration: 0.3), value: fraction)
-        }
-        .frame(width: 10, height: 10)
-        .help(bufferHelpText)
-    }
-
-    private var bufferHelpText: String {
-        if player.isBuffering { return "Buffering…" }
-        if player.cacheSeconds >= 1 {
-            return String(format: "Cache: %.0fs", player.cacheSeconds)
-        }
-        return "Cache"
-    }
-
     // MARK: - Bottom-right: media info
 
     @ViewBuilder
@@ -1274,8 +1229,7 @@ struct PlayerView: View {
         // channel.streamURL here (as we used to) made mpv open a second
         // direct provider connection, which some Xtream accounts refuse
         // with a 403 — the source of the "catchup return fails" error.
-        let url = slot.freshProxiedURL()
-        player.loadURL(url, autoplay: true)
+        slot.loadLive()
         liveLatched = true
     }
 
@@ -1295,7 +1249,7 @@ struct PlayerView: View {
 
         beginSeeking()
         catchupStartDate = clamped
-        player.loadURL(url, autoplay: true)
+        session?.focusedSlot.loadCatchup(url)
         liveLatched = false
     }
 

@@ -53,6 +53,11 @@ enum MultiViewLayout: String, CaseIterable, Identifiable {
 @MainActor
 @Observable
 final class PlayerSlot: Identifiable {
+    private enum PlaybackMode {
+        case live
+        case catchup
+    }
+
     let id = UUID()
     var channel: Channel
     var currentProgram: EPGProgram?
@@ -70,8 +75,139 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored var player: MPVPlayer {
         if let existing = _player { return existing }
         let new = MPVPlayer()
+        new.onPlaybackEnded = { [weak self] reason in
+            self?.handlePlaybackEnded(reason)
+        }
         _player = new
         return new
+    }
+
+    // MARK: - Silent reconnect policy
+    //
+    // Live HLS streams drop for all kinds of transient reasons: provider
+    // edge hiccups, HLS playlist discontinuities, the demuxer hitting a
+    // malformed segment, spurious EOF on an HD feed (mpv issue #2385).
+    // mpv's libavformat reconnect only covers single-socket network
+    // stalls; once the demuxer gives up, the video chain stays dead.
+    //
+    // We recover by re-issuing `loadURL` with a fresh proxy token (so the
+    // shared upstream broadcaster gets a clean tap) on exponential
+    // backoff. Nothing is surfaced to the UI unless reconnects keep
+    // failing for long enough that the stream is clearly offline.
+
+    @ObservationIgnored private var reconnectAttempt: Int = 0
+    @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var firstFailureAt: Date?
+    @ObservationIgnored private var playbackWatchdog: Task<Void, Never>?
+    @ObservationIgnored private var playbackMode: PlaybackMode = .live
+
+    /// After this long of continuous reconnect failures without a single
+    /// successful `FILE_LOADED`, surface an error to the user. The reconnect
+    /// task keeps running in the background — the banner auto-clears if a
+    /// later attempt gets a frame through.
+    @ObservationIgnored private let fatalReconnectWindow: TimeInterval = 60
+
+    /// Seconds of continuous playback required before we consider the stream
+    /// "healthy" and reset the reconnect backoff counter.
+    @ObservationIgnored private let healthyPlaybackSeconds: Double = 5
+
+    fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
+        switch reason {
+        case .stopped:
+            // Initiated by us (new loadfile, teardown). Nothing to do.
+            cancelReconnect()
+            return
+        case .eof, .error:
+            break
+        }
+
+        guard playbackMode == .live else {
+            cancelReconnect()
+            if case .error(_, let message) = reason {
+                player.setReconnectingErrorMessage("Playback failed: \(message)")
+            }
+            return
+        }
+
+        scheduleReconnect(reason: reason)
+    }
+
+    private func scheduleReconnect(reason: MPVEndReason) {
+        // Mark the start of a failure streak so we know when to give up
+        // visibly. `firstFailureAt` is cleared on every successful playback
+        // beyond `healthyPlaybackSeconds`.
+        if firstFailureAt == nil {
+            firstFailureAt = Date()
+        }
+
+        let attempt = reconnectAttempt
+        reconnectAttempt += 1
+
+        // 0.25s, 0.5s, 1s, 2s, 4s, then capped at 5s. The first retry is
+        // snappy so a single bad segment barely blips; later retries
+        // breathe so we don't hammer a dead upstream.
+        let baseDelay = 0.25 * pow(2.0, Double(min(attempt, 5)))
+        let delay = min(baseDelay, 5.0)
+
+        let failureAge = firstFailureAt.map { Date().timeIntervalSince($0) } ?? 0
+        let shouldSurfaceError = failureAge >= fatalReconnectWindow
+
+        let player = self.player
+        if shouldSurfaceError {
+            switch reason {
+            case .eof:
+                player.setReconnectingErrorMessage("Stream offline — still trying.")
+            case .error(_, let message):
+                player.setReconnectingErrorMessage("Stream offline — still trying. (\(message))")
+            case .stopped:
+                break
+            }
+        }
+
+        reconnectTask?.cancel()
+        reconnectTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.performReconnect()
+        }
+    }
+
+    private func performReconnect() {
+        guard playbackMode == .live else { return }
+        let url = freshProxiedURL()
+        player.loadURL(url, autoplay: true)
+        player.play()
+        armHealthyPlaybackWatchdog()
+    }
+
+    /// Watches timePos; once playback has advanced by `healthyPlaybackSeconds`
+    /// since the last reload, declare the session healthy and reset backoff.
+    private func armHealthyPlaybackWatchdog() {
+        playbackWatchdog?.cancel()
+        let startTime = player.timePos
+        playbackWatchdog = Task { @MainActor [weak self] in
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard !Task.isCancelled, let self else { return }
+                if self.player.isPlaying,
+                   self.player.timePos - startTime >= self.healthyPlaybackSeconds {
+                    self.reconnectAttempt = 0
+                    self.firstFailureAt = nil
+                    self.player.clearReconnectingErrorMessage()
+                    return
+                }
+            }
+        }
+    }
+
+    func cancelReconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        playbackWatchdog?.cancel()
+        playbackWatchdog = nil
+        reconnectAttempt = 0
+        firstFailureAt = nil
     }
 
     init(channel: Channel, currentProgram: EPGProgram?) {
@@ -83,7 +219,32 @@ final class PlayerSlot: Identifiable {
     }
 
     func unregisterFromRegistry() {
-        // no-op now; kept for call-site compatibility.
+        cancelReconnect()
+    }
+
+    func loadInitialLive() {
+        playbackMode = .live
+        cancelReconnect()
+        player.clearReconnectingErrorMessage()
+        player.loadURL(proxiedURL)
+        player.play()
+    }
+
+    func loadLive() {
+        playbackMode = .live
+        cancelReconnect()
+        player.clearReconnectingErrorMessage()
+        let url = freshProxiedURL()
+        player.loadURL(url, autoplay: true)
+        player.play()
+    }
+
+    func loadCatchup(_ url: URL) {
+        playbackMode = .catchup
+        cancelReconnect()
+        player.clearReconnectingErrorMessage()
+        player.loadURL(url, autoplay: true)
+        player.play()
     }
 
     /// Mint a fresh proxy token for the current channel. Proxy URLs are
@@ -125,8 +286,7 @@ final class PlayerSession {
         started = true
         guard !skipInitialLoad else { return }
         let first = slots[0]
-        first.player.loadURL(first.proxiedURL)
-        first.player.play()
+        first.loadInitialLive()
     }
 
     var focusedSlot: PlayerSlot {
@@ -149,8 +309,7 @@ final class PlayerSession {
         let slot = PlayerSlot(channel: channel, currentProgram: currentProgram)
         slots.append(slot)
 
-        slot.player.loadURL(slot.proxiedURL)
-        slot.player.play()
+        slot.loadInitialLive()
         // Apply mute AFTER loadURL+play: mpv initializes its audio output on
         // file load, and setting `mute` before that can race (a burst of
         // audio leaks out before the mute takes effect).
