@@ -27,6 +27,14 @@ private enum SparkleConfiguration {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    // 6 hours between scheduled background checks.
+    private static let updateCheckInterval: TimeInterval = 6 * 60 * 60
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Silent check on launch — only surfaces UI if an update is available.
+        updaterController?.updater.checkForUpdatesInBackground()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         RecordingManager.shared.stopAll()
     }
@@ -36,11 +44,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
 
-        return SPUStandardUpdaterController(
+        let controller = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
+        controller.updater.automaticallyChecksForUpdates = true
+        controller.updater.updateCheckInterval = Self.updateCheckInterval
+        return controller
     }()
 
     var canCheckForUpdates: Bool {
