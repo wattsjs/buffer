@@ -1,7 +1,7 @@
 import Foundation
 
-/// Stream characteristics captured from the broadcaster at the moment a
-/// recording attaches. Video fields are zero / empty when the stream has
+/// Stream characteristics captured when a recording starts. Video fields are
+/// zero / empty when the stream has
 /// no video track (unlikely for IPTV), and audioCodec is nil when there's
 /// no audio. `videoFPS` is zero when the container didn't carry frame
 /// timing.
@@ -17,8 +17,9 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
     enum Status: String, Codable, Sendable {
         case scheduled
         /// Scheduler fired (or live record button was pressed) and we're
-        /// opening the broadcaster — HLS playlist fetch + TLS handshake. No
-        /// bytes on disk yet. Flips to `.recording` once attach returns.
+        /// opening the upstream stream — HLS playlist fetch + TLS handshake.
+        /// No bytes on disk yet. Flips to `.recording` once the recorder
+        /// starts.
         case startingUp
         case recording
         case completed
@@ -27,10 +28,9 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
     }
 
     enum Source: String, Codable, Sendable {
-        /// Tee'd off a `MPVPlayer` the user is already watching — zero extra
-        /// server connections.
+        /// User-started recording while a channel is being watched.
         case live
-        /// Unattended headless `MPVPlayer` spun up by the scheduler.
+        /// Unattended scheduled recording.
         case scheduled
     }
 
@@ -57,8 +57,8 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
     /// the exact same event later (the API matches on date + id + type).
     var wakeAt: Date?
 
-    /// Captured from the broadcaster when the recording attaches. Nil
-    /// until attach succeeds; stays set once recorded so past-recordings
+    /// Captured when the recorder starts. Nil until start succeeds; stays set
+    /// once recorded so past-recordings
     /// retain resolution / codec / fps information.
     var streamInfo: StreamInfo?
     /// Live byte count updated ~1 Hz while the recording is active, frozen
@@ -68,7 +68,7 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
     /// File size measured from disk after finalize. Nil while recording.
     var fileSizeBytes: Int64?
 
-    /// Duration of the captured media. For live-muxed MPEG-TS, wall-clock
+    /// Duration of the captured media. For live MPEG-TS recordings, wall-clock
     /// equals media time, so we derive from actualStart/End.
     var mediaDuration: TimeInterval? {
         guard let start = actualStart else { return nil }

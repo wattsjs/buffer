@@ -1224,11 +1224,8 @@ struct PlayerView: View {
         guard let slot = session?.focusedSlot else { return }
         beginSeeking()
         catchupStartDate = nil
-        // Route the live reconnect back through StreamProxy so a concurrent
-        // recording keeps sharing one upstream connection. Using the raw
-        // channel.streamURL here (as we used to) made mpv open a second
-        // direct provider connection, which some Xtream accounts refuse
-        // with a 403 — the source of the "catchup return fails" error.
+        // Live playback now reconnects directly to the provider URL. Active
+        // recordings keep running on their own separate stream.
         slot.loadLive()
         liveLatched = true
     }

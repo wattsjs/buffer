@@ -77,13 +77,6 @@ struct BufferApp: App {
         // the UNUserNotificationCenter delegate and registers categories.
         // Actual permission + reconciliation happens in `.task` below.
         _ = NotificationManager.shared
-        // StreamProxy.start() blocks up to ~1s on a semaphore waiting for the
-        // NWListener to bind. Run it off the main thread so app launch isn't
-        // gated on it — proxiedURL() calls start() again and will wait only
-        // if the listener isn't ready yet (first PlayerSlot open).
-        DispatchQueue.global(qos: .userInitiated).async {
-            StreamProxy.shared.start()
-        }
         RecordingManager.shared.bootstrap()
     }
 

@@ -62,12 +62,6 @@ final class PlayerSlot: Identifiable {
     var channel: Channel
     var currentProgram: EPGProgram?
 
-    /// StreamProxy token + localhost URL the mpv player connects to. The
-    /// proxy fans bytes out from one upstream broadcaster, so viewer and
-    /// recorder share the same provider connection.
-    @ObservationIgnored private(set) var proxyToken: UUID
-    @ObservationIgnored private(set) var proxiedURL: URL
-
     // MPVPlayer is created lazily on first access. SwiftUI re-invokes view
     // inits on every parent re-render; a discarded slot must not spawn an
     // mpv instance just to be torn down a moment later.
@@ -103,10 +97,9 @@ final class PlayerSlot: Identifiable {
     // mpv's libavformat reconnect only covers single-socket network
     // stalls; once the demuxer gives up, the video chain stays dead.
     //
-    // We recover by re-issuing `loadURL` with a fresh proxy token (so the
-    // shared upstream broadcaster gets a clean tap) on exponential
-    // backoff. Nothing is surfaced to the UI unless reconnects keep
-    // failing for long enough that the stream is clearly offline.
+    // We recover by re-issuing `loadURL` on exponential backoff. Nothing is
+    // surfaced to the UI unless reconnects keep failing for long enough that
+    // the stream is clearly offline.
 
     @ObservationIgnored private var reconnectAttempt: Int = 0
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
@@ -216,9 +209,8 @@ final class PlayerSlot: Identifiable {
         guard playbackMode == .live else { return }
         reconnectTask = nil
         stopRecoveryTasks(resetFailureWindow: false)
-        let url = freshProxiedURL()
         noteExpectedStopIfReplacingCurrentItem()
-        player.loadURL(url, autoplay: true)
+        player.loadURL(channel.streamURL, autoplay: true)
         armRecoveryWatchdogs()
     }
 
@@ -327,9 +319,6 @@ final class PlayerSlot: Identifiable {
     init(channel: Channel, currentProgram: EPGProgram?) {
         self.channel = channel
         self.currentProgram = currentProgram
-        let ref = StreamProxy.shared.proxiedURL(for: channel.streamURL)
-        self.proxyToken = ref.token
-        self.proxiedURL = ref.url
     }
 
     func unregisterFromRegistry() {
@@ -341,7 +330,7 @@ final class PlayerSlot: Identifiable {
         stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
-        player.loadURL(proxiedURL, autoplay: true)
+        player.loadURL(channel.streamURL, autoplay: true)
         armRecoveryWatchdogs()
         // The user is actively watching this channel — bump probe priority so
         // the badge populates quickly even if scrolling hadn't requested it.
@@ -352,9 +341,8 @@ final class PlayerSlot: Identifiable {
         playbackMode = .live
         stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
-        let url = freshProxiedURL()
         noteExpectedStopIfReplacingCurrentItem()
-        player.loadURL(url, autoplay: true)
+        player.loadURL(channel.streamURL, autoplay: true)
         armRecoveryWatchdogs()
         StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
     }
@@ -365,18 +353,6 @@ final class PlayerSlot: Identifiable {
         player.clearReconnectingErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(url, autoplay: true)
-    }
-
-    /// Mint a fresh proxy token for the current channel. Proxy URLs are
-    /// single-use (the route handler clears the token once mpv connects), so
-    /// any reconnect after the first load — e.g. returning from catchup —
-    /// needs a new token so bytes still flow through the shared broadcaster
-    /// instead of mpv opening a second direct upstream connection.
-    func freshProxiedURL() -> URL {
-        let ref = StreamProxy.shared.proxiedURL(for: channel.streamURL)
-        self.proxyToken = ref.token
-        self.proxiedURL = ref.url
-        return ref.url
     }
 }
 

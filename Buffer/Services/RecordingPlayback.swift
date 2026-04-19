@@ -4,8 +4,7 @@ import Observation
 /// Playback controller for a recorded file. Owns the mpv instance for the
 /// window and encapsulates the decision of what URL to hand to mpv:
 /// - completed recordings → open the `.ts` file directly (fast local path).
-/// - in-progress recordings → open the tail-follow HTTP endpoint on
-///   `StreamProxy`, which keeps the stream alive as bytes accumulate.
+/// - in-progress recordings → also open the `.ts` file directly.
 ///
 /// Lives next to `PlayerSession` as the recording equivalent. The view
 /// layer treats either as interchangeable source of an `MPVPlayer` +
@@ -13,17 +12,33 @@ import Observation
 @MainActor
 @Observable
 final class RecordingPlayback {
+    private enum ReloadTuning {
+        static let retryDelayNanoseconds: UInt64 = 750_000_000
+        static let resumeBackoffSeconds: Double = 1
+    }
+
     private let recordingID: UUID
     private let original: Recording
     let player: MPVPlayer
 
-    @ObservationIgnored private var tailToken: UUID?
     @ObservationIgnored private var started = false
+    @ObservationIgnored private var reloadTask: Task<Void, Never>?
 
     init(recording: Recording) {
         self.recordingID = recording.id
         self.original = recording
         self.player = MPVPlayer()
+        self.player.onPlaybackEnded = { [weak self] reason in
+            self?.handlePlaybackEnded(reason)
+        }
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            reloadTask?.cancel()
+            player.onPlaybackEnded = nil
+            player.stop()
+        }
     }
 
     /// Live snapshot from the shared `RecordingManager` store, so observers
@@ -63,41 +78,50 @@ final class RecordingPlayback {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
 
-        let id = recordingID
-        let inProgress = isInProgress
-        let playURL: URL
-        if inProgress {
-            // Hop the tail registration onto a detached task. It's cheap,
-            // but `StreamProxy.registerRecordingTail` synchronously calls
-            // `start()` on the listener and takes the proxy's state lock.
-            // Under load (e.g. a live broadcaster on the same channel is
-            // also holding that lock mid-attach), we don't want the main
-            // thread waiting on any of that. Capture the two singletons
-            // on main before jumping threads — they're both `@MainActor`
-            // static properties, so the detached closure can't access
-            // them directly without actor-isolation warnings.
-            let proxy = StreamProxy.shared
-            let manager = RecordingManager.shared
-            let reg = await Task.detached(priority: .userInitiated) {
-                proxy.registerRecordingTail(
-                    fileURL: fileURL,
-                    isActive: { manager.isStillRecording(id: id) }
-                )
-            }.value
-            tailToken = reg.token
-            playURL = reg.url
-        } else {
-            playURL = fileURL
-        }
-
-        player.loadURL(playURL, autoplay: true, fastProbe: true)
+        player.loadURL(fileURL, autoplay: true, fastProbe: true)
     }
 
     func stop() {
-        player.pause()
-        if let token = tailToken {
-            StreamProxy.shared.unregisterRecordingTail(token: token)
-            tailToken = nil
+        reloadTask?.cancel()
+        reloadTask = nil
+        player.onPlaybackEnded = nil
+        player.stop()
+    }
+
+    private func handlePlaybackEnded(_ reason: MPVEndReason) {
+        switch reason {
+        case .eof:
+            guard isInProgress else { return }
+            scheduleReload()
+        case .error(_, let message):
+            if isInProgress {
+                scheduleReload()
+            } else {
+                player.setReconnectingErrorMessage("Playback failed: \(message)")
+            }
+        case .stopped:
+            break
+        }
+    }
+
+    private func scheduleReload() {
+        guard let fileURL = recording.fileURL, RecordingManager.shared.isStillRecording(id: recordingID) else { return }
+        reloadTask?.cancel()
+
+        let resumeTime = max(player.timePos - ReloadTuning.resumeBackoffSeconds, 0)
+        player.setReconnectingErrorMessage("Recording still growing — retrying…")
+        reloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: ReloadTuning.retryDelayNanoseconds)
+            guard !Task.isCancelled else { return }
+            guard RecordingManager.shared.isStillRecording(id: self.recordingID) else { return }
+
+            self.player.loadURL(fileURL, autoplay: true, fastProbe: true)
+            if resumeTime > 0 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled else { return }
+                self.player.seek(to: resumeTime)
+            }
         }
     }
 }
