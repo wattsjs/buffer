@@ -201,7 +201,7 @@ final class MPVPlayer {
         currentURL = url
 
         // Fast-probe path is used for known local MPEG-TS sources (recording
-        // files + the tail-follow proxy). With the default 1 MiB probesize +
+        // files). With the default 1 MiB probesize +
         // 2 s analyzeduration, mpv's ffmpeg demuxer can spend 5–10 s scanning
         // the head of a multi-gigabyte .ts file before reporting stream info.
         // For MPEG-TS the SPS usually lands in the first few KB, so shrinking
@@ -253,6 +253,14 @@ final class MPVPlayer {
     func pause() {
         setFlag("pause", true)
         isPlaying = false
+    }
+
+    func stop() {
+        guard let handle else { return }
+        command(handle, ["stop"])
+        isPlaying = false
+        isBuffering = false
+        isLoading = false
     }
 
     func togglePause() {
@@ -542,9 +550,12 @@ final class MPVPlayer {
         // teardown. Everything else on `self` has already been released
         // above, so it's safe to let the handle die outside this actor.
         if let capturedHandle = handle {
+            let capturedHandleBits = UInt(bitPattern: capturedHandle)
             handle = nil
             DispatchQueue.global(qos: .userInitiated).async {
-                mpv_terminate_destroy(capturedHandle)
+                if let capturedHandle = OpaquePointer(bitPattern: capturedHandleBits) {
+                    mpv_terminate_destroy(capturedHandle)
+                }
             }
         }
     }

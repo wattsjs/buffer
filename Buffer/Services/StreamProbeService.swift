@@ -35,7 +35,7 @@ final class StreamProbeService {
 
     /// Serialize probes. IPTV providers usually count each open() against a
     /// session/connection limit, and an in-flight probe on the same channel
-    /// the user is about to play can race the StreamProxy broadcaster's open
+    /// the user is about to play can race the player's own open
     /// and trip "Invalid data" / 503s on the upstream. One at a time keeps us
     /// out of trouble at the cost of slower badge fill on big channel lists.
     private let maxConcurrent = 1

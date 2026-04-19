@@ -217,7 +217,7 @@ private struct RecordingRow: View {
         return String(s.map { map[$0] ?? $0 })
     }
 
-    /// Small orange pill shown while the broadcaster is opening (HLS + TLS
+    /// Small orange pill shown while the recording stream is opening (HLS + TLS
     /// handshake) but bytes haven't started flowing yet. Spinner signals
     /// "work in progress" so the user doesn't think the row is stalled.
     @ViewBuilder

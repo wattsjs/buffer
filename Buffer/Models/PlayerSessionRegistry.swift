@@ -24,7 +24,7 @@ final class PlayerSessionRegistry {
     }
 }
 
-// StreamProxyRegistry was removed — the broadcaster architecture keys off
+// The old proxy registry was removed — player sessions now key off
 // the upstream URL directly, so no external lookup table is needed.
 
 /// Context-menu item for the main window's channel rows. Shows only when

@@ -2,13 +2,20 @@ import AppKit
 import Foundation
 import IOKit.pwr_mgt
 
-/// Owns Buffer's recording subsystem: realtime tee'd recordings on an active
-/// `MPVPlayer`, scheduled unattended recordings via `HeadlessRecorder`, and
-/// persistence of both. Mirrors the pattern used by `NotificationManager`.
+/// Owns Buffer's recording subsystem: direct live recordings, scheduled
+/// unattended recordings, and persistence of both. Mirrors the pattern used
+/// by `NotificationManager`.
 @MainActor
 @Observable
 final class RecordingManager {
     static let shared = RecordingManager()
+
+    private struct DirectRecorderStartResult: Sendable {
+        let handleBits: UInt
+        let streamInfo: StreamInfo
+
+        var handle: OpaquePointer? { OpaquePointer(bitPattern: handleBits) }
+    }
 
     /// All known recordings — scheduled, in-flight, completed. Most-recent
     /// first when displayed.
@@ -64,6 +71,7 @@ final class RecordingManager {
     /// before mpv tries to open the stream. 120 s is the value `pmset`
     /// documentation uses as the minimum reliable lead time.
     private static let wakeLeadSeconds: TimeInterval = 120
+    private static let unexpectedStopGraceSeconds: TimeInterval = 30
 
     /// Whether to ask macOS to wake the Mac for scheduled recordings.
     /// Defaults to true — matches user expectation that "schedule a recording"
@@ -75,16 +83,12 @@ final class RecordingManager {
         }
     }
 
-    /// Active realtime recordings, keyed by recording ID. Value is the
-    /// StreamProxy token that the viewer's mpv is already using — we tee
-    /// recording bytes off the proxy so the provider sees one connection.
-    @ObservationIgnored private var liveSessions: [UUID: UUID] = [:]
+    /// Active direct-recording handles, keyed by recording ID.
+    @ObservationIgnored private var liveSessions: [UUID: OpaquePointer] = [:]
     @ObservationIgnored private var liveStopTimers: [UUID: DispatchSourceTimer] = [:]
 
-    // Scheduled recordings now share the same StreamProxy attachment path as
-    // live-tee recordings — the proxy opens (or reuses) a broadcaster for
-    // the channel and the recording is a byte-sink on it. No separate
-    // session type is needed.
+    // Scheduled recordings use the same direct-recorder path as manual live
+    // recordings. No separate session type is needed.
     @ObservationIgnored private var scheduledStartTimers: [UUID: DispatchSourceTimer] = [:]
     @ObservationIgnored private var scheduledStopTimers: [UUID: DispatchSourceTimer] = [:]
 
@@ -196,17 +200,13 @@ final class RecordingManager {
         if mutated { saveRecordings() }
     }
 
-    // MARK: - Live tee recordings
+    // MARK: - Live recordings
 
-    /// Begin recording the stream the viewer is currently watching. Bytes are
-    /// tee'd off the shared `BufferBroadcaster` mpv is already connected to —
-    /// provider sees exactly one connection regardless of viewer + recorder
-    /// combinations.
-    /// Async because `StreamProxy.attachRecording` opens (or reuses) a
-    /// broadcaster, which means the HLS + TLS handshake on a first-time
-    /// channel — that's the 4 s beach ball the trace caught. We hop the
-    /// attach onto a detached task so main stays responsive while the
-    /// provider negotiates.
+    /// Begin recording the stream the viewer is currently watching. Recording
+    /// uses a separate upstream connection from playback.
+    /// Async because opening the upstream stream can take several seconds on
+    /// a cold channel. We hop the recorder creation onto a detached task so
+    /// main stays responsive while the provider negotiates.
     @discardableResult
     func startLiveRecording(
         playlistID: UUID,
@@ -224,7 +224,7 @@ final class RecordingManager {
         let recordingID = UUID()
         let streamURL = channel.streamURL
 
-        // Insert the row as `.startingUp` BEFORE kicking off the broadcaster
+        // Insert the row as `.startingUp` BEFORE kicking off the recorder
         // open — that handshake can take several seconds on a cold channel
         // and the user needs immediate visual feedback that the recording
         // exists.
@@ -250,37 +250,36 @@ final class RecordingManager {
         recordings.insert(placeholder, at: 0)
         saveRecordings()
 
-        let streamInfo = await Task.detached(priority: .userInitiated) {
-            StreamProxy.shared.attachRecording(
-                forChannel: streamURL,
-                to: fileURL,
-                recordingID: recordingID,
-                userAgent: "Buffer/1.0",
-                referer: nil
-            )
-        }.value
+        let startResult = await Self.startDirectRecorderAsync(
+            streamURL: streamURL,
+            fileURL: fileURL,
+            userAgent: "Buffer/1.0",
+            referer: nil
+        )
 
         // Row may have been cancelled while we were awaiting.
         guard let index = recordings.firstIndex(where: { $0.id == recordingID }),
               recordings[index].status == .startingUp else {
-            if streamInfo != nil {
-                StreamProxy.shared.detachRecording(recordingID: recordingID)
+            if let handle = startResult?.handle {
+                buffer_direct_recorder_free(handle)
             }
             return nil
         }
 
-        guard let streamInfo else {
+        guard let startResult else {
             recordings[index].status = .failed
-            recordings[index].errorMessage = "Could not start broadcaster"
+            recordings[index].errorMessage = "Could not start recording"
             saveRecordings()
             return nil
         }
 
         recordings[index].status = .recording
         recordings[index].actualStart = Date()
-        recordings[index].streamInfo = streamInfo
+        recordings[index].streamInfo = startResult.streamInfo
         saveRecordings()
-        liveSessions[recordingID] = UUID()   // placeholder; presence signals "live"
+        if let handle = startResult.handle {
+            liveSessions[recordingID] = handle
+        }
         markActive(recordingID, true)
         acquirePowerAssertionIfNeeded()
         startProgressTickerIfNeeded()
@@ -296,8 +295,8 @@ final class RecordingManager {
     }
 
     func stopLiveRecording(id: UUID) {
-        guard liveSessions[id] != nil else { return }
-        StreamProxy.shared.detachRecording(recordingID: id)
+        guard let handle = liveSessions[id] else { return }
+        buffer_direct_recorder_free(handle)
         liveSessions[id] = nil
         liveStopTimers[id]?.cancel()
         liveStopTimers[id] = nil
@@ -317,12 +316,7 @@ final class RecordingManager {
 
     /// Thread-safe set of currently-recording IDs. Mirrors
     /// `recordings.filter { $0.status == .recording }.map(\.id)` and is
-    /// updated from the MainActor whenever a recording starts/stops. Read
-    /// from the non-main StreamProxy tail handler to decide whether to
-    /// keep polling for new bytes at EOF.
-    // NSLock-guarded so the StreamProxy tail handler (non-main queue) can
-    // read status without crossing actor boundaries. NSLock is Sendable in
-    // modern SDKs, so no explicit actor escape annotation is required.
+    /// updated from the MainActor whenever a recording starts/stops.
     @ObservationIgnored private let activeIDsLock = NSLock()
     @ObservationIgnored nonisolated(unsafe) private var _activeIDs: Set<UUID> = []
 
@@ -407,10 +401,10 @@ final class RecordingManager {
             recordings[index].status = .cancelled
             saveRecordings()
         case .startingUp:
-            // Broadcaster attach is in flight. Flip status now — the
+            // Recorder creation is in flight. Flip status now — the
             // pending beginScheduledRecording / startLiveRecording tasks
-            // re-check `.startingUp` after the await and will detach the
-            // session if needed.
+            // re-check `.startingUp` after the await and will tear down the
+            // recorder if needed.
             scheduledStartTimers[id]?.cancel()
             scheduledStartTimers[id] = nil
             cancelWake(for: recordings[index])
@@ -418,11 +412,13 @@ final class RecordingManager {
             recordings[index].status = .cancelled
             saveRecordings()
         case .recording:
-            // Both .live and .scheduled flows use the same sink-detach path.
-            // Stopping early is not a failure — the partial file on disk is
-            // perfectly playable, so we mark it completed regardless of
-            // source. Deletion is a separate explicit action.
-            StreamProxy.shared.detachRecording(recordingID: id)
+            // Both .live and .scheduled flows use the same direct-recorder
+            // path. Stopping early is not a failure — the partial file on
+            // disk is perfectly playable, so we mark it completed regardless
+            // of source. Deletion is a separate explicit action.
+            if let handle = liveSessions[id] {
+                buffer_direct_recorder_free(handle)
+            }
             liveSessions[id] = nil
             liveStopTimers[id]?.cancel()
             liveStopTimers[id] = nil
@@ -445,8 +441,8 @@ final class RecordingManager {
 
     /// Stop every active recording (called from app-quit hook).
     func stopAll() {
-        for id in liveSessions.keys {
-            StreamProxy.shared.detachRecording(recordingID: id)
+        for (id, handle) in liveSessions {
+            buffer_direct_recorder_free(handle)
             markFinished(id: id, error: nil)
         }
         liveSessions.removeAll()
@@ -487,44 +483,43 @@ final class RecordingManager {
         }
 
         // Flip to `.startingUp` so the list shows "Starting…" while the
-        // broadcaster opens (HLS + TLS handshake can run several seconds).
+        // recorder opens (HLS + TLS handshake can run several seconds).
         recordings[index].status = .startingUp
         saveRecordings()
 
-        // Bounce the broadcaster open onto a detached task so main stays
+        // Bounce recorder creation onto a detached task so main stays
         // responsive during the scheduled start.
         let streamURL = recording.streamURL
-        let streamInfo = await Task.detached(priority: .userInitiated) {
-            StreamProxy.shared.attachRecording(
-                forChannel: streamURL,
-                to: fileURL,
-                recordingID: id,
-                userAgent: "Buffer/1.0",
-                referer: nil
-            )
-        }.value
+        let startResult = await Self.startDirectRecorderAsync(
+            streamURL: streamURL,
+            fileURL: fileURL,
+            userAgent: "Buffer/1.0",
+            referer: nil
+        )
 
         // The recording could have been cancelled while we were awaiting.
         guard let freshIndex = recordings.firstIndex(where: { $0.id == id }),
               recordings[freshIndex].status == .startingUp else {
-            if streamInfo != nil {
-                StreamProxy.shared.detachRecording(recordingID: id)
+            if let handle = startResult?.handle {
+                buffer_direct_recorder_free(handle)
             }
             return
         }
 
-        guard let streamInfo else {
+        guard let startResult else {
             recordings[freshIndex].status = .failed
-            recordings[freshIndex].errorMessage = "Could not start broadcaster"
+            recordings[freshIndex].errorMessage = "Could not start recording"
             saveRecordings()
             return
         }
         recordings[freshIndex].status = .recording
         recordings[freshIndex].actualStart = Date()
         recordings[freshIndex].wakeAt = nil
-        recordings[freshIndex].streamInfo = streamInfo
+        recordings[freshIndex].streamInfo = startResult.streamInfo
         saveRecordings()
-        liveSessions[id] = UUID()  // placeholder presence
+        if let handle = startResult.handle {
+            liveSessions[id] = handle
+        }
         markActive(id, true)
         acquirePowerAssertionIfNeeded()
         startProgressTickerIfNeeded()
@@ -536,7 +531,9 @@ final class RecordingManager {
     }
 
     private func finishScheduledRecording(id: UUID) {
-        StreamProxy.shared.detachRecording(recordingID: id)
+        if let handle = liveSessions[id] {
+            buffer_direct_recorder_free(handle)
+        }
         liveSessions[id] = nil
         scheduledStopTimers[id] = nil
         markFinished(id: id, error: nil)
@@ -593,13 +590,41 @@ final class RecordingManager {
     private func tickProgress() {
         for index in recordings.indices where recordings[index].status == .recording {
             let id = recordings[index].id
-            let bytes = StreamProxy.shared.recordingBytesWritten(recordingID: id)
+            guard let handle = liveSessions[id] else { continue }
+
+            let bytes = buffer_direct_recorder_bytes_written(handle)
             if bytes != recordings[index].bytesWritten {
                 recordings[index].bytesWritten = bytes
             }
+
+            guard buffer_direct_recorder_is_running(handle) == 0 else { continue }
+
+            var error = [CChar](repeating: 0, count: 256)
+            let hasError = buffer_direct_recorder_copy_error(handle, &error, error.count) != 0
+            buffer_direct_recorder_free(handle)
+            liveSessions[id] = nil
+            liveStopTimers[id]?.cancel()
+            liveStopTimers[id] = nil
+            scheduledStopTimers[id]?.cancel()
+            scheduledStopTimers[id] = nil
+
+            if hasError, let message = String(validatingCString: error), !message.isEmpty {
+                markFinished(id: id, error: "Recording stopped: \(message)")
+            } else if let message = unexpectedStopMessage(for: recordings[index]) {
+                markFinished(id: id, error: message)
+            } else {
+                markFinished(id: id, error: nil)
+            }
+            releasePowerAssertionIfIdle()
         }
         // Deliberately no saveRecordings() — bytesWritten is transient
         // during live recording and gets finalized in markFinished().
+    }
+
+    private func unexpectedStopMessage(for recording: Recording) -> String? {
+        let expectedStop = recording.scheduledEnd.addingTimeInterval(Double(postRollSeconds))
+        guard Date() + Self.unexpectedStopGraceSeconds < expectedStop else { return nil }
+        return "Recording stopped unexpectedly"
     }
 
     // MARK: - Timer plumbing
@@ -758,14 +783,111 @@ final class RecordingManager {
         let stamp = formatter.string(from: start)
         let safeChannel = Self.sanitize(channelName)
         let safeTitle = Self.sanitize(title)
-        // `.ts` because StreamProxy writes raw MPEG-TS segment bytes from
-        // the provider verbatim — no muxer, just byte-level concatenation.
+        // `.ts` because the direct recorder remuxes the source into MPEG-TS.
         // MPEG-TS is self-describing so partial files play while recording
         // is in progress.
         let filename = "\(stamp) \(safeTitle).ts"
         return outputDirectory
             .appendingPathComponent(safeChannel, isDirectory: true)
             .appendingPathComponent(filename)
+    }
+
+    nonisolated private static func startDirectRecorderAsync(
+        streamURL: URL,
+        fileURL: URL,
+        userAgent: String?,
+        referer: String?
+    ) async -> DirectRecorderStartResult? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: startDirectRecorder(
+                    streamURL: streamURL,
+                    fileURL: fileURL,
+                    userAgent: userAgent,
+                    referer: referer
+                ))
+            }
+        }
+    }
+
+    nonisolated private static func startDirectRecorder(
+        streamURL: URL,
+        fileURL: URL,
+        userAgent: String?,
+        referer: String?
+    ) -> DirectRecorderStartResult? {
+        try? FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !FileManager.default.fileExists(atPath: fileURL.path) {
+            FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+        }
+
+        var error = [CChar](repeating: 0, count: 256)
+        let handle: OpaquePointer? = streamURL.absoluteString.withCString { inputURL in
+            fileURL.path.withCString { outputPath in
+                func create(_ userAgentPtr: UnsafePointer<CChar>?, _ refererPtr: UnsafePointer<CChar>?) -> OpaquePointer? {
+                    buffer_direct_recorder_create(
+                        inputURL,
+                        outputPath,
+                        userAgentPtr,
+                        refererPtr,
+                        &error,
+                        error.count
+                    )
+                }
+
+                if let userAgent {
+                    return userAgent.withCString { userAgentPtr in
+                        if let referer {
+                            return referer.withCString { refererPtr in
+                                create(userAgentPtr, refererPtr)
+                            }
+                        }
+                        return create(userAgentPtr, nil)
+                    }
+                }
+                if let referer {
+                    return referer.withCString { refererPtr in
+                        create(nil, refererPtr)
+                    }
+                }
+                return create(nil, nil)
+            }
+        }
+        guard let handle else {
+            if let message = String(validatingCString: error), !message.isEmpty {
+                print("[RecordingManager] recorder start failed: \(message)")
+            }
+            return nil
+        }
+
+        var rawInfo = BufferDirectRecorderStreamInfo()
+        buffer_direct_recorder_get_stream_info(handle, &rawInfo)
+        let videoCodecTuple = rawInfo.video_codec
+        let audioCodecTuple = rawInfo.audio_codec
+        let videoCodec = withUnsafePointer(to: videoCodecTuple) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: 32) {
+                String(cString: $0)
+            }
+        }
+        let audioCodec = withUnsafePointer(to: audioCodecTuple) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: 32) {
+                $0.pointee == 0 ? nil : String(cString: $0)
+            }
+        }
+        let streamInfo = StreamInfo(
+            videoWidth: Int(rawInfo.video_width),
+            videoHeight: Int(rawInfo.video_height),
+            videoCodec: videoCodec,
+            videoFPS: rawInfo.video_fps,
+            audioCodec: audioCodec
+        )
+        return DirectRecorderStartResult(
+            handleBits: UInt(bitPattern: handle),
+            streamInfo: streamInfo
+        )
     }
 
     private static func sanitize(_ string: String) -> String {
