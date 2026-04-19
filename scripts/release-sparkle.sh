@@ -109,11 +109,19 @@ ensure_api_key_file() {
   fi
 }
 
-setup_temp_keychain_from_env() {
-  [[ -n "$APPLE_CERTIFICATE" && -n "$APPLE_CERTIFICATE_PASSWORD" ]] || return 1
+activate_signing_keychain() {
+  local keychain_path=$1
 
   ORIGINAL_DEFAULT_KEYCHAIN=$(security default-keychain | tr -d '"')
   ORIGINAL_KEYCHAIN_LIST=$(security list-keychains -d user | tr -d '"')
+
+  security unlock-keychain "$keychain_path" >/dev/null 2>&1 || true
+  security list-keychains -d user -s "$keychain_path" "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain >/dev/null
+  security default-keychain -s "$keychain_path" >/dev/null
+}
+
+setup_temp_keychain_from_env() {
+  [[ -n "$APPLE_CERTIFICATE" && -n "$APPLE_CERTIFICATE_PASSWORD" ]] || return 1
 
   TEMP_KEYCHAIN_PATH=$(mktemp -u "$RUNNER_TEMP/buffer-signing.XXXXXX.keychain-db" 2>/dev/null || mktemp -u /tmp/buffer-signing.XXXXXX.keychain-db)
   TEMP_KEYCHAIN_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
@@ -135,8 +143,7 @@ setup_temp_keychain_from_env() {
     -s -k "$TEMP_KEYCHAIN_PASSWORD" \
     "$TEMP_KEYCHAIN_PATH" >/dev/null
 
-  security list-keychains -d user -s "$TEMP_KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain >/dev/null
-  security default-keychain -s "$TEMP_KEYCHAIN_PATH" >/dev/null
+  activate_signing_keychain "$TEMP_KEYCHAIN_PATH"
   rm -f "$cert_file"
   return 0
 }
@@ -179,6 +186,7 @@ setup_signing() {
   if [[ -f "$SIGNING_KEYCHAIN_PATH" ]]; then
     DEVELOPER_ID_APPLICATION=$(detect_signing_identity "$SIGNING_KEYCHAIN_PATH")
     if [[ -n "$DEVELOPER_ID_APPLICATION" ]]; then
+      activate_signing_keychain "$SIGNING_KEYCHAIN_PATH"
       KEYCHAIN_BUILD_FLAGS=(OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN_PATH")
       return 0
     fi
