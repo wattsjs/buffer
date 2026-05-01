@@ -68,6 +68,13 @@ struct PlayerSlotCell: View {
                 .transition(.opacity)
             }
         }
+        .overlay(alignment: .bottomLeading) {
+            if showCellChrome && (isHovering || isFocused) {
+                slotControls
+                    .padding(8)
+                    .transition(.opacity)
+            }
+        }
         .overlay {
             if showCellChrome {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -96,8 +103,8 @@ struct PlayerSlotCell: View {
                 .font(.caption2.weight(.semibold))
                 .lineLimit(1)
                 .foregroundStyle(.white)
-            if isFocused {
-                Image(systemName: "speaker.wave.2.fill")
+            if !slot.player.isMuted && slot.player.volume > 0 {
+                Image(systemName: volumeIconName)
                     .font(.system(size: 9))
                     .foregroundStyle(.white.opacity(0.9))
             }
@@ -105,5 +112,68 @@ struct PlayerSlotCell: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(.black.opacity(0.55), in: Capsule())
+    }
+
+    private var slotControls: some View {
+        HStack(spacing: 8) {
+            Button {
+                slot.player.togglePause()
+            } label: {
+                Image(systemName: slot.player.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .disabled(slot.player.isLoading)
+            .help(slot.player.isPlaying ? "Pause" : "Play")
+
+            Button {
+                slot.player.toggleMute()
+            } label: {
+                Image(systemName: volumeIconName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .help(slot.player.isMuted ? "Unmute" : "Mute")
+
+            Slider(
+                value: Binding(
+                    get: { slot.player.volume },
+                    set: { value in
+                        slot.player.setVolume(value)
+                        if slot.player.isMuted && value > 0 {
+                            slot.player.setMute(false)
+                        }
+                    }
+                ),
+                in: 0...100
+            )
+            .controlSize(.mini)
+            .tint(.white)
+            .frame(width: 88)
+
+            Text("\(Int(slot.player.volume))")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.75))
+                .frame(width: 24, alignment: .trailing)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.black.opacity(0.62), in: Capsule())
+    }
+
+    private var volumeIconName: String {
+        if slot.player.isMuted || slot.player.volume < 1 {
+            return "speaker.slash.fill"
+        }
+        if slot.player.volume < 33 {
+            return "speaker.wave.1.fill"
+        }
+        if slot.player.volume < 66 {
+            return "speaker.wave.2.fill"
+        }
+        return "speaker.wave.3.fill"
     }
 }

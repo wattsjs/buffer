@@ -5,6 +5,7 @@
 //  Created by Jamie Watts on 14/4/2026.
 //
 
+import OSLog
 import SwiftUI
 
 struct ContentView: View {
@@ -29,8 +30,10 @@ struct ContentView: View {
     private func openChannel(_ channel: Channel) {
         viewModel.addRecent(channel)
         if selectedPlayer != .none {
+            AppLog.playback.info("Opening channel externally name=\(channel.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
             ExternalPlayer.launch(streamURL: channel.streamURL, using: selectedPlayer)
         } else {
+            AppLog.playback.info("Opening channel in Buffer name=\(channel.name, privacy: .public)")
             openWindow(value: channel)
         }
     }
@@ -261,11 +264,13 @@ struct ContentView: View {
         }
         .onChange(of: hideSport) { _, hidden in
             if hidden {
+                AppLog.sports.info("Sports surface hidden")
                 sportsViewModel.stopAutoRefresh()
                 if viewModel.selection == .sports {
                     viewModel.selection = .home
                 }
             } else {
+                AppLog.sports.info("Sports surface enabled")
                 sportsViewModel.channels = viewModel.channels
                 sportsViewModel.programs = viewModel.programs
                 sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
@@ -308,7 +313,16 @@ struct ContentView: View {
             }
         }
         .task {
+            let hydrationSignpostID = AppLog.appSignposter.makeSignpostID()
+            let hydrationState = AppLog.appSignposter.beginInterval(
+                "LaunchHydration",
+                id: hydrationSignpostID
+            )
+            let launchHydrateStarted = ContinuousClock.now
             await viewModel.hydrate()
+            AppLog.appSignposter.endInterval("LaunchHydration", hydrationState)
+            let launchHydrateElapsed = launchHydrateStarted.duration(to: .now).components.seconds
+            AppLog.sync.info("Launch hydration finished seconds=\(launchHydrateElapsed, privacy: .public) channels=\(viewModel.channels.count, privacy: .public)")
             // If the cache is empty (first launch, or cache invalidated by a
             // schema bump) kick off an immediate sync so the user doesn't have
             // to hit refresh manually.

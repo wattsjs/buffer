@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import OSLog
 import Sparkle
 import SwiftUI
 
@@ -41,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private(set) lazy var updaterController: SPUStandardUpdaterController? = {
         guard SparkleConfiguration.isConfigured else {
+            AppLog.app.info("Sparkle updater is not configured")
             return nil
         }
 
@@ -59,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkForUpdates() {
+        AppLog.app.info("Manual update check requested")
         updaterController?.checkForUpdates(nil)
     }
 }
@@ -85,7 +88,9 @@ struct BufferApp: App {
             ContentView(viewModel: viewModel)
                 .frame(minWidth: 800, minHeight: 500)
                 .task {
+                    AppLog.app.info("Notification bootstrap started")
                     await notificationManager.bootstrap()
+                    AppLog.app.info("Notification bootstrap finished")
                 }
         }
         .commands {

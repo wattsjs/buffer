@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import OSLog
 
 enum MultiViewLayout: String, CaseIterable, Identifiable {
     case single
@@ -72,6 +73,9 @@ final class PlayerSlot: Identifiable {
         new.onPlaybackEnded = { [weak self] reason in
             self?.handlePlaybackEnded(reason)
         }
+        new.onFileLoaded = { [weak self] in
+            self?.handleFileLoaded()
+        }
         new.onMediaInfoChanged = { [weak self] info in
             guard let self else { return }
             StreamProbeService.shared.recordPlaybackInfo(
@@ -110,6 +114,7 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var lastObservedTimePos: Double = 0
     @ObservationIgnored private var lastPlaybackProgressAt: Date?
     @ObservationIgnored private var expectedStoppedEndFiles: Int = 0
+    @ObservationIgnored private var lastReconnectAt: Date?
 
     /// After this long of continuous reconnect failures without a single
     /// successful `FILE_LOADED`, surface an error to the user. The reconnect
@@ -127,6 +132,9 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private let stalledWhileBufferingSeconds: TimeInterval = 12
     @ObservationIgnored private let stalledWhilePlayingSeconds: TimeInterval = 6
     @ObservationIgnored private let playbackProgressEpsilon: Double = 0.25
+    @ObservationIgnored private let minimumImmediateReconnectSpacing: TimeInterval = 2
+    @ObservationIgnored private let slowRetryFailureWindow: TimeInterval = 60
+    @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
 
     fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
         switch reason {
@@ -153,7 +161,13 @@ final class PlayerSlot: Identifiable {
         scheduleReconnect(reason: reason)
     }
 
+    private func handleFileLoaded() {
+        lastObservedTimePos = player.timePos
+        lastPlaybackProgressAt = Date()
+    }
+
     private func scheduleReconnect(reason: MPVEndReason, immediate: Bool = false) {
+        AppLog.playback.warning("Scheduling reconnect channel=\(self.channel.name, privacy: .public) reason=\(String(describing: reason), privacy: .public) immediate=\(immediate, privacy: .public) attempt=\(self.reconnectAttempt, privacy: .public)")
         // Mark the start of a failure streak so we know when to give up
         // visibly. `firstFailureAt` is cleared on every successful playback
         // beyond `healthyPlaybackSeconds`.
@@ -167,24 +181,28 @@ final class PlayerSlot: Identifiable {
         // 0.25s, 0.5s, 1s, 2s, 4s, then capped at 5s. The first retry is
         // snappy so a single bad segment barely blips; later retries
         // breathe so we don't hammer a dead upstream.
-        let delay: Double
-        if immediate {
-            delay = 0
-        } else {
-            let baseDelay = 0.25 * pow(2.0, Double(min(attempt, 5)))
-            delay = min(baseDelay, 5.0)
-        }
-
         let failureAge = firstFailureAt.map { Date().timeIntervalSince($0) } ?? 0
         let shouldSurfaceError = failureAge >= fatalReconnectWindow
+        let shouldSlowRetry = failureAge >= slowRetryFailureWindow
+
+        let delay: Double
+        if immediate {
+            let sinceLastReconnect = lastReconnectAt.map { Date().timeIntervalSince($0) } ?? .infinity
+            let spacingDelay = max(0, minimumImmediateReconnectSpacing - sinceLastReconnect)
+            let repeatedFailureDelay = min(Double(attempt) * 0.75, 3.0)
+            delay = shouldSlowRetry ? slowRetryDelay : max(spacingDelay, repeatedFailureDelay)
+        } else {
+            let baseDelay = 0.25 * pow(2.0, Double(min(attempt, 5)))
+            delay = shouldSlowRetry ? slowRetryDelay : min(baseDelay, 5.0)
+        }
 
         let player = self.player
         if shouldSurfaceError {
             switch reason {
             case .eof:
-                player.setReconnectingErrorMessage("Stream offline — still trying.")
+                player.setReconnectingErrorMessage("Stream offline — retrying in background.")
             case .error(_, let message):
-                player.setReconnectingErrorMessage("Stream offline — still trying. (\(message))")
+                player.setReconnectingErrorMessage("Stream offline — retrying in background. (\(message))")
             case .stopped:
                 break
             }
@@ -207,6 +225,8 @@ final class PlayerSlot: Identifiable {
 
     private func performReconnect() {
         guard playbackMode == .live else { return }
+        AppLog.playback.info("Performing reconnect channel=\(self.channel.name, privacy: .public)")
+        lastReconnectAt = Date()
         reconnectTask = nil
         stopRecoveryTasks(resetFailureWindow: false)
         noteExpectedStopIfReplacingCurrentItem()
@@ -303,6 +323,7 @@ final class PlayerSlot: Identifiable {
         if resetFailureWindow {
             reconnectAttempt = 0
             firstFailureAt = nil
+            lastReconnectAt = nil
         }
     }
 
@@ -406,9 +427,9 @@ final class PlayerSession {
         slots.append(slot)
 
         slot.loadInitialLive()
-        // Apply mute AFTER loadURL+play: mpv initializes its audio output on
-        // file load, and setting `mute` before that can race (a burst of
-        // audio leaks out before the mute takes effect).
+        // New multi-view panes start muted to avoid surprise audio overlap.
+        // After that, per-pane controls own each slot's mute/volume state.
+        slot.player.setMute(true)
         applySlotPolicies()
 
         promoteLayoutIfNeeded()
@@ -447,7 +468,6 @@ final class PlayerSession {
         let multi = slots.count > 1
         for slot in slots {
             let focused = slot.id == focusedSlotID
-            slot.player.setMute(!focused)
             slot.player.configureResources(multiView: multi, focused: focused)
         }
     }

@@ -39,6 +39,12 @@ struct EPGGridView: View {
         }
     }
 
+    private static func timelineTime(_ date: Date) -> String {
+        date.formatted(date: .omitted, time: .shortened)
+            .replacingOccurrences(of: " ", with: "")
+            .lowercased()
+    }
+
     var body: some View {
         if channels.isEmpty && hasLoadedOnce {
             ContentUnavailableView(
@@ -123,10 +129,6 @@ struct EPGGridView: View {
     ) -> ChannelLabelRowData {
         let timelineWidth = CGFloat(timelineHours * 60) * pixelsPerMinute
         let end = timelineStart.addingTimeInterval(Double(timelineWidth / pixelsPerMinute) * 60)
-        let formatter = DateFormatter()
-        formatter.dateFormat = "h:mma"
-        formatter.amSymbol = "am"
-        formatter.pmSymbol = "pm"
 
         let sorted = programs
             .filter { $0.end > timelineStart && $0.start < end }
@@ -144,7 +146,7 @@ struct EPGGridView: View {
             guard width > 2 else { continue }
             blocks.append((
                 rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                timeRange: "\(formatter.string(from: p.start)) - \(formatter.string(from: p.end))"
+                timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))"
             ))
             cursor = p.end
         }
@@ -400,12 +402,14 @@ private struct ProgramCanvasLayer: View, Equatable {
         let isFallback: Bool
     }
 
+    private static func timelineTime(_ date: Date) -> String {
+        date.formatted(date: .omitted, time: .shortened)
+            .replacingOccurrences(of: " ", with: "")
+            .lowercased()
+    }
+
     private func buildBlocks() -> [Block] {
         let end = timelineStart.addingTimeInterval(Double(timelineWidth / pixelsPerMinute) * 60)
-        let formatter = DateFormatter()
-        formatter.dateFormat = "h:mma"
-        formatter.amSymbol = "am"
-        formatter.pmSymbol = "pm"
 
         let sorted = programs
             .filter { $0.end > timelineStart && $0.start < end }
@@ -428,7 +432,7 @@ private struct ProgramCanvasLayer: View, Equatable {
                     program: p,
                     rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
                     title: p.title.isEmpty ? "No Event Today" : p.title,
-                    timeRange: "\(formatter.string(from: p.start)) - \(formatter.string(from: p.end))",
+                    timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))",
                     hasReminder: reminderProgramIDs.contains(p.id),
                     isFallback: false
                 )

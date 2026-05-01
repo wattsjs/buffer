@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// Fetches live and upcoming sporting events from ESPN's public scoreboard API
 /// and parses them into canonical `SportEvent` models.
@@ -66,7 +67,7 @@ actor ESPNClient {
             }
             return filterStaleLookbackEvents(parse(data: data, league: league))
         } catch {
-            print("[ESPN] Failed to fetch \(league.shortName): \(error.localizedDescription)")
+            AppLog.sports.error("ESPN scoreboard fetch failed league=\(league.shortName, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             return []
         }
     }
@@ -390,7 +391,7 @@ actor ESPNClient {
             }
             return buildGolfRounds(from: ev, league: league)
         } catch {
-            print("[ESPN] Leaderboard fetch failed for \(eventID): \(error.localizedDescription)")
+            AppLog.sports.error("ESPN leaderboard fetch failed eventID=\(eventID, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             return []
         }
     }

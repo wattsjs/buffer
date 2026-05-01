@@ -1,6 +1,7 @@
 import Foundation
 import UserNotifications
 import AppKit
+import OSLog
 import SwiftUI
 
 /// Bridges EPG program reminders to the macOS notification daemon
@@ -49,7 +50,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
             _ = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])
         } catch {
-            print("[Buffer] Notification auth error: \(error)")
+            AppLog.notifications.error("Notification auth failed error=\(error.localizedDescription, privacy: .public)")
         }
         await refreshAuthorizationStatus()
     }
@@ -139,7 +140,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         do {
             try await UNUserNotificationCenter.current().add(request)
         } catch {
-            print("[Buffer] Failed to schedule reminder: \(error)")
+            AppLog.notifications.error("Failed to schedule reminder id=\(id, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             return false
         }
 

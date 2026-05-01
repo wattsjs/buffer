@@ -1,6 +1,7 @@
 import Foundation
 import Libmpv
 import Observation
+import OSLog
 
 enum BufferSetting {
     static let appStorageKey = "mpvBufferSeconds"
@@ -77,6 +78,25 @@ final class MPVPlayer {
             let secs = Double(bufferSeconds)
             return max(min(secs * 0.4, secs - 1), 0)
         }
+
+        static var liveStreamLavfOptions: String {
+            [
+                "reconnect=1",
+                "reconnect_streamed=1",
+                "reconnect_on_network_error=1",
+                "reconnect_on_http_error=5xx,429",
+                "reconnect_delay_max=5",
+                "reconnect_max_retries=3",
+                "reconnect_delay_total_max=12",
+                "respect_retry_after=0",
+                "rw_timeout=10000000",
+            ].joined(separator: ",")
+        }
+    }
+
+    private struct MPVLogSuppression {
+        var lastEmittedAt: Date
+        var suppressedCount: Int
     }
 
     private(set) var mediaInfo = MPVMediaInfo()
@@ -109,6 +129,10 @@ final class MPVPlayer {
     /// Emitted when newly parsed media metadata becomes available. Intended for
     /// lightweight consumers such as StreamProbeService cache updates.
     var onMediaInfoChanged: ((MPVMediaInfo) -> Void)?
+    /// Emitted after mpv has opened the media and reported FILE_LOADED.
+    /// Owners use this to reset recovery watchdog state from "loading" to
+    /// "waiting for first playback progress".
+    var onFileLoaded: (() -> Void)?
 
     /// True if we have no rewind window, or playback is within a few seconds of
     /// the live edge. Streams without a DVR window are considered always-live.
@@ -163,6 +187,7 @@ final class MPVPlayer {
     private var statePollTimer: DispatchSourceTimer?
     private var bufferSeconds: Int = BufferSetting.read()
     private var defaultsObserver: NSObjectProtocol?
+    private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
 
     init() {
         setupMPV()
@@ -188,6 +213,7 @@ final class MPVPlayer {
 
     func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false) {
         guard let handle else { return }
+        AppLog.playback.info("mpv load url=\(url.absoluteString, privacy: .private(mask: .hash)) autoplay=\(autoplay, privacy: .public) fastProbe=\(fastProbe, privacy: .public)")
         errorMessage = nil
         resetMediaTrackState()
         timePos = 0
@@ -412,6 +438,7 @@ final class MPVPlayer {
         setOption(newHandle, "hwdec", "videotoolbox")
         setOption(newHandle, "hwdec-codecs", "all")
         setOption(newHandle, "vd-lavc-dr", "auto")
+        setOption(newHandle, "vd-lavc-show-all", "no")
         // Auto thread count explodes to one H.264 frame thread per core on Apple
         // Silicon, which shows up as 16 av:h264:df* threads in Instruments even
         // when VideoToolbox is active. Keep software fallback available, but cap
@@ -466,6 +493,7 @@ final class MPVPlayer {
         // startup latency for normal HLS — the larger window only kicks in
         // for pathological feeds that delay stream headers.
         setOption(newHandle, "demuxer-lavf-probe-info", "auto")
+        setOption(newHandle, "demuxer-lavf-o", "fflags=+discardcorrupt")
         setOption(newHandle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
         setOption(newHandle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
         setOption(newHandle, "network-timeout", "10")
@@ -474,8 +502,7 @@ final class MPVPlayer {
         // errors, demuxer parse failures, or false-EOF — those surface as
         // MPV_EVENT_END_FILE and are handled by the owner via `onPlaybackEnded`
         // (see PlayerSlot's reconnect policy).
-        setOption(newHandle, "stream-lavf-o",
-                  "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=5")
+        setOption(newHandle, "stream-lavf-o", Tuning.liveStreamLavfOptions)
         setOption(newHandle, "user-agent", "Buffer/1.0")
 
         let initErr = mpv_initialize(newHandle)
@@ -620,8 +647,11 @@ final class MPVPlayer {
                 }
             case MPV_EVENT_START_FILE:
                 errorMessage = nil
+                AppLog.playback.debug("mpv start-file")
             case MPV_EVENT_FILE_LOADED:
                 errorMessage = nil
+                AppLog.playback.info("mpv file-loaded")
+                onFileLoaded?()
                 if let paused = readFlagProperty("pause") {
                     pending.isPlaying = !paused
                 }
@@ -643,7 +673,7 @@ final class MPVPlayer {
             case MPV_EVENT_LOG_MESSAGE:
                 if let msg = evt.data?.assumingMemoryBound(to: mpv_event_log_message.self).pointee,
                    let text = msg.text {
-                    print("[mpv] \(String(cString: text).trimmingCharacters(in: .whitespacesAndNewlines))")
+                    emitMPVLog(String(cString: text))
                 }
             default:
                 break
@@ -670,6 +700,7 @@ final class MPVPlayer {
         default:
             endReason = .stopped
         }
+        AppLog.playback.info("mpv end-file reason=\(String(describing: endReason), privacy: .public)")
 
         // If an owner has installed a recovery handler, let it decide what
         // the user sees — it may be about to silently reconnect, in which
@@ -684,6 +715,77 @@ final class MPVPlayer {
         if case .error(_, let message) = endReason {
             errorMessage = "Playback failed: \(message)"
         }
+    }
+
+    private func emitMPVLog(_ rawMessage: String) {
+        let message = Self.sanitizedMPVLogMessage(rawMessage)
+        guard !message.isEmpty else { return }
+
+        let now = Date()
+        if var suppression = mpvLogSuppression[message],
+           now.timeIntervalSince(suppression.lastEmittedAt) < 2 {
+            suppression.suppressedCount += 1
+            mpvLogSuppression[message] = suppression
+            return
+        }
+
+        if let suppression = mpvLogSuppression[message], suppression.suppressedCount > 0 {
+            let category = Self.streamQualityCategory(for: message)
+            AppLog.playback.debug("mpv suppressed repeated warning category=\(category, privacy: .public) count=\(suppression.suppressedCount, privacy: .public) message=\(message, privacy: .public)")
+        }
+
+        mpvLogSuppression[message] = MPVLogSuppression(lastEmittedAt: now, suppressedCount: 0)
+        let category = Self.streamQualityCategory(for: message)
+        AppLog.playback.warning("mpv category=\(category, privacy: .public) \(message, privacy: .public)")
+    }
+
+    private static func sanitizedMPVLogMessage(_ rawMessage: String) -> String {
+        var message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return "" }
+
+        message = message.replacingOccurrences(
+            of: #"secret_token=[^'"\s&]+"#,
+            with: "secret_token=<redacted>",
+            options: .regularExpression
+        )
+        message = message.replacingOccurrences(
+            of: #"://([^/\s'"]+)/live/[^'"\s]+"#,
+            with: "://$1/live/<redacted>",
+            options: .regularExpression
+        )
+        message = message.replacingOccurrences(
+            of: #"(https?)://([^/\s'"]+)/[^'"\s]+"#,
+            with: "$1://$2/<redacted>",
+            options: .regularExpression
+        )
+        return message
+    }
+
+    private static func streamQualityCategory(for message: String) -> String {
+        let lowercased = message.lowercased()
+        if lowercased.contains("http error") ||
+            lowercased.contains("server returned") ||
+            lowercased.contains("connection") ||
+            lowercased.contains("tls:") ||
+            lowercased.contains("will reconnect") ||
+            lowercased.contains("end of file") {
+            return "network"
+        }
+        if lowercased.contains("hls:") || lowercased.contains("playlist") || lowercased.contains("segment") {
+            return "hls"
+        }
+        if lowercased.contains("mpegts:") || lowercased.contains("packet corrupt") || lowercased.contains("invalid audio pts") {
+            return "transport"
+        }
+        if lowercased.contains("h264:") || lowercased.contains("no frame") || lowercased.contains("non-existing pps") {
+            return "decode"
+        }
+        if lowercased.contains("desynchronisation") ||
+            lowercased.contains("audio/video") ||
+            lowercased.contains("audio device underrun") {
+            return "av-sync"
+        }
+        return "mpv"
     }
 
     private func resetMediaTrackState() {

@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SwiftUI
 
 enum SidebarSelection: Hashable {
@@ -247,6 +248,13 @@ class EPGViewModel {
     }
 
     private func performSync(config: ServerConfig, silent: Bool, scope: SyncScope) async {
+        let signpostID = AppLog.syncSignposter.makeSignpostID()
+        let signpostState = AppLog.syncSignposter.beginInterval(
+            "EPGSync",
+            id: signpostID,
+            "scope=\(String(describing: scope), privacy: .public) silent=\(silent, privacy: .public)"
+        )
+        let started = ContinuousClock.now
         let cacheKey = DataCache.cacheKey(for: config)
         var syncedStatus = ServerAccountStatus.initial(for: config, cacheKey: cacheKey)
 
@@ -261,6 +269,7 @@ class EPGViewModel {
                 isRefreshing = false
                 loadingStage = nil
             }
+            AppLog.syncSignposter.endInterval("EPGSync", signpostState)
             hasLoadedOnce = true
             activeSyncTask = nil
         }
@@ -304,7 +313,7 @@ class EPGViewModel {
                         DataCache.savePrograms(organized, key: cacheKey)
                     }
                 } catch {
-                    print("[Buffer] EPG fetch failed: \(error)")
+                    AppLog.sync.error("EPG fetch failed error=\(error.localizedDescription, privacy: .public)")
                     syncedStatus.guideStatus = "Unavailable"
                 }
             } else {
@@ -313,10 +322,11 @@ class EPGViewModel {
 
             lastUpdated = Date()
             updateServerStatus(syncedStatus)
-            print("[Buffer] Synced \(channels.count) channels in \(groups.count) groups (scope=\(scope), silent=\(silent))")
+            let elapsed = started.duration(to: .now).components.seconds
+            AppLog.sync.info("Sync finished scope=\(String(describing: scope), privacy: .public) silent=\(silent, privacy: .public) seconds=\(elapsed, privacy: .public) channels=\(self.channels.count, privacy: .public) groups=\(self.groups.count, privacy: .public)")
 
         } catch {
-            print("[Buffer] Sync failed: \(error)")
+            AppLog.sync.error("Sync failed scope=\(String(describing: scope), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             if !silent && channels.isEmpty {
                 errorMessage = error.localizedDescription
             }

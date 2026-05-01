@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import IOKit.pwr_mgt
+import OSLog
 
 /// Owns Buffer's recording subsystem: direct live recordings, scheduled
 /// unattended recordings, and persistence of both. Mirrors the pattern used
@@ -726,7 +727,7 @@ final class RecordingManager {
             recordings[index].wakeAt = desiredWake
             saveRecordings()
         } else {
-            print("[Buffer] IOPMSchedulePowerEvent failed for recording \(recording.id): \(result)")
+            AppLog.recording.error("IOPMSchedulePowerEvent failed recordingID=\(recording.id.uuidString, privacy: .public) result=\(result, privacy: .public)")
         }
     }
 
@@ -739,7 +740,7 @@ final class RecordingManager {
         )
         if result != kIOReturnSuccess {
             // Not fatal — macOS may already have consumed the event at wake.
-            print("[Buffer] IOPMCancelScheduledPowerEvent returned \(result)")
+            AppLog.recording.warning("IOPMCancelScheduledPowerEvent returned result=\(result, privacy: .public)")
         }
     }
 
@@ -858,7 +859,7 @@ final class RecordingManager {
         }
         guard let handle else {
             if let message = String(validatingCString: error), !message.isEmpty {
-                print("[RecordingManager] recorder start failed: \(message)")
+                AppLog.recording.error("Recorder start failed message=\(message, privacy: .public)")
             }
             return nil
         }
