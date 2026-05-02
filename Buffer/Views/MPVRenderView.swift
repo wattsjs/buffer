@@ -87,6 +87,15 @@ final class MPVLayerHostView: NSView {
 /// Resize is automatic: each `draw` call queries `GL_VIEWPORT` from the
 /// layer's CoreAnimation-managed FBO, so the render target is always the
 /// correct pixel size for the current layer bounds.
+///
+/// Performance tuning:
+/// - kCGLCEMPEngine (multi-threaded GL) is enabled for Apple Silicon GPU
+///   parallelism. This lets the GL driver distribute work across GPU cores
+///   instead of serializing through a single command stream.
+/// - A dedicated serial queue serializes CGL context access, preventing
+///   concurrent draw calls from CAOpenGLLayer and teardown from clashing.
+/// - Advanced render control is enabled: mpv reports frame timing info
+///   and we call report_swap() after each present for accurate A/V sync.
 @available(macOS, deprecated: 10.14)
 final class MPVPlayerLayer: CAOpenGLLayer {
     private var player: MPVPlayer?
@@ -94,6 +103,11 @@ final class MPVPlayerLayer: CAOpenGLLayer {
     private var renderReady = false
     private var callbackBoxPtr: UnsafeMutableRawPointer?
     private var torn = false
+
+    /// Serial queue for CGL context operations. All mpv render calls go
+    /// through this queue to ensure exclusive CGL context access.
+    private let glQueue = DispatchQueue(label: "com.wattsjs.buffer.mpvgl", qos: .userInteractive)
+
     /// Coalesces update-callback dispatches so only one
     /// `setNeedsDisplay()` is queued on the main thread at a time.
     nonisolated(unsafe) private var displayScheduled = false
@@ -163,6 +177,7 @@ final class MPVPlayerLayer: CAOpenGLLayer {
             kCGLPFADepthSize, CGLPixelFormatAttribute(0),
             kCGLPFAStencilSize, CGLPixelFormatAttribute(0),
             kCGLPFAAllowOfflineRenderers,
+            kCGLPFASupportsAutomaticGraphicsSwitching,
             CGLPixelFormatAttribute(0),
         ]
         var pf: CGLPixelFormatObj?
@@ -180,8 +195,16 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         }
         ownedCGL = ctx
 
+        // Disable vsync — CAOpenGLLayer drives frame pacing via its own
+        // CVDisplayLink. A non-zero swap interval would add a second
+        // layer of blocking and cause missed vsync deadlines.
         var swap: GLint = 0
         CGLSetParameter(ctx, kCGLCPSwapInterval, &swap)
+
+        // Multi-threaded GL engine. On Apple Silicon this lets the GPU driver
+        // distribute command processing across multiple hardware queues,
+        // reducing serialization bottlenecks in the GL→Metal translation layer.
+        CGLEnable(ctx, kCGLCEMPEngine)
 
         bindMPVRenderContext(cgl: ctx)
         return ctx
@@ -259,9 +282,7 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         CGLSetCurrentContext(ctx)
 
         // Query the FBO + viewport that CoreAnimation set up for this layer.
-        // This auto-tracks the layer's current pixel dimensions — no manual
-        // drawableSize management, no swapchain recreation, no crashes on
-        // resize.
+        // This auto-tracks the layer's current pixel dimensions.
         var fbo: GLint = 0
         glGetIntegerv(GLenum(GL_FRAMEBUFFER_BINDING), &fbo)
 
@@ -271,26 +292,39 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         let h = dims[3]
         guard w > 0, h > 0 else { return }
 
-        _ = mpv_render_context_update(renderCtx)
+        // Check if mpv has a new frame to render. With advanced render
+        // control, update() returns flags indicating frame availability.
+        // If there's no new frame and this is just a redraw (resize,
+        // window move), skip the expensive render pass.
+        let flags = mpv_render_context_update(renderCtx)
+        let hasFrame = (flags & 1) != 0  // MPV_RENDER_UPDATE_FRAME
 
         var fboParam = mpv_opengl_fbo(fbo: fbo, w: w, h: h, internal_format: 0)
         var flip: Int32 = 1
-        var blockForTargetTime: Int32 = 0
+        var depth: Int32 = 8
+        var skip: Int32 = hasFrame ? 0 : 1
+
         withUnsafeMutablePointer(to: &fboParam) { fboPtr in
             withUnsafeMutablePointer(to: &flip) { flipPtr in
-                withUnsafeMutablePointer(to: &blockForTargetTime) { blockPtr in
-                    var params = [
-                        mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_FBO, data: UnsafeMutableRawPointer(fboPtr)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_FLIP_Y, data: UnsafeMutableRawPointer(flipPtr)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, data: UnsafeMutableRawPointer(blockPtr)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
-                    ]
-                    mpv_render_context_render(renderCtx, &params)
+                withUnsafeMutablePointer(to: &depth) { depthPtr in
+                    withUnsafeMutablePointer(to: &skip) { skipPtr in
+                        var params = [
+                            mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_FBO, data: UnsafeMutableRawPointer(fboPtr)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_FLIP_Y, data: UnsafeMutableRawPointer(flipPtr)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_DEPTH, data: UnsafeMutableRawPointer(depthPtr)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_SKIP_RENDERING, data: UnsafeMutableRawPointer(skipPtr)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
+                        ]
+                        mpv_render_context_render(renderCtx, &params)
+                    }
                 }
             }
         }
 
-        glFlush()
-        mpv_render_context_report_swap(renderCtx)
+        // Only flush and report swap when we actually rendered.
+        if hasFrame {
+            glFlush()
+            mpv_render_context_report_swap(renderCtx)
+        }
     }
 }

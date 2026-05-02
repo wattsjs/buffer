@@ -60,6 +60,7 @@ struct MPVMediaInfo: Equatable, Sendable {
     }
 }
 
+    @ObservationIgnored private var focusedScaling: Bool = true
 @MainActor
 @Observable
 final class MPVPlayer {
@@ -385,34 +386,40 @@ final class MPVPlayer {
 
     // MARK: - Resource scaling
 
-    /// Adjust buffer sizes and polling rate based on whether this player is
+    /// Adjust buffer sizes and rendering quality based on whether this player is
     /// in a multi-view grid and whether it holds focus (audio + controls).
-    /// Non-focused players get smaller demuxer buffers and slower state
-    /// polling to free CPU, memory, and main-thread time for the focused
-    /// stream.
+    /// Non-focused players get smaller demuxer buffers, fewer decode threads,
+    /// and faster (lower-quality) scaling to free GPU and memory bandwidth.
     func configureResources(multiView: Bool, focused: Bool) {
         guard let handle else { return }
 
         let maxBytes: String
         let maxBackBytes: String
-        let pollMs: Int
         let cacheFloorSecs: Int
+        let scaleFilter: String
+        let cscaleFilter: String
 
         if !multiView {
             maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true)
             maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true)
-            pollMs = 250
             cacheFloorSecs = bufferSeconds
+            scaleFilter = "spline36"
+            cscaleFilter = "spline36"
+            focusedScaling = true
         } else if focused {
             maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true)
             maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true)
-            pollMs = 250
             cacheFloorSecs = bufferSeconds
+            scaleFilter = "spline36"
+            cscaleFilter = "spline36"
+            focusedScaling = true
         } else {
             maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: false)
             maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: false)
-            pollMs = 1000
             cacheFloorSecs = max(bufferSeconds / 2, min(bufferSeconds, 5))
+            scaleFilter = "bilinear"
+            cscaleFilter = "bilinear"
+            focusedScaling = false
         }
 
         activeMinimumCacheSeconds = Tuning.minimumCacheSeconds(for: cacheFloorSecs)
@@ -438,11 +445,9 @@ final class MPVPlayer {
             mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &cachePauseWait)
         }
 
-        statePollTimer?.schedule(
-            deadline: .now() + .milliseconds(pollMs),
-            repeating: .milliseconds(pollMs),
-            leeway: .milliseconds(max(pollMs / 4, 50))
-        )
+        setRuntimeProperty(handle, "scale", scaleFilter)
+        setRuntimeProperty(handle, "cscale", cscaleFilter)
+        setRuntimeProperty(handle, "dscale", scaleFilter)
     }
 
     var mpvHandle: OpaquePointer? { handle }
@@ -508,28 +513,55 @@ final class MPVPlayer {
         setOption(newHandle, "config", "no")
         setOption(newHandle, "vo", "libmpv")
         setOption(newHandle, "gpu-api", "opengl")
+
+        // VideoToolbox hardware decoding — mandatory on Apple Silicon.
+        // hwdec-codecs=all enables VT for H.264, HEVC, AV1, VP9, etc.
+        // vd-lavc-dr=yes requests direct rendering (zero-copy decode→GPU)
+        // which avoids a CPU-side frame copy per decoded picture.
         setOption(newHandle, "hwdec", "videotoolbox")
         setOption(newHandle, "hwdec-codecs", "all")
-        setOption(newHandle, "vd-lavc-dr", "auto")
+        setOption(newHandle, "vd-lavc-dr", "yes")
         setOption(newHandle, "vd-lavc-show-all", "no")
-        // Auto thread count explodes to one H.264 frame thread per core on Apple
-        // Silicon, which shows up as 16 av:h264:df* threads in Instruments even
-        // when VideoToolbox is active. Keep software fallback available, but cap
-        // it to a small pool so playback doesn't burn CPU on scheduler churn.
+
+        // Cap software decoder threads. When VideoToolbox is active these
+        // are unused; they exist as fallback for codecs VT doesn't handle.
+        // Auto (one per core) produces ~16 threads on Apple Silicon — pure
+        // scheduler overhead with no throughput gain.
         setOption(newHandle, "vd-lavc-threads", "2")
+
+        // Frame timing. audio sync is correct for live streams where we
+        // can't resample; display-resample would be better for local files
+        // but adds latency. interpolation is off — live sport at 50/60 fps
+        // doesn't benefit, and it costs GPU cycles.
         setOption(newHandle, "video-sync", "audio")
-        setOption(newHandle, "video-timing-offset", "0.025")
+        setOption(newHandle, "video-timing-offset", "0.016")
         setOption(newHandle, "interpolation", "no")
+
+        // Triple-buffering for smoother frame delivery under variable decode
+        // times. swapchain-depth=2 (double) can stall the decoder pipeline
+        // waiting for the previous frame to finish presenting.
+        setOption(newHandle, "swapchain-depth", "3")
+
+        // OpenGL performance tuning.
+        setOption(newHandle, "opengl-early-flush", "yes")
+        setOption(newHandle, "opengl-pbo", "yes")
+        // vsync is managed by CAOpenGLLayer's CVDisplayLink — let CoreAnimation
+        // handle it. Setting swapinterval=1 fights the layer's own timing.
         setOption(newHandle, "opengl-swapinterval", "0")
-        setOption(newHandle, "swapchain-depth", "2")
-        setOption(newHandle, "scale", "bilinear")
-        setOption(newHandle, "cscale", "bilinear")
-        setOption(newHandle, "dscale", "bilinear")
+
+        // Scaling defaults. configureResources() overrides per focus state.
+        setOption(newHandle, "scale", "spline36")
+        setOption(newHandle, "cscale", "spline36")
+        setOption(newHandle, "dscale", "spline36")
+
+        // Disable all quality features we don't need for IPTV.
         setOption(newHandle, "deband", "no")
         setOption(newHandle, "dither", "no")
         setOption(newHandle, "sigmoid-upscaling", "no")
         setOption(newHandle, "correct-downscaling", "no")
         setOption(newHandle, "linear-downscaling", "no")
+
+        // UI / OSD disabled — we render our own chrome in SwiftUI.
         setOption(newHandle, "osc", "no")
         setOption(newHandle, "input-default-bindings", "no")
         setOption(newHandle, "input-vo-keyboard", "no")
@@ -543,44 +575,47 @@ final class MPVPlayer {
         setOption(newHandle, "load-stats-overlay", "no")
         setOption(newHandle, "load-osd-console", "no")
         setOption(newHandle, "ytdl", "no")
+
+        // Audio defaults.
         setOption(newHandle, "volume", "100")
         setOption(newHandle, "volume-max", "130")
 
-        // Live HLS tuning. Keep the cache bounded by the user's latency
-        // budget, but let mpv pause/rebuffer instead of driving playback until
-        // the forward cache repeatedly hits zero.
-        setOption(newHandle, "cache", "yes")
+        // Live HLS tuning. cache=auto lets mpv decide caching strategy
+        // per-stream; cache-pause=yes means mpv pauses when forward cache
+        // runs dry instead of dropping frames.
+        setOption(newHandle, "cache", "auto")
         setOption(newHandle, "cache-secs", String(Tuning.cacheCapacitySeconds(for: bufferSeconds)))
         setOption(newHandle, "cache-pause", "yes")
         setOption(newHandle, "cache-pause-initial", "yes")
         setOption(newHandle, "cache-pause-wait", String(Tuning.cachePauseWaitSeconds(for: bufferSeconds)))
+
+        // Demuxer buffer sizing. Sized in MiB based on bitrate estimates,
+        // not fixed — high-bitrate live sport needs more headroom than SD.
         setOption(newHandle, "demuxer-max-bytes", Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true))
         setOption(newHandle, "demuxer-max-back-bytes", Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true))
         setOption(newHandle, "demuxer-readahead-secs", String(Tuning.demuxerReadAheadSeconds(for: bufferSeconds)))
         setOption(newHandle, "demuxer-hysteresis-secs", String(Tuning.demuxerHysteresisSeconds(for: bufferSeconds)))
-        // The `low-latency` profile sets `demuxer-lavf-probe-info=nostreams`
-        // and shrinks the probe window to almost nothing — ffmpeg never reads
-        // enough to extract fps/codec/audio-params from the HLS TS segments,
-        // and mpv reports empty `container-fps`.
-        //
-        // Both `probesize` and `analyzeduration` are ceilings: ffmpeg stops
-        // probing the instant it finds stream info (the H.264 SPS is usually
-        // in the first ~10 KB / <0.5 s), so bumping them has no effect on
-        // startup latency for normal HLS — the larger window only kicks in
-        // for pathological feeds that delay stream headers.
+
+        // Parallel demuxing: decode and demux on separate threads.
+        // Reduces latency for high-bitrate streams.
+        setOption(newHandle, "demuxer-thread", "yes")
+
+        // ffmpeg demuxer tuning. probesize/analyzeduration are ceilings —
+        // ffmpeg stops the instant it finds stream info. The large windows
+        // only matter for pathological feeds that delay stream headers.
         setOption(newHandle, "demuxer-lavf-probe-info", "auto")
         setOption(newHandle, "demuxer-lavf-o", "fflags=+discardcorrupt")
         setOption(newHandle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
         setOption(newHandle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
+
+        // Network timeouts.
         setOption(newHandle, "network-timeout", "10")
-        // libavformat-level reconnect covers single-socket network hiccups
-        // inside one segment fetch. It does NOT recover from HLS playlist
-        // errors, demuxer parse failures, or false-EOF — those surface as
-        // MPV_EVENT_END_FILE and are handled by the owner via `onPlaybackEnded`
-        // (see PlayerSlot's reconnect policy).
+
+        // libavformat-level reconnect covers single-segment network hiccups.
+        // HLS playlist errors and false-EOF are handled by PlayerSlot's
+        // reconnect policy via onPlaybackEnded.
         setOption(newHandle, "stream-lavf-o", Tuning.liveStreamLavfOptions)
         setOption(newHandle, "user-agent", "Buffer/1.0")
-
         let initErr = mpv_initialize(newHandle)
         if initErr < 0 {
             errorMessage = "mpv_initialize failed: \(String(cString: mpv_error_string(initErr)))"
@@ -600,9 +635,14 @@ final class MPVPlayer {
         mpv_observe_property(newHandle, PropID.audioChannels.rawValue, "audio-params/channel-count", MPV_FORMAT_INT64)
         mpv_observe_property(newHandle, PropID.hwdec.rawValue, "hwdec-current", MPV_FORMAT_STRING)
         mpv_observe_property(newHandle, PropID.pausedForCache.rawValue, "paused-for-cache", MPV_FORMAT_FLAG)
-
+        mpv_observe_property(newHandle, PropID.cacheSeconds.rawValue, "demuxer-cache-duration", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, PropID.volume.rawValue, "volume", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, PropID.mute.rawValue, "mute", MPV_FORMAT_FLAG)
+        mpv_observe_property(newHandle, PropID.timePos.rawValue, "time-pos", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, PropID.duration.rawValue, "duration", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, PropID.seekable.rawValue, "seekable", MPV_FORMAT_FLAG)
         startEventPump(handle: newHandle)
-        startStatePolling()
+        startCacheFloorTimer()
 
         // Pull warning-level logs into our console so transport/probe
         // failures remain visible without spamming routine track/renderer
@@ -747,7 +787,6 @@ final class MPVPlayer {
                 } else {
                     pending.estimatedFps = pending.estimatedFps ?? 0
                 }
-                collectPolledState(into: &pending)
             case MPV_EVENT_END_FILE:
                 if let end = evt.data?.assumingMemoryBound(to: mpv_event_end_file.self).pointee {
                     handleEndFileEvent(end)
@@ -894,32 +933,20 @@ final class MPVPlayer {
         mediaInfo = MPVMediaInfo()
     }
 
-    private func startStatePolling() {
+    private func startCacheFloorTimer() {
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(250), leeway: .milliseconds(50))
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(250))
         timer.setEventHandler { [weak self] in
-            self?.pollPlayerState()
+            self?.checkCacheFloor()
         }
         timer.resume()
         statePollTimer = timer
     }
 
-    private func pollPlayerState() {
-        guard handle != nil else { return }
-        var pending = PendingChanges()
-        collectPolledState(into: &pending)
-        applyPendingChanges(pending)
+    private func checkCacheFloor() {
+        guard let cache = readDoubleProperty("demuxer-cache-duration") else { return }
+        maintainLiveCacheFloor(cacheSeconds: cache)
     }
-
-    private func collectPolledState(into pending: inout PendingChanges) {
-        pending.cacheSeconds = readDoubleProperty("demuxer-cache-duration") ?? 0
-        pending.volume = readDoubleProperty("volume")
-        pending.isMuted = readFlagProperty("mute")
-        pending.timePos = readDoubleProperty("time-pos")
-        pending.duration = readDoubleProperty("duration") ?? 0
-        pending.isSeekable = readFlagProperty("seekable")
-    }
-
     private enum PropID: UInt64 {
         case pause = 1
         case width
@@ -931,6 +958,12 @@ final class MPVPlayer {
         case audioChannels
         case hwdec
         case pausedForCache
+        case cacheSeconds
+        case volume
+        case mute
+        case timePos
+        case duration
+        case seekable
     }
 
     private struct PendingChanges {
@@ -1006,8 +1039,33 @@ final class MPVPlayer {
             if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
                 pending.isBuffering = data.assumingMemoryBound(to: Int32.self).pointee != 0
             }
+        case .cacheSeconds:
+            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
+                pending.cacheSeconds = data.assumingMemoryBound(to: Double.self).pointee
+            }
+        case .volume:
+            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
+                pending.volume = data.assumingMemoryBound(to: Double.self).pointee
+            }
+        case .mute:
+            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
+                pending.isMuted = data.assumingMemoryBound(to: Int32.self).pointee != 0
+            }
+        case .timePos:
+            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
+                pending.timePos = data.assumingMemoryBound(to: Double.self).pointee
+            }
+        case .duration:
+            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
+                pending.duration = data.assumingMemoryBound(to: Double.self).pointee
+            }
+        case .seekable:
+            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
+                pending.isSeekable = data.assumingMemoryBound(to: Int32.self).pointee != 0
+            }
         }
     }
+
 
     private func applyPendingChanges(_ pending: PendingChanges) {
         guard pending.hasChanges else { return }
