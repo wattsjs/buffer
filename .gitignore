@@ -2,6 +2,7 @@
 .build/
 .pi/
 .local/
+.codex/
 dist/
 build/
 DerivedData/
