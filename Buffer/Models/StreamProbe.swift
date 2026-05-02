@@ -1,5 +1,83 @@
 import Foundation
 
+nonisolated enum StreamHealthEvent: String, Codable, Sendable {
+    case http509
+    case playlistReloadFailure
+    case reconnect
+    case recoveryReload
+}
+
+nonisolated struct StreamHealth: Codable, Hashable, Sendable {
+    var http509Count: Int = 0
+    var playlistReloadFailureCount: Int = 0
+    var reconnectCount: Int = 0
+    var recoveryReloadCount: Int = 0
+
+    var lastHTTP509At: Date?
+    var lastPlaylistReloadFailureAt: Date?
+    var lastReconnectAt: Date?
+    var lastRecoveryReloadAt: Date?
+    var reconnectWindowStart: Date?
+    var reconnectsInWindow: Int = 0
+
+    static let unstableWindow: TimeInterval = 15 * 60
+
+    var hasEvents: Bool {
+        http509Count > 0 ||
+        playlistReloadFailureCount > 0 ||
+        reconnectCount > 0 ||
+        recoveryReloadCount > 0
+    }
+
+    var isUnstable: Bool {
+        let now = Date()
+        if Self.isRecent(lastHTTP509At, now: now) ||
+            Self.isRecent(lastPlaylistReloadFailureAt, now: now) ||
+            Self.isRecent(lastRecoveryReloadAt, now: now) {
+            return true
+        }
+
+        guard reconnectsInWindow >= 2,
+              Self.isRecent(reconnectWindowStart, now: now) else {
+            return false
+        }
+        return true
+    }
+
+    var statusLabel: String {
+        isUnstable ? "unstable" : "ok"
+    }
+
+    mutating func record(_ event: StreamHealthEvent, at date: Date = Date()) {
+        switch event {
+        case .http509:
+            http509Count += 1
+            lastHTTP509At = date
+        case .playlistReloadFailure:
+            playlistReloadFailureCount += 1
+            lastPlaylistReloadFailureAt = date
+        case .reconnect:
+            reconnectCount += 1
+            lastReconnectAt = date
+            if let windowStart = reconnectWindowStart,
+               date.timeIntervalSince(windowStart) <= Self.unstableWindow {
+                reconnectsInWindow += 1
+            } else {
+                reconnectWindowStart = date
+                reconnectsInWindow = 1
+            }
+        case .recoveryReload:
+            recoveryReloadCount += 1
+            lastRecoveryReloadAt = date
+        }
+    }
+
+    private static func isRecent(_ date: Date?, now: Date) -> Bool {
+        guard let date else { return false }
+        return now.timeIntervalSince(date) <= unstableWindow
+    }
+}
+
 /// Static metadata pulled from a channel's stream by libavformat. Attached to a
 /// channel out-of-band (keyed by `Channel.id`) so the Channel cache schema
 /// doesn't need to bump every time we adjust probe fields.
@@ -28,6 +106,7 @@ nonisolated struct StreamProbe: Codable, Hashable, Sendable {
     var hasVideo: Bool
     var hasAudio: Bool
     var errorMessage: String?
+    var streamHealth: StreamHealth = StreamHealth()
 
     var resolutionLabel: String {
         guard width > 0, height > 0 else { return "" }
@@ -98,6 +177,65 @@ nonisolated struct StreamProbe: Codable, Hashable, Sendable {
 }
 
 extension StreamProbe {
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case probedAt
+        case probeSeconds
+        case width
+        case height
+        case fps
+        case videoCodec
+        case audioCodec
+        case audioChannels
+        case sampleRate
+        case bitRate
+        case liveLatencySeconds
+        case hasVideo
+        case hasAudio
+        case errorMessage
+        case streamHealth
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        status = try c.decode(Status.self, forKey: .status)
+        probedAt = try c.decode(Date.self, forKey: .probedAt)
+        probeSeconds = try c.decode(Double.self, forKey: .probeSeconds)
+        width = try c.decode(Int.self, forKey: .width)
+        height = try c.decode(Int.self, forKey: .height)
+        fps = try c.decode(Double.self, forKey: .fps)
+        videoCodec = try c.decode(String.self, forKey: .videoCodec)
+        audioCodec = try c.decode(String.self, forKey: .audioCodec)
+        audioChannels = try c.decode(Int.self, forKey: .audioChannels)
+        sampleRate = try c.decode(Int.self, forKey: .sampleRate)
+        bitRate = try c.decode(Int64.self, forKey: .bitRate)
+        liveLatencySeconds = try c.decodeIfPresent(Double.self, forKey: .liveLatencySeconds)
+        hasVideo = try c.decode(Bool.self, forKey: .hasVideo)
+        hasAudio = try c.decode(Bool.self, forKey: .hasAudio)
+        errorMessage = try c.decodeIfPresent(String.self, forKey: .errorMessage)
+        streamHealth = try c.decodeIfPresent(StreamHealth.self, forKey: .streamHealth) ?? StreamHealth()
+    }
+
+    nonisolated func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(status, forKey: .status)
+        try c.encode(probedAt, forKey: .probedAt)
+        try c.encode(probeSeconds, forKey: .probeSeconds)
+        try c.encode(width, forKey: .width)
+        try c.encode(height, forKey: .height)
+        try c.encode(fps, forKey: .fps)
+        try c.encode(videoCodec, forKey: .videoCodec)
+        try c.encode(audioCodec, forKey: .audioCodec)
+        try c.encode(audioChannels, forKey: .audioChannels)
+        try c.encode(sampleRate, forKey: .sampleRate)
+        try c.encode(bitRate, forKey: .bitRate)
+        try c.encodeIfPresent(liveLatencySeconds, forKey: .liveLatencySeconds)
+        try c.encode(hasVideo, forKey: .hasVideo)
+        try c.encode(hasAudio, forKey: .hasAudio)
+        try c.encodeIfPresent(errorMessage, forKey: .errorMessage)
+        try c.encode(streamHealth, forKey: .streamHealth)
+    }
+
     /// Map the C result struct into a Swift value. Strings are read up to the
     /// first NUL byte from the fixed-size char arrays.
     nonisolated init(cResult r: BufferProbeResult) {

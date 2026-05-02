@@ -72,6 +72,7 @@ struct PlayerView: View {
     @State private var showVolumePopover = false
     @State private var showChannelPicker = false
     @State private var showStatsForNerds = false
+    @State private var streamProbeService = StreamProbeService.shared
 
     /// Recording-mode primary scrub position override while the user drags
     /// the bottom scrubber. Also reused by channel mode's HLS-seekbar.
@@ -130,6 +131,10 @@ struct PlayerView: View {
 
     private var channel: Channel? { session?.focusedSlot.channel }
     private var currentProgram: EPGProgram? { session?.focusedSlot.currentProgram }
+    private var focusedStreamHealth: StreamHealth? {
+        guard let channel else { return nil }
+        return streamProbeService.probe(for: channel.id)?.streamHealth
+    }
     private var liveProgram: EPGProgram? {
         guard let c = channel else { return nil }
         return viewModel?.currentProgram(for: c)
@@ -1206,6 +1211,9 @@ struct PlayerView: View {
 
     @ViewBuilder
     private func statsForNerdsPanel(_ info: MPVMediaInfo) -> some View {
+        let _ = streamProbeService.version
+        let streamHealth = focusedStreamHealth ?? StreamHealth()
+
         VStack(alignment: .leading, spacing: 8) {
             Text("Stats for Nerds")
                 .font(.caption.weight(.semibold))
@@ -1221,10 +1229,17 @@ struct PlayerView: View {
                 statsRow("Live latency", info.liveLatencySeconds.map { String(format: "%.1fs", $0) } ?? "")
                 statsRow("Position", playbackPositionLabel)
                 statsRow("Volume", "\(Int(player.volume.rounded()))%\(player.isMuted ? " muted" : "")")
+                if isChannelMode {
+                    statsRow("Stream health", streamHealth.statusLabel)
+                    statsRow("HTTP 509", "\(streamHealth.http509Count)")
+                    statsRow("Playlist reloads", "\(streamHealth.playlistReloadFailureCount)")
+                    statsRow("Reconnects", "\(streamHealth.reconnectCount)")
+                    statsRow("Recovery reloads", "\(streamHealth.recoveryReloadCount)")
+                }
             }
         }
         .padding(12)
-        .frame(width: 250, alignment: .leading)
+        .frame(width: 286, alignment: .leading)
         .chromeSurface(in: RoundedRectangle(cornerRadius: 12, style: .continuous), fill: Color.black.opacity(0.68))
     }
 
@@ -1235,7 +1250,7 @@ struct PlayerView: View {
                 Text(label)
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.55))
-                    .frame(width: 88, alignment: .leading)
+                    .frame(width: 112, alignment: .leading)
                 Text(value)
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.white.opacity(0.88))

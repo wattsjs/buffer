@@ -145,6 +145,34 @@ final class StreamProbeService {
         }
     }
 
+    /// Record stream health observed during live playback. Unlike static
+    /// probing, this annotates the active channel without opening a second
+    /// provider connection.
+    func recordStreamHealthEvent(
+        channelID: String,
+        event: StreamHealthEvent,
+        at date: Date = Date()
+    ) {
+        var probe = probes[channelID] ?? StreamProbe(
+            status: .ok,
+            probedAt: date,
+            probeSeconds: 0,
+            width: 0, height: 0, fps: 0,
+            videoCodec: "", audioCodec: "",
+            audioChannels: 0, sampleRate: 0,
+            bitRate: 0, hasVideo: false, hasAudio: false,
+            errorMessage: nil
+        )
+
+        probe.streamHealth.record(event, at: date)
+        probe.probedAt = date
+        probes[channelID] = probe
+        version &+= 1
+        if let key = activeCacheKey {
+            persist(for: key)
+        }
+    }
+
     /// Convenience for batch warming (e.g. all visible favorites). Same dedupe
     /// rules as the single-channel call.
     func requestProbes(for channels: some Sequence<Channel>) {
@@ -191,7 +219,11 @@ final class StreamProbeService {
                 self.inFlight.remove(id)
                 // Drop the result if the user switched playlists mid-flight.
                 if self.activeCacheKey == key {
-                    self.probes[id] = result
+                    var merged = result
+                    if let existing = self.probes[id] {
+                        merged.streamHealth = existing.streamHealth
+                    }
+                    self.probes[id] = merged
                     self.version &+= 1
                     if let key {
                         self.persist(for: key)
