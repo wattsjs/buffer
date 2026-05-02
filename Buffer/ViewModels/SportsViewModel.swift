@@ -23,6 +23,11 @@ final class SportsViewModel {
     private(set) var totalEvents: Int = 0
     private(set) var isStreamIndexBuilding = false
 
+    /// Incremented each time the stream search index transitions from
+    /// building/empty to ready. Cards observe this to rematch while a
+    /// popover is open.
+    private(set) var searchIndexVersion: Int = 0
+
     var selectedSports: Set<Sport> = [] { didSet { rebuildSections() } }
     var hideFinished = false { didSet { rebuildSections() } }
 
@@ -41,11 +46,9 @@ final class SportsViewModel {
     var channelPreferenceScores: [String: Double] = [:]
     var groupPreferenceScores: [String: Double] = [:]
     var hiddenGroups: Set<String> = []
-    var cacheKey: String?
 
     /// Pre-built search index for on-demand matching.
     private var searchIndex = StreamSearchIndex.empty
-    private var searchIndexFingerprint: String?
 
     var isStreamIndexReady: Bool {
         !isStreamIndexBuilding && !searchIndex.entries.isEmpty && searchIndex.epgTitleCount > 0
@@ -67,8 +70,7 @@ final class SportsViewModel {
         favoriteChannelIDs: Set<String>,
         channelPreferenceScores: [String: Double],
         groupPreferenceScores: [String: Double],
-        hiddenGroups: Set<String>,
-        cacheKey: String?
+        hiddenGroups: Set<String>
     ) {
         self.channels = channels
         self.programs = programs
@@ -76,7 +78,6 @@ final class SportsViewModel {
         self.channelPreferenceScores = channelPreferenceScores
         self.groupPreferenceScores = groupPreferenceScores
         self.hiddenGroups = hiddenGroups
-        self.cacheKey = cacheKey
         rebuildIndexInBackground()
     }
 
@@ -92,65 +93,45 @@ final class SportsViewModel {
 
     // MARK: - Index building
 
+    /// Build the sports stream search index in the background.
+    /// The index is built purely in-memory from channels + EPG programs;
+    /// it is not persisted to disk. EPG is the durable source of truth.
     private func rebuildIndexInBackground() {
         let ch = channels
         let pr = programs
         let hidden = hiddenGroups
-        let key = cacheKey
         indexBuildGeneration &+= 1
         let generation = indexBuildGeneration
 
         if ch.isEmpty {
             searchIndex = .empty
-            searchIndexFingerprint = nil
             isStreamIndexBuilding = false
             AppLog.sports.info("Sports stream index cleared; no channels")
             return
         }
 
         if pr.isEmpty {
-            searchIndex = .empty
-            searchIndexFingerprint = nil
-            isStreamIndexBuilding = true
+            // Channels are loaded but EPG hasn't arrived yet.
+            // Keep whatever index we have (if any) and mark building.
+            if searchIndex.entries.isEmpty {
+                isStreamIndexBuilding = true
+            }
             AppLog.sports.info("Sports stream index waiting for guide data channels=\(ch.count, privacy: .public)")
             return
         }
 
-        isStreamIndexBuilding = true
+        isStreamIndexBuilding = searchIndex.entries.isEmpty
         AppLog.sports.info("Sports stream index build started generation=\(generation, privacy: .public) channels=\(ch.count, privacy: .public) programKeys=\(pr.count, privacy: .public)")
 
-        Task.detached(priority: .userInitiated) { [ch, pr, hidden, key, generation] in
+        Task.detached(priority: .userInitiated) { [ch, pr, hidden, generation] in
             let start = ContinuousClock.now
-            let fingerprint = DataCache.streamSearchIndexFingerprint(
-                channels: ch,
-                programs: pr,
-                hiddenGroups: hidden
-            )
-
-            if let key,
-               let cached = DataCache.loadStreamSearchIndex(key: key, fingerprint: fingerprint) {
-                await MainActor.run { [weak self] in
-                    guard let self, self.indexBuildGeneration == generation else { return }
-                    self.searchIndex = cached
-                    self.searchIndexFingerprint = fingerprint
-                    self.isStreamIndexBuilding = false
-                    let elapsed = start.duration(to: .now).components
-                    let milliseconds = (elapsed.seconds * 1_000) + (elapsed.attoseconds / 1_000_000_000_000_000)
-                    AppLog.sports.info("Sports stream index loaded from cache generation=\(generation, privacy: .public) entries=\(cached.entries.count, privacy: .public) programKeys=\(cached.programKeyCount, privacy: .public) epgTitles=\(cached.epgTitleCount, privacy: .public) loadMs=\(milliseconds, privacy: .public)")
-                }
-                return
-            }
-
             let index = StreamMatcher.buildIndex(channels: ch, programs: pr, hiddenGroups: hidden)
-            if let key {
-                DataCache.saveStreamSearchIndex(index, key: key, fingerprint: fingerprint)
-            }
 
             await MainActor.run { [weak self] in
                 guard let self, self.indexBuildGeneration == generation else { return }
                 self.searchIndex = index
-                self.searchIndexFingerprint = fingerprint
                 self.isStreamIndexBuilding = false
+                self.searchIndexVersion &+= 1
                 let elapsed = start.duration(to: .now).components
                 let milliseconds = (elapsed.seconds * 1_000) + (elapsed.attoseconds / 1_000_000_000_000_000)
                 AppLog.sports.info("Sports stream index ready generation=\(generation, privacy: .public) entries=\(index.entries.count, privacy: .public) programKeys=\(index.programKeyCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) buildMs=\(milliseconds, privacy: .public)")

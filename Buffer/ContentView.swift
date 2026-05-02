@@ -46,8 +46,7 @@ struct ContentView: View {
             favoriteChannelIDs: viewModel.favoriteChannelIDs,
             channelPreferenceScores: viewModel.channelPreferenceScores,
             groupPreferenceScores: viewModel.groupPreferenceScores,
-            hiddenGroups: viewModel.hiddenGroupNames,
-            cacheKey: viewModel.activePlaylist.map(DataCache.cacheKey(for:))
+            hiddenGroups: viewModel.hiddenGroupNames
         )
     }
 
