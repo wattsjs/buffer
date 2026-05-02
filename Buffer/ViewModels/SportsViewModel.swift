@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SwiftUI
 
 /// A section of events grouped by time bucket, ready for display.
@@ -34,28 +35,45 @@ final class SportsViewModel {
     private var indexBuildGeneration = 0
 
     // External data for stream matching — set by the view
-    var channels: [Channel] = [] { didSet { rebuildIndexInBackground() } }
-    var programs: [String: [EPGProgram]] = [:] { didSet { rebuildIndexInBackground() } }
+    var channels: [Channel] = []
+    var programs: [String: [EPGProgram]] = [:]
     var favoriteChannelIDs: Set<String> = []
     var channelPreferenceScores: [String: Double] = [:]
     var groupPreferenceScores: [String: Double] = [:]
-    var hiddenGroups: Set<String> = [] { didSet { rebuildIndexInBackground() } }
+    var hiddenGroups: Set<String> = []
 
     /// Pre-built search index for on-demand matching.
     private var searchIndex = StreamSearchIndex.empty
 
     var isStreamIndexReady: Bool {
-        !isStreamIndexBuilding && !searchIndex.entries.isEmpty
+        !isStreamIndexBuilding && !searchIndex.entries.isEmpty && searchIndex.epgTitleCount > 0
     }
 
     var streamIndexUnavailableMessage: String? {
         if isStreamIndexBuilding {
             return "Indexing channels and guide data…"
         }
-        if searchIndex.entries.isEmpty {
+        if searchIndex.entries.isEmpty || searchIndex.epgTitleCount == 0 {
             return "Channel search index is not ready yet"
         }
         return nil
+    }
+
+    func updateStreamMatchingContext(
+        channels: [Channel],
+        programs: [String: [EPGProgram]],
+        favoriteChannelIDs: Set<String>,
+        channelPreferenceScores: [String: Double],
+        groupPreferenceScores: [String: Double],
+        hiddenGroups: Set<String>
+    ) {
+        self.channels = channels
+        self.programs = programs
+        self.favoriteChannelIDs = favoriteChannelIDs
+        self.channelPreferenceScores = channelPreferenceScores
+        self.groupPreferenceScores = groupPreferenceScores
+        self.hiddenGroups = hiddenGroups
+        rebuildIndexInBackground()
     }
 
     // MARK: - Index building
@@ -66,19 +84,34 @@ final class SportsViewModel {
         let hidden = hiddenGroups
         indexBuildGeneration &+= 1
         let generation = indexBuildGeneration
-        isStreamIndexBuilding = !ch.isEmpty
 
         if ch.isEmpty {
             searchIndex = .empty
+            isStreamIndexBuilding = false
+            AppLog.sports.info("Sports stream index cleared; no channels")
             return
         }
 
+        if pr.isEmpty {
+            searchIndex = .empty
+            isStreamIndexBuilding = true
+            AppLog.sports.info("Sports stream index waiting for guide data channels=\(ch.count, privacy: .public)")
+            return
+        }
+
+        isStreamIndexBuilding = true
+        AppLog.sports.info("Sports stream index build started generation=\(generation, privacy: .public) channels=\(ch.count, privacy: .public) programKeys=\(pr.count, privacy: .public)")
+
         Task.detached(priority: .userInitiated) { [ch, pr, hidden, generation] in
+            let start = ContinuousClock.now
             let index = StreamMatcher.buildIndex(channels: ch, programs: pr, hiddenGroups: hidden)
             await MainActor.run { [weak self] in
                 guard let self, self.indexBuildGeneration == generation else { return }
                 self.searchIndex = index
                 self.isStreamIndexBuilding = false
+                let elapsed = start.duration(to: .now).components
+                let milliseconds = (elapsed.seconds * 1_000) + (elapsed.attoseconds / 1_000_000_000_000_000)
+                AppLog.sports.info("Sports stream index ready generation=\(generation, privacy: .public) entries=\(index.entries.count, privacy: .public) programKeys=\(index.programKeyCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) buildMs=\(milliseconds, privacy: .public)")
             }
         }
     }
@@ -159,9 +192,13 @@ final class SportsViewModel {
         let favIDs = favoriteChannelIDs
         let channelScores = channelPreferenceScores
         let groupScores = groupPreferenceScores
-        guard !index.entries.isEmpty else { return [] }
+        guard !index.entries.isEmpty, index.epgTitleCount > 0 else {
+            AppLog.sports.info("Sports stream match skipped; index not ready event=\(event.displayTitle, privacy: .public) entries=\(index.entries.count, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public)")
+            return []
+        }
 
         return await Task.detached(priority: .userInitiated) {
+            let start = ContinuousClock.now
             var matches = StreamMatcher.findMatches(for: event, index: index)
             // Semantic score remains primary. User preference is a bounded
             // tie-breaker from favorite channels, channel usage, and folder usage.
@@ -180,6 +217,9 @@ final class SportsViewModel {
                 )
                 return lScore > rScore
             }
+            let elapsed = start.duration(to: .now).components
+            let milliseconds = (elapsed.seconds * 1_000) + (elapsed.attoseconds / 1_000_000_000_000_000)
+            AppLog.sports.info("Sports stream match finished event=\(event.displayTitle, privacy: .public) matches=\(matches.count, privacy: .public) entries=\(index.entries.count, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) matchMs=\(milliseconds, privacy: .public)")
             return matches
         }.value
     }

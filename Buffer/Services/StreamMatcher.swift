@@ -35,11 +35,15 @@ nonisolated struct StreamSearchIndex: Sendable {
     let entries: [ChannelSearchIndex]
     let tokenToEntryIndices: [String: ContiguousArray<Int>]
     let inverseDocumentFrequency: [String: Double]
+    let programKeyCount: Int
+    let epgTitleCount: Int
 
     static let empty = StreamSearchIndex(
         entries: [],
         tokenToEntryIndices: [:],
-        inverseDocumentFrequency: [:]
+        inverseDocumentFrequency: [:],
+        programKeyCount: 0,
+        epgTitleCount: 0
     )
 }
 
@@ -135,6 +139,7 @@ nonisolated enum StreamMatcher {
             )
         }
 
+        let epgTitleCount = entries.reduce(0) { $0 + $1.epgTitles.count }
         let inverted = buildInvertedIndex(for: entries)
         return StreamSearchIndex(
             entries: entries,
@@ -142,7 +147,9 @@ nonisolated enum StreamMatcher {
             inverseDocumentFrequency: buildInverseDocumentFrequency(
                 tokenToEntryIndices: inverted,
                 documentCount: entries.count
-            )
+            ),
+            programKeyCount: programs.count,
+            epgTitleCount: epgTitleCount
         )
     }
 
@@ -209,9 +216,6 @@ nonisolated enum StreamMatcher {
         for hiddenPath in hiddenGroupPaths {
             guard !hiddenPath.isEmpty, hiddenPath.count <= path.count else { continue }
             if Array(path.prefix(hiddenPath.count)) == hiddenPath {
-                return true
-            }
-            if path.contains(hiddenPath[0]) {
                 return true
             }
         }

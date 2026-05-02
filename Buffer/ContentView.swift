@@ -40,12 +40,14 @@ struct ContentView: View {
     }
 
     private func updateSportsMatchingContext() {
-        sportsViewModel.channels = viewModel.channels
-        sportsViewModel.programs = viewModel.programs
-        sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
-        sportsViewModel.channelPreferenceScores = viewModel.channelPreferenceScores
-        sportsViewModel.groupPreferenceScores = viewModel.groupPreferenceScores
-        sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
+        sportsViewModel.updateStreamMatchingContext(
+            channels: viewModel.channels,
+            programs: viewModel.programs,
+            favoriteChannelIDs: viewModel.favoriteChannelIDs,
+            channelPreferenceScores: viewModel.channelPreferenceScores,
+            groupPreferenceScores: viewModel.groupPreferenceScores,
+            hiddenGroups: viewModel.hiddenGroupNames
+        )
     }
 
     private func handleSidebarSelectionChange(from oldValue: SidebarSelection, to newValue: SidebarSelection) {
@@ -295,10 +297,10 @@ struct ContentView: View {
             updateSportsMatchingContext()
         }
         .onChange(of: viewModel.channels.count) { _, _ in
-            sportsViewModel.channels = viewModel.channels
+            updateSportsMatchingContext()
         }
         .onChange(of: viewModel.programs.count) { _, _ in
-            sportsViewModel.programs = viewModel.programs
+            updateSportsMatchingContext()
         }
         .onChange(of: viewModel.favoriteChannelIDs) { _, _ in
             updateSportsMatchingContext()
@@ -307,7 +309,7 @@ struct ContentView: View {
             updateSportsMatchingContext()
         }
         .onChange(of: viewModel.hiddenGroupNames) { _, _ in
-            sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
+            updateSportsMatchingContext()
         }
         .onChange(of: hideSport) { _, hidden in
             handleSportsVisibilityChange(hidden: hidden)
