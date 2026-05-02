@@ -27,13 +27,15 @@ private enum SparkleConfiguration {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, SPUStandardUserDriverDelegate {
     // 6 hours between scheduled background checks.
     private static let updateCheckInterval: TimeInterval = 6 * 60 * 60
 
+    private var updaterStarted = false
+    private var focusingScheduledUpdate = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Silent check on launch — only surfaces UI if an update is available.
-        updaterController?.updater.checkForUpdatesInBackground()
+        startUpdater()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -47,9 +49,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let controller = SPUStandardUpdaterController(
-            startingUpdater: true,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
+            startingUpdater: false,
+            updaterDelegate: self,
+            userDriverDelegate: self
         )
         controller.updater.automaticallyChecksForUpdates = true
         controller.updater.updateCheckInterval = Self.updateCheckInterval
@@ -57,12 +59,105 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
 
     var canCheckForUpdates: Bool {
-        updaterController != nil
+        guard let updaterController else {
+            return false
+        }
+
+        return !updaterStarted || updaterController.updater.canCheckForUpdates
     }
 
     func checkForUpdates() {
         AppLog.app.info("Manual update check requested")
+        startUpdater()
         updaterController?.checkForUpdates(nil)
+    }
+
+    private func startUpdater() {
+        guard !updaterStarted, let updaterController else {
+            return
+        }
+
+        updaterController.updater.automaticallyChecksForUpdates = true
+        updaterController.updater.updateCheckInterval = Self.updateCheckInterval
+
+        do {
+            try updaterController.updater.start()
+            updaterStarted = true
+            AppLog.app.info("Sparkle updater started")
+
+            if updaterController.updater.automaticallyChecksForUpdates {
+                updaterController.updater.checkForUpdatesInBackground()
+            }
+        } catch {
+            AppLog.app.error("Sparkle updater failed to start error=\(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    var supportsGentleScheduledUpdateReminders: Bool {
+        true
+    }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem,
+        andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        immediateFocus
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool,
+        forUpdate update: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        guard !state.userInitiated else {
+            AppLog.app.info("Sparkle update shown from manual check")
+            return
+        }
+
+        if handleShowingUpdate {
+            focusApplicationForUpdate()
+            AppLog.app.info("Sparkle scheduled update shown in focus")
+        } else {
+            presentScheduledUpdateInFocus()
+        }
+    }
+
+    func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
+        focusingScheduledUpdate = false
+    }
+
+    func standardUserDriverWillFinishUpdateSession() {
+        focusingScheduledUpdate = false
+    }
+
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        AppLog.app.info("Sparkle found update version=\(item.versionString, privacy: .public)")
+    }
+
+    private func presentScheduledUpdateInFocus() {
+        guard !focusingScheduledUpdate else {
+            return
+        }
+
+        focusingScheduledUpdate = true
+        AppLog.app.info("Sparkle scheduled update found; bringing update prompt to front")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.focusApplicationForUpdate()
+            self.updaterController?.checkForUpdates(nil)
+        }
+    }
+
+    private func focusApplicationForUpdate() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        for window in NSApp.windows where window.isVisible {
+            window.orderFrontRegardless()
+        }
     }
 }
 
