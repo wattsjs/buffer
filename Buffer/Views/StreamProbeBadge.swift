@@ -19,20 +19,25 @@ struct StreamProbeBadge: View {
     var body: some View {
         // Touch `version` so SwiftUI re-renders when probe state changes.
         let _ = service.version
-        if probesEnabled, let probe = service.probe(for: channelID) {
+        if let probe = service.probe(for: channelID),
+           probesEnabled || probe.streamHealth.hasEvents {
             content(for: probe)
         }
     }
 
     @ViewBuilder
     private func content(for probe: StreamProbe) -> some View {
-        switch probe.status {
-        case .ok:
-            okBadge(probe)
-        case .offline, .timedOut, .error:
-            statusBadge(symbol: "exclamationmark.triangle.fill", tint: .orange, text: shortStatusText(probe))
-        case .unsupported:
-            statusBadge(symbol: "questionmark.circle.fill", tint: .secondary, text: "no streams")
+        if probe.streamHealth.isUnstable {
+            statusBadge(symbol: "exclamationmark.triangle.fill", tint: .orange, text: "unstable")
+        } else if probesEnabled {
+            switch probe.status {
+            case .ok:
+                okBadge(probe)
+            case .offline, .timedOut, .error:
+                statusBadge(symbol: "exclamationmark.triangle.fill", tint: .orange, text: shortStatusText(probe))
+            case .unsupported:
+                statusBadge(symbol: "questionmark.circle.fill", tint: .secondary, text: "no streams")
+            }
         }
     }
 
@@ -49,7 +54,9 @@ struct StreamProbeBadge: View {
     private func okBadge(_ probe: StreamProbe) -> some View {
         switch style {
         case .compact:
-            compactPill(text: compactMetricsLabel(probe), audioOnly: probe.audioOnly)
+            if !compactMetricsLabel(probe).isEmpty {
+                compactPill(text: compactMetricsLabel(probe), audioOnly: probe.audioOnly)
+            }
         case .compactMetrics:
             if !compactMetricsLabel(probe).isEmpty {
                 compactPill(text: compactMetricsLabel(probe), audioOnly: probe.audioOnly)

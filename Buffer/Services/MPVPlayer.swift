@@ -26,6 +26,19 @@ enum MPVEndReason: Equatable, Sendable {
     case error(code: Int32, message: String)
 }
 
+enum MPVStreamIssue: Equatable, Sendable {
+    case httpError(String)
+    case hlsReloadFailed(String)
+    case reconnecting(String)
+
+    var recoveryMessage: String {
+        switch self {
+        case .httpError(let message), .hlsReloadFailed(let message), .reconnecting(let message):
+            message
+        }
+    }
+}
+
 struct MPVMediaInfo: Equatable, Sendable {
     var width: Int = 0
     var height: Int = 0
@@ -179,6 +192,10 @@ final class MPVPlayer {
     /// Owners use this to reset recovery watchdog state from "loading" to
     /// "waiting for first playback progress".
     var onFileLoaded: (() -> Void)?
+    /// Emitted for mpv network/HLS warnings that do not always terminate
+    /// playback. Owners can use this as a liveness signal when mpv sits in its
+    /// own reconnect loop without delivering `MPV_EVENT_END_FILE`.
+    var onStreamIssue: ((MPVStreamIssue) -> Void)?
 
     /// True if we have no rewind window, or playback is within a few seconds of
     /// the live edge. Streams without a DVR window are considered always-live.
@@ -802,6 +819,10 @@ final class MPVPlayer {
         mpvLogSuppression[message] = MPVLogSuppression(lastEmittedAt: now, suppressedCount: 0)
         let category = Self.streamQualityCategory(for: message)
         AppLog.playback.warning("mpv category=\(category, privacy: .public) \(message, privacy: .public)")
+
+        if let issue = Self.streamIssue(for: message) {
+            onStreamIssue?(issue)
+        }
     }
 
     private static func sanitizedMPVLogMessage(_ rawMessage: String) -> String {
@@ -824,6 +845,20 @@ final class MPVPlayer {
             options: .regularExpression
         )
         return message
+    }
+
+    private static func streamIssue(for message: String) -> MPVStreamIssue? {
+        let lowercased = message.lowercased()
+        if lowercased.contains("failed to reload playlist") {
+            return .hlsReloadFailed(message)
+        }
+        if lowercased.contains("http error") || lowercased.contains("server returned") {
+            return .httpError(message)
+        }
+        if lowercased.contains("will reconnect") {
+            return .reconnecting(message)
+        }
+        return nil
     }
 
     private static func streamQualityCategory(for message: String) -> String {

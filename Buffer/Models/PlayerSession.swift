@@ -76,6 +76,9 @@ final class PlayerSlot: Identifiable {
         new.onFileLoaded = { [weak self] in
             self?.handleFileLoaded()
         }
+        new.onStreamIssue = { [weak self] issue in
+            self?.handleStreamIssue(issue)
+        }
         new.onMediaInfoChanged = { [weak self] info in
             guard let self else { return }
             StreamProbeService.shared.recordPlaybackInfo(
@@ -115,6 +118,8 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var lastPlaybackProgressAt: Date?
     @ObservationIgnored private var expectedStoppedEndFiles: Int = 0
     @ObservationIgnored private var lastReconnectAt: Date?
+    @ObservationIgnored private var streamIssueWindowStart: Date?
+    @ObservationIgnored private var streamIssueCount: Int = 0
 
     /// After this long of continuous reconnect failures without a single
     /// successful `FILE_LOADED`, surface an error to the user. The reconnect
@@ -135,6 +140,8 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private let minimumImmediateReconnectSpacing: TimeInterval = 2
     @ObservationIgnored private let slowRetryFailureWindow: TimeInterval = 60
     @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
+    @ObservationIgnored private let streamIssueWindow: TimeInterval = 20
+    @ObservationIgnored private let repeatedStreamIssueThreshold: Int = 2
 
     fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
         switch reason {
@@ -164,6 +171,58 @@ final class PlayerSlot: Identifiable {
     private func handleFileLoaded() {
         lastObservedTimePos = player.timePos
         lastPlaybackProgressAt = Date()
+        streamIssueWindowStart = nil
+        streamIssueCount = 0
+    }
+
+    private func handleStreamIssue(_ issue: MPVStreamIssue) {
+        guard playbackMode == .live else { return }
+        if let event = streamHealthEvent(for: issue) {
+            StreamProbeService.shared.recordStreamHealthEvent(
+                channelID: channel.id,
+                event: event
+            )
+        }
+        guard reconnectTask == nil else { return }
+
+        let shouldRecover: Bool
+        switch issue {
+        case .hlsReloadFailed, .httpError:
+            shouldRecover = true
+        case .reconnecting:
+            shouldRecover = noteRepeatedStreamIssue()
+        }
+
+        guard shouldRecover else { return }
+
+        let reason = MPVEndReason.error(
+            code: 0,
+            message: "stream network recovery: \(issue.recoveryMessage)"
+        )
+        scheduleReconnect(reason: reason, immediate: true)
+    }
+
+    private func streamHealthEvent(for issue: MPVStreamIssue) -> StreamHealthEvent? {
+        switch issue {
+        case .httpError(let message):
+            return message.contains("509") ? .http509 : nil
+        case .hlsReloadFailed:
+            return .playlistReloadFailure
+        case .reconnecting:
+            return .reconnect
+        }
+    }
+
+    private func noteRepeatedStreamIssue() -> Bool {
+        let now = Date()
+        if let windowStart = streamIssueWindowStart,
+           now.timeIntervalSince(windowStart) <= streamIssueWindow {
+            streamIssueCount += 1
+        } else {
+            streamIssueWindowStart = now
+            streamIssueCount = 1
+        }
+        return streamIssueCount >= repeatedStreamIssueThreshold
     }
 
     private func scheduleReconnect(reason: MPVEndReason, immediate: Bool = false) {
@@ -226,6 +285,10 @@ final class PlayerSlot: Identifiable {
     private func performReconnect() {
         guard playbackMode == .live else { return }
         AppLog.playback.info("Performing reconnect channel=\(self.channel.name, privacy: .public)")
+        StreamProbeService.shared.recordStreamHealthEvent(
+            channelID: channel.id,
+            event: .recoveryReload
+        )
         lastReconnectAt = Date()
         reconnectTask = nil
         stopRecoveryTasks(resetFailureWindow: false)
@@ -325,6 +388,9 @@ final class PlayerSlot: Identifiable {
             firstFailureAt = nil
             lastReconnectAt = nil
         }
+
+        streamIssueWindowStart = nil
+        streamIssueCount = 0
     }
 
     private func noteExpectedStopIfReplacingCurrentItem() {
