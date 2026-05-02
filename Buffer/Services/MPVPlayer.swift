@@ -24,6 +24,18 @@ enum MPVEndReason: Equatable, Sendable {
     case eof
     /// An mpv error code (see `mpv_error_string`).
     case error(code: Int32, message: String)
+    /// HTTP 509 Bandwidth Limit Exceeded — provider is throttling.
+    /// Treated separately from generic errors because the recovery strategy
+    /// is fundamentally different: back off much longer, stop other streams
+    /// if account-level, and never retry at the segment-fetch level.
+    case http509(message: String)
+
+    var isRecoverable: Bool {
+        switch self {
+        case .stopped: return false
+        case .eof, .error, .http509: return true
+        }
+    }
 }
 
 enum MPVStreamIssue: Equatable, Sendable {
@@ -144,10 +156,15 @@ final class MPVPlayer {
                 "reconnect=1",
                 "reconnect_streamed=1",
                 "reconnect_on_network_error=1",
-                "reconnect_on_http_error=5xx,429",
-                "reconnect_delay_max=5",
-                "reconnect_max_retries=3",
-                "reconnect_delay_total_max=12",
+                // Explicit status codes only — exclude 509 (Bandwidth Limit
+                // Exceeded). 509 is account-level rate limiting: retrying
+                // at the segment-fetch level adds to the bandwidth that
+                // already exceeded the cap. Let it surface immediately so
+                // PlayerSlot can apply a long, coordinated backoff.
+                "reconnect_on_http_error=429,502,503,504",
+                "reconnect_delay_max=3",
+                "reconnect_max_retries=2",
+                "reconnect_delay_total_max=6",
                 "respect_retry_after=0",
                 "rw_timeout=10000000",
             ].joined(separator: ",")
@@ -255,6 +272,7 @@ final class MPVPlayer {
     @ObservationIgnored private var autoPausedForCacheFloor = false
     private var defaultsObserver: NSObjectProtocol?
     private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
+    @ObservationIgnored private var lastHTTPStatusCode: Int = 0
 
     init() {
         setupMPV()
@@ -814,13 +832,24 @@ final class MPVPlayer {
         case MPV_END_FILE_REASON_EOF:
             endReason = .eof
         case MPV_END_FILE_REASON_ERROR:
-            let message = event.error < 0
-                ? String(cString: mpv_error_string(event.error))
-                : "unknown playback error"
-            endReason = .error(code: event.error, message: message)
+            // Check if the preceding log messages indicated a 509.
+            // Since we excluded 509 from reconnect_on_http_error,
+            // it surfaces here immediately instead of after retries.
+            if lastHTTPStatusCode == 509 {
+                let message = event.error < 0
+                    ? String(cString: mpv_error_string(event.error))
+                    : "unknown playback error"
+                endReason = .http509(message: "HTTP 509: \(message)")
+            } else {
+                let message = event.error < 0
+                    ? String(cString: mpv_error_string(event.error))
+                    : "unknown playback error"
+                endReason = .error(code: event.error, message: message)
+            }
         default:
             endReason = .stopped
         }
+        lastHTTPStatusCode = 0
         AppLog.playback.info("mpv end-file reason=\(String(describing: endReason), privacy: .public)")
 
         // If an owner has installed a recovery handler, let it decide what
@@ -833,13 +862,24 @@ final class MPVPlayer {
 
         // Legacy path for callers that don't handle reconnect themselves
         // (e.g. RecordingPlayback): surface errors directly.
-        if case .error(_, let message) = endReason {
+        switch endReason {
+        case .error(_, let message):
             errorMessage = "Playback failed: \(message)"
+        case .http509(let message):
+            errorMessage = "Bandwidth limit: \(message)"
+        case .eof, .stopped:
+            break
         }
     }
 
     private func emitMPVLog(_ rawMessage: String) {
         let message = Self.sanitizedMPVLogMessage(rawMessage)
+        // Track the last HTTP status code so handleEndFileEvent can
+        // distinguish 509 from transient errors.
+        if let code = Self.extractHTTPStatusCode(message) {
+            lastHTTPStatusCode = code
+        }
+
         guard !message.isEmpty else { return }
 
         let now = Date()
@@ -862,6 +902,26 @@ final class MPVPlayer {
         if let issue = Self.streamIssue(for: message) {
             onStreamIssue?(issue)
         }
+    }
+
+    /// Extracts an HTTP status code from an mpv log message. Matches patterns
+    /// like "HTTP error 509", "Server returned 5XX", "HTTP 429".
+    private static func extractHTTPStatusCode(_ message: String) -> Int? {
+        // ffmpeg formats: "HTTP error 509 Not Found" or "Server returned 5XX ..."
+        let patterns = [
+            try! NSRegularExpression(pattern: #"HTTP error (\d{3})"#, options: .caseInsensitive),
+            try! NSRegularExpression(pattern: #"Server returned (\d{3})"#, options: .caseInsensitive),
+            try! NSRegularExpression(pattern: #"HTTP (\d{3})"#, options: .caseInsensitive),
+        ]
+        for pattern in patterns {
+            if let match = pattern.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
+               match.numberOfRanges > 1,
+               let range = Range(match.range(at: 1), in: message),
+               let code = Int(message[range]) {
+                return code
+            }
+        }
+        return nil
     }
 
     private static func sanitizedMPVLogMessage(_ rawMessage: String) -> String {
@@ -931,6 +991,7 @@ final class MPVPlayer {
         containerFps = 0
         estimatedFps = 0
         mediaInfo = MPVMediaInfo()
+        lastHTTPStatusCode = 0
     }
 
     private func startCacheFloorTimer() {

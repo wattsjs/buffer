@@ -142,6 +142,15 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
     @ObservationIgnored private let streamIssueWindow: TimeInterval = 20
     @ObservationIgnored private let repeatedStreamIssueThreshold: Int = 2
+    @ObservationIgnored private let http509Count: Int = 0
+
+    // 509-specific backoff — much longer than transient errors.
+    // 509 means "Bandwidth Limit Exceeded" from the provider: retrying
+    // aggressively adds to the bandwidth that already exceeded the cap.
+    @ObservationIgnored private let http509BaseDelay: TimeInterval = 30
+    @ObservationIgnored private let http509MaxDelay: TimeInterval = 300
+    @ObservationIgnored private let http509MaxRetries: Int = 3
+    @ObservationIgnored private let http509ImmediateSpacing: TimeInterval = 15
 
     fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
         switch reason {
@@ -153,14 +162,19 @@ final class PlayerSlot: Identifiable {
             }
             cancelReconnect()
             return
-        case .eof, .error:
+        case .eof, .error, .http509:
             break
         }
 
         guard playbackMode == .live else {
             cancelReconnect()
-            if case .error(_, let message) = reason {
+            switch reason {
+            case .error(_, let message):
                 player.setReconnectingErrorMessage("Playback failed: \(message)")
+            case .http509(let message):
+                player.setReconnectingErrorMessage("Bandwidth limit — stream paused: \(message)")
+            case .eof, .stopped:
+                break
             }
             return
         }
@@ -226,10 +240,12 @@ final class PlayerSlot: Identifiable {
     }
 
     private func scheduleReconnect(reason: MPVEndReason, immediate: Bool = false) {
-        AppLog.playback.warning("Scheduling reconnect channel=\(self.channel.name, privacy: .public) reason=\(String(describing: reason), privacy: .public) immediate=\(immediate, privacy: .public) attempt=\(self.reconnectAttempt, privacy: .public)")
+        let is509 = if case .http509 = reason { true } else { false }
+        AppLog.playback.warning("Scheduling reconnect channel=\(self.channel.name, privacy: .public) is509=\(is509, privacy: .public) reason=\(String(describing: reason), privacy: .public) immediate=\(immediate, privacy: .public) attempt=\(self.reconnectAttempt, privacy: .public)")
+
         // Mark the start of a failure streak so we know when to give up
-        // visibly. `firstFailureAt` is cleared on every successful playback
-        // beyond `healthyPlaybackSeconds`.
+        // visibly.  is cleared on every successful playback
+        // beyond .
         if firstFailureAt == nil {
             firstFailureAt = Date()
         }
@@ -237,9 +253,28 @@ final class PlayerSlot: Identifiable {
         let attempt = reconnectAttempt
         reconnectAttempt += 1
 
-        // 0.25s, 0.5s, 1s, 2s, 4s, then capped at 5s. The first retry is
-        // snappy so a single bad segment barely blips; later retries
-        // breathe so we don't hammer a dead upstream.
+        // 509 has its own backoff tier — much longer delays because retrying
+        // adds to the bandwidth that already exceeded the cap.
+        if is509 {
+            // Max 3 retries for 509, then give up permanently.
+            guard attempt < http509MaxRetries else {
+                player.setReconnectingErrorMessage("Bandwidth limit — giving up after \(http509MaxRetries) attempts.")
+                reconnectTask?.cancel()
+                reconnectTask = nil
+                return
+            }
+
+            let delay = min(http509BaseDelay * pow(2.0, Double(attempt)), http509MaxDelay)
+            player.setReconnectingErrorMessage("Bandwidth limit — retrying in \(Int(delay))s…")
+            reconnectTask?.cancel()
+            reconnectTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled, let self else { return }
+                self.performReconnect()
+            }
+            return
+        }
+
         let failureAge = firstFailureAt.map { Date().timeIntervalSince($0) } ?? 0
         let shouldSurfaceError = failureAge >= fatalReconnectWindow
         let shouldSlowRetry = failureAge >= slowRetryFailureWindow
@@ -262,7 +297,7 @@ final class PlayerSlot: Identifiable {
                 player.setReconnectingErrorMessage("Stream offline — retrying in background.")
             case .error(_, let message):
                 player.setReconnectingErrorMessage("Stream offline — retrying in background. (\(message))")
-            case .stopped:
+            case .stopped, .http509:
                 break
             }
         }
