@@ -99,6 +99,12 @@ final class RecordingPlayback {
             } else {
                 player.setReconnectingErrorMessage("Playback failed: \(message)")
             }
+        case .http509(let message):
+            if isInProgress {
+                scheduleReload()
+            } else {
+                player.setReconnectingErrorMessage("Bandwidth limit — stream paused: \(message)")
+            }
         case .stopped:
             break
         }
