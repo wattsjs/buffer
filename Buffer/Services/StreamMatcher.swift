@@ -3,7 +3,7 @@ import Foundation
 /// Pre-built, lowercased search data for a single channel.
 /// Built once when channels/programs change. Stored as a flat struct
 /// to minimize copy overhead when iterating.
-nonisolated struct ChannelSearchIndex: Sendable {
+nonisolated struct ChannelSearchIndex: Sendable, Codable {
     let channel: Channel
     let nameLower: String
     let nameWords: ContiguousArray<String>
@@ -17,7 +17,7 @@ nonisolated struct ChannelSearchIndex: Sendable {
     /// Only programs within a ±48h window are kept.
     let epgTitles: ContiguousArray<EPGTitle>
 
-    struct EPGTitle: Sendable {
+    struct EPGTitle: Sendable, Codable {
         let title: String       // original casing for display
         let description: String // original casing, trimmed for display
         let titleLower: ContiguousArray<UInt8>  // UTF-8 bytes for fast search
@@ -28,22 +28,91 @@ nonisolated struct ChannelSearchIndex: Sendable {
         let descCompact: String
         let start: Date
         let end: Date
+
+        private enum CodingKeys: String, CodingKey {
+            case title
+            case description
+            case titleLower
+            case descLower
+            case titleWords
+            case descWords
+            case titleCompact
+            case descCompact
+            case start
+            case end
+        }
+
+        init(
+            title: String,
+            description: String,
+            titleLower: ContiguousArray<UInt8>,
+            descLower: ContiguousArray<UInt8>,
+            titleWords: ContiguousArray<String>,
+            descWords: ContiguousArray<String>,
+            titleCompact: String,
+            descCompact: String,
+            start: Date,
+            end: Date
+        ) {
+            self.title = title
+            self.description = description
+            self.titleLower = titleLower
+            self.descLower = descLower
+            self.titleWords = titleWords
+            self.descWords = descWords
+            self.titleCompact = titleCompact
+            self.descCompact = descCompact
+            self.start = start
+            self.end = end
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            title = try container.decode(String.self, forKey: .title)
+            description = try container.decode(String.self, forKey: .description)
+            titleLower = ContiguousArray(try container.decode(Data.self, forKey: .titleLower))
+            descLower = ContiguousArray(try container.decode(Data.self, forKey: .descLower))
+            titleWords = ContiguousArray(try container.decode([String].self, forKey: .titleWords))
+            descWords = ContiguousArray(try container.decode([String].self, forKey: .descWords))
+            titleCompact = try container.decode(String.self, forKey: .titleCompact)
+            descCompact = try container.decode(String.self, forKey: .descCompact)
+            start = try container.decode(Date.self, forKey: .start)
+            end = try container.decode(Date.self, forKey: .end)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(title, forKey: .title)
+            try container.encode(description, forKey: .description)
+            try container.encode(Data(titleLower), forKey: .titleLower)
+            try container.encode(Data(descLower), forKey: .descLower)
+            try container.encode(Array(titleWords), forKey: .titleWords)
+            try container.encode(Array(descWords), forKey: .descWords)
+            try container.encode(titleCompact, forKey: .titleCompact)
+            try container.encode(descCompact, forKey: .descCompact)
+            try container.encode(start, forKey: .start)
+            try container.encode(end, forKey: .end)
+        }
     }
 }
 
-nonisolated struct StreamSearchIndex: Sendable {
+nonisolated struct StreamSearchIndex: Sendable, Codable {
     let entries: [ChannelSearchIndex]
     let tokenToEntryIndices: [String: ContiguousArray<Int>]
     let inverseDocumentFrequency: [String: Double]
     let programKeyCount: Int
     let epgTitleCount: Int
+    let earliestProgramStart: Date?
+    let latestProgramEnd: Date?
 
     static let empty = StreamSearchIndex(
         entries: [],
         tokenToEntryIndices: [:],
         inverseDocumentFrequency: [:],
         programKeyCount: 0,
-        epgTitleCount: 0
+        epgTitleCount: 0,
+        earliestProgramStart: nil,
+        latestProgramEnd: nil
     )
 }
 
@@ -139,7 +208,20 @@ nonisolated enum StreamMatcher {
             )
         }
 
-        let epgTitleCount = entries.reduce(0) { $0 + $1.epgTitles.count }
+        var epgTitleCount = 0
+        var earliestProgramStart: Date?
+        var latestProgramEnd: Date?
+        for entry in entries {
+            epgTitleCount += entry.epgTitles.count
+            for epg in entry.epgTitles {
+                if earliestProgramStart == nil || epg.start < earliestProgramStart! {
+                    earliestProgramStart = epg.start
+                }
+                if latestProgramEnd == nil || epg.end > latestProgramEnd! {
+                    latestProgramEnd = epg.end
+                }
+            }
+        }
         let inverted = buildInvertedIndex(for: entries)
         return StreamSearchIndex(
             entries: entries,
@@ -149,7 +231,9 @@ nonisolated enum StreamMatcher {
                 documentCount: entries.count
             ),
             programKeyCount: programs.count,
-            epgTitleCount: epgTitleCount
+            epgTitleCount: epgTitleCount,
+            earliestProgramStart: earliestProgramStart,
+            latestProgramEnd: latestProgramEnd
         )
     }
 

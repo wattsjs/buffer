@@ -17,6 +17,12 @@ nonisolated enum DataCache {
         let probes: [String: StreamProbe]
     }
 
+    struct CachedStreamSearchIndex: Codable, Sendable {
+        let savedAt: Date
+        let fingerprint: String
+        let index: StreamSearchIndex
+    }
+
     nonisolated private static func cacheDirectory() -> URL? {
         let fm = FileManager.default
         guard let base = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else {
@@ -67,6 +73,10 @@ nonisolated enum DataCache {
         cacheDirectory()?.appendingPathComponent("probes_\(key).json")
     }
 
+    nonisolated private static func streamSearchIndexURL(for key: String) -> URL? {
+        cacheDirectory()?.appendingPathComponent("sports_index_\(key).plist")
+    }
+
     // MARK: - Channels
 
     nonisolated static func loadChannels(key: String) -> CachedChannels? {
@@ -114,6 +124,122 @@ nonisolated enum DataCache {
             try? data.write(to: url, options: .atomic)
         }
     }
+
+    // MARK: - Sports stream search index
+
+    nonisolated static func streamSearchIndexFingerprint(
+        channels: [Channel],
+        programs: [String: [EPGProgram]],
+        hiddenGroups: Set<String>
+    ) -> String {
+        var hasher = SHA256()
+
+        func update(_ value: String) {
+            hasher.update(data: Data(value.utf8))
+            hasher.update(data: Data([0]))
+        }
+
+        update("sports-index-v1")
+        update(String(channels.count))
+        for channel in channels.sorted(by: { $0.id < $1.id }) {
+            update(channel.id)
+            update(channel.name)
+            update(channel.group)
+            update(channel.epgChannelID ?? "")
+        }
+
+        update(String(hiddenGroups.count))
+        for group in hiddenGroups.sorted() {
+            update(group)
+        }
+
+        update(String(programs.count))
+        for key in programs.keys.sorted() {
+            update(key)
+            let list = programs[key] ?? []
+            update(String(list.count))
+            for program in list {
+                update(program.id)
+                update(program.channelID)
+                update(String(program.start.timeIntervalSince1970))
+                update(String(program.end.timeIntervalSince1970))
+                update(program.title)
+                update(program.description)
+            }
+        }
+
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func loadStreamSearchIndex(
+        key: String,
+        fingerprint: String,
+        maxAge: TimeInterval = 6 * 3600,
+        now: Date = Date()
+    ) -> StreamSearchIndex? {
+        purgeExpiredStreamSearchIndexCaches(now: now)
+
+        guard let url = streamSearchIndexURL(for: key),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let payload = try? PropertyListDecoder.cacheDecoder.decode(
+                CachedStreamSearchIndex.self,
+                from: data
+              ),
+              payload.fingerprint == fingerprint,
+              now.timeIntervalSince(payload.savedAt) <= maxAge,
+              let latestEnd = payload.index.latestProgramEnd,
+              latestEnd > now.addingTimeInterval(-3600),
+              !payload.index.entries.isEmpty,
+              payload.index.epgTitleCount > 0
+        else {
+            return nil
+        }
+
+        return payload.index
+    }
+
+    nonisolated static func saveStreamSearchIndex(
+        _ index: StreamSearchIndex,
+        key: String,
+        fingerprint: String
+    ) {
+        guard let url = streamSearchIndexURL(for: key),
+              !index.entries.isEmpty,
+              index.epgTitleCount > 0
+        else { return }
+
+        let payload = CachedStreamSearchIndex(
+            savedAt: Date(),
+            fingerprint: fingerprint,
+            index: index
+        )
+        if let data = try? PropertyListEncoder.cacheEncoder.encode(payload) {
+            try? data.write(to: url, options: .atomic)
+        }
+        purgeExpiredStreamSearchIndexCaches()
+    }
+
+    nonisolated static func purgeExpiredStreamSearchIndexCaches(
+        olderThan maxAge: TimeInterval = 24 * 3600,
+        now: Date = Date()
+    ) {
+        guard let dir = cacheDirectory(),
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+              )
+        else { return }
+
+        for url in files where url.lastPathComponent.hasPrefix("sports_index_") {
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            let modified = values?.contentModificationDate ?? .distantPast
+            if now.timeIntervalSince(modified) > maxAge {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
 }
 
 private extension JSONEncoder {
@@ -130,4 +256,16 @@ private extension JSONDecoder {
         d.dateDecodingStrategy = .secondsSince1970
         return d
     }()
+}
+
+private extension PropertyListEncoder {
+    nonisolated static let cacheEncoder: PropertyListEncoder = {
+        let e = PropertyListEncoder()
+        e.outputFormat = .binary
+        return e
+    }()
+}
+
+private extension PropertyListDecoder {
+    nonisolated static let cacheDecoder = PropertyListDecoder()
 }

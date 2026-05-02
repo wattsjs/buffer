@@ -29,7 +29,7 @@ struct ContentView: View {
 
     private func openChannel(_ channel: Channel) {
         viewModel.addRecent(channel)
-        updateSportsMatchingContext()
+        updateSportsMatchingPreferences()
         if selectedPlayer != .none {
             AppLog.playback.info("Opening channel externally name=\(channel.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
             ExternalPlayer.launch(streamURL: channel.streamURL, using: selectedPlayer)
@@ -46,7 +46,16 @@ struct ContentView: View {
             favoriteChannelIDs: viewModel.favoriteChannelIDs,
             channelPreferenceScores: viewModel.channelPreferenceScores,
             groupPreferenceScores: viewModel.groupPreferenceScores,
-            hiddenGroups: viewModel.hiddenGroupNames
+            hiddenGroups: viewModel.hiddenGroupNames,
+            cacheKey: viewModel.activePlaylist.map(DataCache.cacheKey(for:))
+        )
+    }
+
+    private func updateSportsMatchingPreferences() {
+        sportsViewModel.updateStreamMatchingPreferences(
+            favoriteChannelIDs: viewModel.favoriteChannelIDs,
+            channelPreferenceScores: viewModel.channelPreferenceScores,
+            groupPreferenceScores: viewModel.groupPreferenceScores
         )
     }
 
@@ -303,10 +312,10 @@ struct ContentView: View {
             updateSportsMatchingContext()
         }
         .onChange(of: viewModel.favoriteChannelIDs) { _, _ in
-            updateSportsMatchingContext()
+            updateSportsMatchingPreferences()
         }
         .onChange(of: viewModel.recentChannelIDs) { _, _ in
-            updateSportsMatchingContext()
+            updateSportsMatchingPreferences()
         }
         .onChange(of: viewModel.hiddenGroupNames) { _, _ in
             updateSportsMatchingContext()
