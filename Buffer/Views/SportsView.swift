@@ -241,6 +241,7 @@ private struct SportEventCard: View {
     @State private var matches: [StreamMatch]?
     @State private var matchUnavailableMessage: String?
     @State private var isMatching = false
+    @State private var lastIndexVersion: Int = 0
     @State private var notificationManager = NotificationManager.shared
     @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
 
@@ -398,24 +399,12 @@ private struct SportEventCard: View {
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
         .onTapGesture {
-            if let matches, !matches.isEmpty {
-                showStreams = true
-            } else if let message = viewModel.streamIndexUnavailableMessage {
-                matches = []
-                matchUnavailableMessage = message
-                showStreams = true
-            } else {
-                isMatching = true
-                Task {
-                    let result = await viewModel.matchEvent(event)
-                    isMatching = false
-                    matches = result
-                    matchUnavailableMessage = nil
-                    if !result.isEmpty {
-                        showStreams = true
-                    }
-                }
-            }
+            handleTap()
+        }
+        .onChange(of: viewModel.searchIndexVersion) { _, newVersion in
+            guard showStreams, newVersion != lastIndexVersion else { return }
+            lastIndexVersion = newVersion
+            rematchIfNeeded()
         }
         .popover(isPresented: $showStreams, arrowEdge: .trailing) {
             StreamMatchesPopover(
@@ -536,6 +525,46 @@ private struct SportEventCard: View {
         }
         f.dateFormat = "EEE h:mma"
         return f.string(from: date)
+    }
+
+    // MARK: - Matching
+
+    private func handleTap() {
+        if let matches, !matches.isEmpty {
+            showStreams = true
+            return
+        }
+        if let message = viewModel.streamIndexUnavailableMessage {
+            matches = []
+            matchUnavailableMessage = message
+            showStreams = true
+            return
+        }
+        isMatching = true
+        Task {
+            let result = await viewModel.matchEvent(event)
+            isMatching = false
+            matches = result
+            matchUnavailableMessage = result.isEmpty ? viewModel.streamIndexUnavailableMessage : nil
+            if !result.isEmpty || matchUnavailableMessage != nil {
+                showStreams = true
+            }
+        }
+        lastIndexVersion = viewModel.searchIndexVersion
+    }
+
+    /// Rematch while the popover is open, e.g. when the index transitions
+    /// from building to ready.
+    private func rematchIfNeeded() {
+        guard !isMatching else { return }
+        if let matches, !matches.isEmpty { return }
+        isMatching = true
+        Task {
+            let result = await viewModel.matchEvent(event)
+            isMatching = false
+            matches = result
+            matchUnavailableMessage = result.isEmpty ? viewModel.streamIndexUnavailableMessage : nil
+        }
     }
 }
 
