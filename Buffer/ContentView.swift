@@ -317,6 +317,7 @@ struct ContentView: View {
                 programs: viewModel.searchEntries,
                 channels: viewModel.channels
             )
+            updateSportsMatchingContext()
         }
         .onChange(of: viewModel.selection) { oldValue, newValue in
             handleSidebarSelectionChange(from: oldValue, to: newValue)
