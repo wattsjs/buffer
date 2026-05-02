@@ -71,6 +71,7 @@ struct PlayerView: View {
     @State private var chromeHideTask: Task<Void, Never>?
     @State private var showVolumePopover = false
     @State private var showChannelPicker = false
+    @State private var showStatsForNerds = false
 
     /// Recording-mode primary scrub position override while the user drags
     /// the bottom scrubber. Also reused by channel mode's HLS-seekbar.
@@ -263,7 +264,6 @@ struct PlayerView: View {
             if showChrome && !isMulti {
                 mediaInfoCard
                     .padding(16)
-                    .allowsHitTesting(false)
                     .transition(.opacity)
             }
         }
@@ -1105,7 +1105,19 @@ struct PlayerView: View {
         let hasAny = info.width > 0 || info.fps > 0 || !info.videoCodec.isEmpty
 
         if hasAny {
-            Group {
+            VStack(alignment: .trailing, spacing: 8) {
+                if showStatsForNerds {
+                    statsForNerdsPanel(info)
+                        .transition(.asymmetric(
+                            insertion: .opacity
+                                .combined(with: .move(edge: .bottom))
+                                .combined(with: .scale(scale: 0.96, anchor: .bottomTrailing)),
+                            removal: .opacity
+                                .combined(with: .scale(scale: 0.98, anchor: .bottomTrailing))
+                        ))
+                        .zIndex(1)
+                }
+
                 switch chromeState.mediaInfoDisplay {
                 case .expanded:
                     expandedMediaInfo(info)
@@ -1115,22 +1127,15 @@ struct PlayerView: View {
             }
             .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottomTrailing)))
             .animation(.easeInOut(duration: 0.18), value: chromeState.mediaInfoDisplay)
+            .animation(.easeInOut(duration: 0.18), value: showStatsForNerds)
         }
     }
 
     @ViewBuilder
     private func expandedMediaInfo(_ info: MPVMediaInfo) -> some View {
-        VStack(alignment: .trailing, spacing: 4) {
-            if !info.resolutionLabel.isEmpty {
-                Text(info.resolutionLabel)
-                    .font(.headline)
-                    .foregroundStyle(.white)
-            }
-            if !info.fpsLabel.isEmpty {
-                Text(info.fpsLabel)
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.75))
-            }
+        VStack(alignment: .trailing, spacing: 6) {
+            mediaInfoSummaryRow(info, prominent: true)
+
             if !info.videoCodec.isEmpty {
                 Text(info.videoCodec.uppercased())
                     .font(.caption2.weight(.semibold))
@@ -1156,19 +1161,115 @@ struct PlayerView: View {
 
     @ViewBuilder
     private func collapsedMediaInfo(_ info: MPVMediaInfo) -> some View {
+        mediaInfoSummaryRow(info, prominent: false)
+    }
+
+    @ViewBuilder
+    private func mediaInfoSummaryRow(_ info: MPVMediaInfo, prominent: Bool) -> some View {
         let bits = [
             info.resolutionLabel,
             info.fps > 0 ? "\(Int(info.fps.rounded(.up)))fps" : "",
         ].filter { !$0.isEmpty }
 
         if !bits.isEmpty {
-            Text(bits.joined(separator: " · "))
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.9))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .chromeSurface(in: Capsule())
+            HStack(spacing: 6) {
+                Text(bits.joined(separator: " · "))
+                    .font(prominent ? .headline : .caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(prominent ? 1 : 0.9))
+                    .monospacedDigit()
+
+                Button {
+                    withAnimation(.spring(duration: 0.24, bounce: 0.18)) {
+                        showStatsForNerds.toggle()
+                    }
+                    if showStatsForNerds {
+                        chromeHideTask?.cancel()
+                        showChrome = true
+                    } else {
+                        scheduleChromeHide()
+                    }
+                } label: {
+                    Image(systemName: showStatsForNerds ? "chart.bar.doc.horizontal.fill" : "chart.bar.doc.horizontal")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(showStatsForNerds ? Color.accentColor : .white.opacity(0.8))
+                .help(showStatsForNerds ? "Hide stats for nerds" : "Show stats for nerds")
+                .animation(.easeInOut(duration: 0.14), value: showStatsForNerds)
+            }
+            .padding(.horizontal, prominent ? 10 : 12)
+            .padding(.vertical, prominent ? 7 : 6)
+            .chromeSurface(in: Capsule())
         }
+    }
+
+    @ViewBuilder
+    private func statsForNerdsPanel(_ info: MPVMediaInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Stats for Nerds")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+
+            VStack(spacing: 5) {
+                statsRow("Resolution", info.resolutionLabel)
+                statsRow("Frame rate", info.fps > 0 ? String(format: "%.2f fps", info.fps) : "")
+                statsRow("Video codec", info.videoCodec.uppercased())
+                statsRow("Audio", audioStatsLabel(info))
+                statsRow("Hardware decode", info.hwdec.isEmpty ? "" : info.hwdec)
+                statsRow("Cache", String(format: "%.1fs", player.cacheSeconds))
+                statsRow("Live latency", info.liveLatencySeconds.map { String(format: "%.1fs", $0) } ?? "")
+                statsRow("Position", playbackPositionLabel)
+                statsRow("Volume", "\(Int(player.volume.rounded()))%\(player.isMuted ? " muted" : "")")
+            }
+        }
+        .padding(12)
+        .frame(width: 250, alignment: .leading)
+        .chromeSurface(in: RoundedRectangle(cornerRadius: 12, style: .continuous), fill: Color.black.opacity(0.68))
+    }
+
+    @ViewBuilder
+    private func statsRow(_ label: String, _ value: String) -> some View {
+        if !value.isEmpty {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.55))
+                    .frame(width: 88, alignment: .leading)
+                Text(value)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.88))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+    }
+
+    private func audioStatsLabel(_ info: MPVMediaInfo) -> String {
+        let parts = [
+            info.audioCodec.isEmpty ? "" : info.audioCodec.uppercased(),
+            info.audioChannels > 0 ? "\(info.audioChannels)ch" : "",
+        ].filter { !$0.isEmpty }
+        return parts.joined(separator: " · ")
+    }
+
+    private var playbackPositionLabel: String {
+        if player.duration > 0 {
+            return "\(formatDuration(player.timePos)) / \(formatDuration(player.duration))"
+        }
+        return formatDuration(player.timePos)
+    }
+
+    private func formatDuration(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "0:00" }
+        let total = Int(seconds.rounded())
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+        return String(format: "%d:%02d", minutes, secs)
     }
 
     @ViewBuilder
@@ -1199,6 +1300,10 @@ struct PlayerView: View {
     private func scheduleChromeHide() {
         chromeHideTask?.cancel()
         guard player.errorMessage == nil else {
+            showChrome = true
+            return
+        }
+        guard !showStatsForNerds else {
             showChrome = true
             return
         }

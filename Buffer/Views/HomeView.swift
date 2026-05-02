@@ -237,6 +237,7 @@ private struct HomeLiveEventCard: View {
     @State private var hovered = false
     @State private var showStreams = false
     @State private var matches: [StreamMatch]?
+    @State private var matchUnavailableMessage: String?
     @State private var isMatching = false
 
     private var tournamentSubtitle: String? {
@@ -305,12 +306,17 @@ private struct HomeLiveEventCard: View {
         .onTapGesture {
             if let matches, !matches.isEmpty {
                 showStreams = true
+            } else if let message = viewModel.streamIndexUnavailableMessage {
+                matches = []
+                matchUnavailableMessage = message
+                showStreams = true
             } else {
                 isMatching = true
                 Task {
                     let result = await viewModel.matchEvent(event)
                     isMatching = false
                     matches = result
+                    matchUnavailableMessage = nil
                     if !result.isEmpty {
                         showStreams = true
                     }
@@ -322,6 +328,7 @@ private struct HomeLiveEventCard: View {
                 event: event,
                 matches: matches ?? [],
                 favoriteIDs: viewModel.favoriteChannelIDs,
+                unavailableMessage: matchUnavailableMessage,
                 onChannelSelected: { channel in
                     showStreams = false
                     onChannelSelected(channel)
@@ -392,6 +399,7 @@ private struct HomeLiveStreamsPopover: View {
     let event: SportEvent
     let matches: [StreamMatch]
     let favoriteIDs: Set<String>
+    var unavailableMessage: String? = nil
     let onChannelSelected: (Channel) -> Void
 
     var body: some View {
@@ -399,6 +407,7 @@ private struct HomeLiveStreamsPopover: View {
             event: event,
             matches: matches,
             favoriteIDs: favoriteIDs,
+            unavailableMessage: unavailableMessage,
             onPlay: onChannelSelected
         )
     }

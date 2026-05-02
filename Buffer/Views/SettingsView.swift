@@ -961,14 +961,14 @@ private struct PlaybackSettingsTab: View {
                     step: 1
                 ) {
                     HStack {
-                        Text("Buffer length")
+                        Text("Minimum buffer")
                         Spacer()
                         Text("\(bufferSeconds) s")
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text("How many seconds mpv buffers ahead. Higher values reduce stutter but add more delay.")
+                Text("How many seconds Buffer keeps ahead before playback. Higher values reduce stutter but add more live delay.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

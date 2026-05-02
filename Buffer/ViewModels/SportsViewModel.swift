@@ -20,6 +20,7 @@ final class SportsViewModel {
     private(set) var hasLoadedOnce = false
     private(set) var lastRefreshed: Date?
     private(set) var totalEvents: Int = 0
+    private(set) var isStreamIndexBuilding = false
 
     var selectedSports: Set<Sport> = [] { didSet { rebuildSections() } }
     var hideFinished = false { didSet { rebuildSections() } }
@@ -30,15 +31,32 @@ final class SportsViewModel {
     private let espn = ESPNClient()
     private var refreshTask: Task<Void, Never>?
     private var autoRefreshTask: Task<Void, Never>?
+    private var indexBuildGeneration = 0
 
     // External data for stream matching — set by the view
     var channels: [Channel] = [] { didSet { rebuildIndexInBackground() } }
     var programs: [String: [EPGProgram]] = [:] { didSet { rebuildIndexInBackground() } }
     var favoriteChannelIDs: Set<String> = []
+    var channelPreferenceScores: [String: Double] = [:]
+    var groupPreferenceScores: [String: Double] = [:]
     var hiddenGroups: Set<String> = [] { didSet { rebuildIndexInBackground() } }
 
     /// Pre-built search index for on-demand matching.
-    private var searchIndex: [ChannelSearchIndex] = []
+    private var searchIndex = StreamSearchIndex.empty
+
+    var isStreamIndexReady: Bool {
+        !isStreamIndexBuilding && !searchIndex.entries.isEmpty
+    }
+
+    var streamIndexUnavailableMessage: String? {
+        if isStreamIndexBuilding {
+            return "Indexing channels and guide data…"
+        }
+        if searchIndex.entries.isEmpty {
+            return "Channel search index is not ready yet"
+        }
+        return nil
+    }
 
     // MARK: - Index building
 
@@ -46,10 +64,21 @@ final class SportsViewModel {
         let ch = channels
         let pr = programs
         let hidden = hiddenGroups
-        Task.detached(priority: .userInitiated) { [ch, pr, hidden] in
+        indexBuildGeneration &+= 1
+        let generation = indexBuildGeneration
+        isStreamIndexBuilding = !ch.isEmpty
+
+        if ch.isEmpty {
+            searchIndex = .empty
+            return
+        }
+
+        Task.detached(priority: .userInitiated) { [ch, pr, hidden, generation] in
             let index = StreamMatcher.buildIndex(channels: ch, programs: pr, hiddenGroups: hidden)
             await MainActor.run { [weak self] in
-                self?.searchIndex = index
+                guard let self, self.indexBuildGeneration == generation else { return }
+                self.searchIndex = index
+                self.isStreamIndexBuilding = false
             }
         }
     }
@@ -128,19 +157,43 @@ final class SportsViewModel {
     func matchEvent(_ event: SportEvent) async -> [StreamMatch] {
         let index = searchIndex
         let favIDs = favoriteChannelIDs
-        guard !index.isEmpty else { return [] }
+        let channelScores = channelPreferenceScores
+        let groupScores = groupPreferenceScores
+        guard !index.entries.isEmpty else { return [] }
 
         return await Task.detached(priority: .userInitiated) {
             var matches = StreamMatcher.findMatches(for: event, index: index)
-            // Sort: favorites first, then by score
+            // Semantic score remains primary. User preference is a bounded
+            // tie-breaker from favorite channels, channel usage, and folder usage.
             matches.sort { lhs, rhs in
-                let lFav = favIDs.contains(lhs.channel.id)
-                let rFav = favIDs.contains(rhs.channel.id)
-                if lFav != rFav { return lFav }
-                return lhs.score > rhs.score
+                let lScore = Self.preferenceAdjustedScore(
+                    match: lhs,
+                    favoriteChannelIDs: favIDs,
+                    channelScores: channelScores,
+                    groupScores: groupScores
+                )
+                let rScore = Self.preferenceAdjustedScore(
+                    match: rhs,
+                    favoriteChannelIDs: favIDs,
+                    channelScores: channelScores,
+                    groupScores: groupScores
+                )
+                return lScore > rScore
             }
             return matches
         }.value
+    }
+
+    nonisolated private static func preferenceAdjustedScore(
+        match: StreamMatch,
+        favoriteChannelIDs: Set<String>,
+        channelScores: [String: Double],
+        groupScores: [String: Double]
+    ) -> Double {
+        let favoriteBoost = favoriteChannelIDs.contains(match.channel.id) ? 0.08 : 0
+        let channelBoost = min(0.08, (channelScores[match.channel.id] ?? 0) * 0.08)
+        let groupBoost = min(0.05, (groupScores[match.channel.group] ?? 0) * 0.05)
+        return match.score * (1.0 + favoriteBoost + channelBoost + groupBoost)
     }
 
     // MARK: - Auto refresh

@@ -29,12 +29,59 @@ struct ContentView: View {
 
     private func openChannel(_ channel: Channel) {
         viewModel.addRecent(channel)
+        updateSportsMatchingContext()
         if selectedPlayer != .none {
             AppLog.playback.info("Opening channel externally name=\(channel.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
             ExternalPlayer.launch(streamURL: channel.streamURL, using: selectedPlayer)
         } else {
             AppLog.playback.info("Opening channel in Buffer name=\(channel.name, privacy: .public)")
             openWindow(value: channel)
+        }
+    }
+
+    private func updateSportsMatchingContext() {
+        sportsViewModel.channels = viewModel.channels
+        sportsViewModel.programs = viewModel.programs
+        sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
+        sportsViewModel.channelPreferenceScores = viewModel.channelPreferenceScores
+        sportsViewModel.groupPreferenceScores = viewModel.groupPreferenceScores
+        sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
+    }
+
+    private func handleSidebarSelectionChange(from oldValue: SidebarSelection, to newValue: SidebarSelection) {
+        if newValue != .search && searchController.hasQuery {
+            searchController.clear()
+        }
+        if newValue == .search && !searchController.hasQuery {
+            searchFieldFocused = true
+        }
+        if oldValue == .search && newValue != .search {
+            selectionBeforeSearch = nil
+        }
+    }
+
+    private func handleSearchQueryStateChange(hasQuery: Bool) {
+        if hasQuery && viewModel.selection != .search {
+            selectionBeforeSearch = viewModel.selection
+            viewModel.selection = .search
+        } else if !hasQuery && viewModel.selection == .search {
+            viewModel.selection = selectionBeforeSearch ?? .home
+            selectionBeforeSearch = nil
+        }
+    }
+
+    private func handleSportsVisibilityChange(hidden: Bool) {
+        if hidden {
+            AppLog.sports.info("Sports surface hidden")
+            sportsViewModel.stopAutoRefresh()
+            if viewModel.selection == .sports {
+                viewModel.selection = .home
+            }
+        } else {
+            AppLog.sports.info("Sports surface enabled")
+            updateSportsMatchingContext()
+            sportsViewModel.refresh()
+            sportsViewModel.startAutoRefresh()
         }
     }
 
@@ -245,10 +292,7 @@ struct ContentView: View {
                 programs: viewModel.searchEntries,
                 channels: viewModel.channels
             )
-            sportsViewModel.channels = viewModel.channels
-            sportsViewModel.programs = viewModel.programs
-            sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
-            sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
+            updateSportsMatchingContext()
         }
         .onChange(of: viewModel.channels.count) { _, _ in
             sportsViewModel.channels = viewModel.channels
@@ -257,27 +301,16 @@ struct ContentView: View {
             sportsViewModel.programs = viewModel.programs
         }
         .onChange(of: viewModel.favoriteChannelIDs) { _, _ in
-            sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
+            updateSportsMatchingContext()
+        }
+        .onChange(of: viewModel.recentChannelIDs) { _, _ in
+            updateSportsMatchingContext()
         }
         .onChange(of: viewModel.hiddenGroupNames) { _, _ in
             sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
         }
         .onChange(of: hideSport) { _, hidden in
-            if hidden {
-                AppLog.sports.info("Sports surface hidden")
-                sportsViewModel.stopAutoRefresh()
-                if viewModel.selection == .sports {
-                    viewModel.selection = .home
-                }
-            } else {
-                AppLog.sports.info("Sports surface enabled")
-                sportsViewModel.channels = viewModel.channels
-                sportsViewModel.programs = viewModel.programs
-                sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
-                sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
-                sportsViewModel.refresh()
-                sportsViewModel.startAutoRefresh()
-            }
+            handleSportsVisibilityChange(hidden: hidden)
         }
         .onChange(of: viewModel.searchIndexVersion) { _, _ in
             searchController.updateIndex(
@@ -286,15 +319,7 @@ struct ContentView: View {
             )
         }
         .onChange(of: viewModel.selection) { oldValue, newValue in
-            if newValue != .search && searchController.hasQuery {
-                searchController.clear()
-            }
-            if newValue == .search && !searchController.hasQuery {
-                searchFieldFocused = true
-            }
-            if oldValue == .search && newValue != .search {
-                selectionBeforeSearch = nil
-            }
+            handleSidebarSelectionChange(from: oldValue, to: newValue)
         }
         .onReceive(
             NotificationCenter.default.publisher(
@@ -304,13 +329,7 @@ struct ContentView: View {
             handleFiredReminder(note)
         }
         .onChange(of: searchController.hasQuery) { _, hasQuery in
-            if hasQuery && viewModel.selection != .search {
-                selectionBeforeSearch = viewModel.selection
-                viewModel.selection = .search
-            } else if !hasQuery && viewModel.selection == .search {
-                viewModel.selection = selectionBeforeSearch ?? .home
-                selectionBeforeSearch = nil
-            }
+            handleSearchQueryStateChange(hasQuery: hasQuery)
         }
         .task {
             let hydrationSignpostID = AppLog.appSignposter.makeSignpostID()
@@ -344,10 +363,7 @@ struct ContentView: View {
             if !hideSport {
                 Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(500))
-                    sportsViewModel.channels = viewModel.channels
-                    sportsViewModel.programs = viewModel.programs
-                    sportsViewModel.favoriteChannelIDs = viewModel.favoriteChannelIDs
-                    sportsViewModel.hiddenGroups = viewModel.hiddenGroupNames
+                    updateSportsMatchingContext()
                     sportsViewModel.refresh()
                     sportsViewModel.startAutoRefresh()
                 }

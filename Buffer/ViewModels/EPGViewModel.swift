@@ -25,6 +25,8 @@ class EPGViewModel {
     var searchText: String = ""
     var recentChannelIDs: [String] = []
     var favoriteChannelIDs: Set<String> = []
+    var channelUsageCounts: [String: Int] = [:]
+    var groupUsageCounts: [String: Int] = [:]
     var hasLoadedOnce = false
     var isRefreshing = false
     var loadingStage: String? = nil
@@ -136,6 +138,47 @@ class EPGViewModel {
         channels.filter { favoriteChannelIDs.contains($0.id) }
     }
 
+    var groupPreferenceScores: [String: Double] {
+        let byID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var scores: [String: Double] = [:]
+
+        for (index, channelID) in recentChannelIDs.enumerated() {
+            guard let group = byID[channelID]?.group, !group.isEmpty else { continue }
+            scores[group, default: 0] += max(0.2, 1.0 - (Double(index) * 0.035))
+        }
+
+        for channelID in favoriteChannelIDs {
+            guard let group = byID[channelID]?.group, !group.isEmpty else { continue }
+            scores[group, default: 0] += 1.25
+        }
+
+        for (group, count) in groupUsageCounts where count > 0 {
+            scores[group, default: 0] += log1p(Double(count)) * 0.75
+        }
+
+        guard let maxScore = scores.values.max(), maxScore > 0 else { return [:] }
+        return scores.mapValues { min(1.0, $0 / maxScore) }
+    }
+
+    var channelPreferenceScores: [String: Double] {
+        var scores: [String: Double] = [:]
+
+        for (index, channelID) in recentChannelIDs.enumerated() {
+            scores[channelID, default: 0] += exp(-Double(index) / 8.0)
+        }
+
+        for channelID in favoriteChannelIDs {
+            scores[channelID, default: 0] += 1.5
+        }
+
+        for (channelID, count) in channelUsageCounts where count > 0 {
+            scores[channelID, default: 0] += log1p(Double(count)) * 0.75
+        }
+
+        guard let maxScore = scores.values.max(), maxScore > 0 else { return [:] }
+        return scores.mapValues { min(1.0, $0 / maxScore) }
+    }
+
     func isFavorite(_ channel: Channel) -> Bool {
         favoriteChannelIDs.contains(channel.id)
     }
@@ -157,6 +200,14 @@ class EPGViewModel {
             ids = Array(ids.prefix(Self.recentsLimit))
         }
         recentChannelIDs = ids
+        channelUsageCounts[channel.id, default: 0] += 1
+        trimChannelUsageCounts()
+        saveChannelUsage()
+        if !channel.group.isEmpty {
+            groupUsageCounts[channel.group, default: 0] += 1
+            trimGroupUsageCounts()
+            saveGroupUsage()
+        }
         saveRecents()
     }
 
@@ -587,6 +638,8 @@ class EPGViewModel {
         loadServerStatus()
         loadRecents()
         loadFavorites()
+        loadChannelUsage()
+        loadGroupUsage()
         loadGroupPreferences()
 
         hydrationTask?.cancel()
@@ -616,6 +669,8 @@ class EPGViewModel {
         isRefreshing = false
         recentChannelIDs = []
         favoriteChannelIDs = []
+        channelUsageCounts = [:]
+        groupUsageCounts = [:]
         storedGroupOrder = []
         hiddenGroupNames = []
         serverStatus = nil
@@ -628,6 +683,8 @@ class EPGViewModel {
     private static let legacyConfigKey = "buffer_server_config"
     private static let legacyServerStatusKey = "buffer_server_status"
     private static let recentsLimit = 24
+    private static let channelUsageLimit = 500
+    private static let groupUsageLimit = 100
 
     private static func serverStatusKey(for cacheKey: String) -> String {
         "buffer_server_status_\(cacheKey)"
@@ -798,6 +855,64 @@ class EPGViewModel {
         }
         let ids = (UserDefaults.standard.array(forKey: key) as? [String]) ?? []
         favoriteChannelIDs = Set(ids)
+    }
+
+    // MARK: - Channel Usage
+
+    private func channelUsageKey() -> String? {
+        guard let config = serverConfig else { return nil }
+        return "buffer_channel_usage_\(DataCache.cacheKey(for: config))"
+    }
+
+    private func trimChannelUsageCounts() {
+        guard channelUsageCounts.count > Self.channelUsageLimit else { return }
+        let keep = channelUsageCounts
+            .sorted { $0.value > $1.value }
+            .prefix(Self.channelUsageLimit)
+        channelUsageCounts = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+    }
+
+    private func saveChannelUsage() {
+        guard let key = channelUsageKey() else { return }
+        UserDefaults.standard.set(channelUsageCounts, forKey: key)
+    }
+
+    private func loadChannelUsage() {
+        guard let key = channelUsageKey() else {
+            channelUsageCounts = [:]
+            return
+        }
+        channelUsageCounts = (UserDefaults.standard.dictionary(forKey: key) as? [String: Int]) ?? [:]
+        trimChannelUsageCounts()
+    }
+
+    // MARK: - Group Usage
+
+    private func groupUsageKey() -> String? {
+        guard let config = serverConfig else { return nil }
+        return "buffer_group_usage_\(DataCache.cacheKey(for: config))"
+    }
+
+    private func trimGroupUsageCounts() {
+        guard groupUsageCounts.count > Self.groupUsageLimit else { return }
+        let keep = groupUsageCounts
+            .sorted { $0.value > $1.value }
+            .prefix(Self.groupUsageLimit)
+        groupUsageCounts = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+    }
+
+    private func saveGroupUsage() {
+        guard let key = groupUsageKey() else { return }
+        UserDefaults.standard.set(groupUsageCounts, forKey: key)
+    }
+
+    private func loadGroupUsage() {
+        guard let key = groupUsageKey() else {
+            groupUsageCounts = [:]
+            return
+        }
+        groupUsageCounts = (UserDefaults.standard.dictionary(forKey: key) as? [String: Int]) ?? [:]
+        trimGroupUsageCounts()
     }
 
     // MARK: - Group Preferences

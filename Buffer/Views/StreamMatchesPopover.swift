@@ -4,6 +4,7 @@ struct StreamMatchesPopover: View {
     let event: SportEvent
     let matches: [StreamMatch]
     let favoriteIDs: Set<String>
+    var unavailableMessage: String? = nil
     var reminderHint: String? = nil
     var onPlay: ((Channel) -> Void)? = nil
     var onRemind: ((Channel) -> Void)? = nil
@@ -71,11 +72,17 @@ struct StreamMatchesPopover: View {
             Divider()
 
             if visibleMatches.isEmpty {
-                Text("No matching streams found")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 24)
+                VStack(spacing: 8) {
+                    if unavailableMessage != nil {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(unavailableMessage ?? "No matching streams found")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
             } else {
                 ScrollView {
                     VStack(spacing: 8) {

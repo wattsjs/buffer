@@ -6,8 +6,12 @@ import Foundation
 nonisolated struct ChannelSearchIndex: Sendable {
     let channel: Channel
     let nameLower: String
+    let nameWords: ContiguousArray<String>
+    let nameCompact: String
+    let nameAcronym: String
     let group: String          // original channel group name (for display)
     let inSportsGroup: Bool
+    let isAudioOnlyGroup: Bool
     let isHidden: Bool         // channel belongs to a user-hidden group
     /// EPG titles already lowercased, sorted by start time.
     /// Only programs within a ±48h window are kept.
@@ -18,9 +22,25 @@ nonisolated struct ChannelSearchIndex: Sendable {
         let description: String // original casing, trimmed for display
         let titleLower: ContiguousArray<UInt8>  // UTF-8 bytes for fast search
         let descLower: ContiguousArray<UInt8>   // description UTF-8 bytes
+        let titleWords: ContiguousArray<String>
+        let descWords: ContiguousArray<String>
+        let titleCompact: String
+        let descCompact: String
         let start: Date
         let end: Date
     }
+}
+
+nonisolated struct StreamSearchIndex: Sendable {
+    let entries: [ChannelSearchIndex]
+    let tokenToEntryIndices: [String: ContiguousArray<Int>]
+    let inverseDocumentFrequency: [String: Double]
+
+    static let empty = StreamSearchIndex(
+        entries: [],
+        tokenToEntryIndices: [:],
+        inverseDocumentFrequency: [:]
+    )
 }
 
 /// A matched stream for a sport event.
@@ -54,14 +74,23 @@ nonisolated enum StreamMatcher {
         channels: [Channel],
         programs: [String: [EPGProgram]],
         hiddenGroups: Set<String> = []
-    ) -> [ChannelSearchIndex] {
+    ) -> StreamSearchIndex {
         let cutoff = Date().addingTimeInterval(-3600)
         let horizon = Date().addingTimeInterval(48 * 3600)
+        let hiddenGroupPaths = hiddenGroups.map(splitGroupPath)
 
-        return channels.compactMap { channel in
-            let isHidden = isGroupHidden(channel.group, hiddenGroups: hiddenGroups)
+        let entries = channels.compactMap { channel in
+            let isHidden = isGroupHidden(
+                channel.group,
+                hiddenGroups: hiddenGroups,
+                hiddenGroupPaths: hiddenGroupPaths
+            )
             let nameLower = normalise(channel.name)
+            let nameWords = ContiguousArray(tokenWords(in: nameLower))
+            let nameCompact = compactKey(nameLower)
+            let nameAcronym = acronym(for: nameWords)
             let groupLower = normalise(channel.group)
+            let isAudioOnlyGroup = groupLower.contains("radio") || nameLower.hasPrefix("radio:")
 
             var epgTitles = ContiguousArray<ChannelSearchIndex.EPGTitle>()
             if let epgID = channel.epgChannelID {
@@ -74,11 +103,17 @@ nonisolated enum StreamMatcher {
                         let descPrefix = desc.count > 256
                             ? String(desc.prefix(256))
                             : desc
+                        let titleLower = normalise(p.title)
+                        let descLower = normalise(descPrefix)
                         epgTitles.append(.init(
                             title: p.title,
                             description: descPrefix,
-                            titleLower: ContiguousArray(normalise(p.title).utf8),
-                            descLower: ContiguousArray(normalise(descPrefix).utf8),
+                            titleLower: ContiguousArray(titleLower.utf8),
+                            descLower: ContiguousArray(descLower.utf8),
+                            titleWords: ContiguousArray(tokenWords(in: titleLower)),
+                            descWords: ContiguousArray(tokenWords(in: descLower)),
+                            titleCompact: compactKey(titleLower),
+                            descCompact: compactKey(descLower),
                             start: p.start,
                             end: p.end
                         ))
@@ -89,23 +124,89 @@ nonisolated enum StreamMatcher {
             return ChannelSearchIndex(
                 channel: channel,
                 nameLower: nameLower,
+                nameWords: nameWords,
+                nameCompact: nameCompact,
+                nameAcronym: nameAcronym,
                 group: channel.group,
                 inSportsGroup: groupLower.contains("sport") || groupLower.contains("ppv"),
+                isAudioOnlyGroup: isAudioOnlyGroup,
                 isHidden: isHidden,
                 epgTitles: epgTitles
             )
         }
+
+        let inverted = buildInvertedIndex(for: entries)
+        return StreamSearchIndex(
+            entries: entries,
+            tokenToEntryIndices: inverted,
+            inverseDocumentFrequency: buildInverseDocumentFrequency(
+                tokenToEntryIndices: inverted,
+                documentCount: entries.count
+            )
+        )
     }
 
-    private static func isGroupHidden(_ group: String, hiddenGroups: Set<String>) -> Bool {
+    private static func buildInvertedIndex(
+        for entries: [ChannelSearchIndex]
+    ) -> [String: ContiguousArray<Int>] {
+        var buckets: [String: [Int]] = [:]
+
+        for (idx, entry) in entries.enumerated() {
+            var tokens = Set<String>()
+            collectIndexTokens(entry.nameWords, into: &tokens)
+            collectIndexToken(entry.nameAcronym, into: &tokens)
+
+            for epg in entry.epgTitles {
+                collectIndexTokens(epg.titleWords, into: &tokens)
+                collectIndexTokens(epg.descWords, into: &tokens)
+            }
+
+            for token in tokens {
+                buckets[token, default: []].append(idx)
+            }
+        }
+
+        return buckets.mapValues { ContiguousArray($0) }
+    }
+
+    private static func buildInverseDocumentFrequency(
+        tokenToEntryIndices: [String: ContiguousArray<Int>],
+        documentCount: Int
+    ) -> [String: Double] {
+        guard documentCount > 0 else { return [:] }
+        let total = Double(documentCount)
+        return tokenToEntryIndices.mapValues { indices in
+            let df = Double(indices.count)
+            return log((total - df + 0.5) / (df + 0.5) + 1.0)
+        }
+    }
+
+    private static func collectIndexTokens(
+        _ words: ContiguousArray<String>,
+        into tokens: inout Set<String>
+    ) {
+        for word in words {
+            collectIndexToken(word, into: &tokens)
+        }
+    }
+
+    private static func collectIndexToken(_ token: String, into tokens: inout Set<String>) {
+        guard token.count >= 2, !trivialWords.contains(token) else { return }
+        tokens.insert(token)
+    }
+
+    private static func isGroupHidden(
+        _ group: String,
+        hiddenGroups: Set<String>,
+        hiddenGroupPaths: [[String]]
+    ) -> Bool {
         guard !hiddenGroups.isEmpty else { return false }
         if hiddenGroups.contains(group) { return true }
 
         let path = splitGroupPath(group)
         guard !path.isEmpty else { return false }
 
-        for hidden in hiddenGroups {
-            let hiddenPath = splitGroupPath(hidden)
+        for hiddenPath in hiddenGroupPaths {
             guard !hiddenPath.isEmpty, hiddenPath.count <= path.count else { continue }
             if Array(path.prefix(hiddenPath.count)) == hiddenPath {
                 return true
@@ -128,6 +229,7 @@ nonisolated enum StreamMatcher {
     // MARK: - Matching
 
     private static let minimumScore: Double = 80
+    private static let maxCandidateEntries = 160
 
     /// Sports where EPG listings use tournament/sport names rather than
     /// individual match names, and events may span many hours.
@@ -139,10 +241,11 @@ nonisolated enum StreamMatcher {
 
     static func findMatches(
         for event: SportEvent,
-        index: [ChannelSearchIndex]
+        index: StreamSearchIndex
     ) -> [StreamMatch] {
         let queries = buildQueries(for: event)
         guard !queries.isEmpty else { return [] }
+        guard !index.entries.isEmpty else { return [] }
 
         let broadcastLower = event.broadcast.compactMap { b -> String? in
             let l = normalise(b)
@@ -160,34 +263,42 @@ nonisolated enum StreamMatcher {
         // - EPG entries often span the whole day ("ATP Tennis 10am-8pm")
         // - Individual match times within the block are approximate
         let isTournament = tournamentSports.contains(event.sport)
+        let now = Date()
+        let isEventLive = event.status.isLive
+        let allowCurrentlyLiveEPG = isEventLive || (!event.status.isFinished && event.startDate <= now)
         let windowStart = event.startDate.addingTimeInterval(isTournament ? -6 * 3600 : -1800)
         let windowEnd = event.startDate.addingTimeInterval(isTournament ? 12 * 3600 : 7200)
 
         var matches: [StreamMatch] = []
         matches.reserveCapacity(16)
 
-        // Iterate by index to avoid copying ChannelSearchIndex structs
-        for i in index.indices {
+        let candidateIndices = candidateEntryIndices(for: queries, in: index)
+        guard !candidateIndices.isEmpty else { return [] }
+
+        // Iterate candidate indices only; the inverted index is built in the
+        // background whenever channels/EPG change.
+        for i in candidateIndices {
             let score = scoreEntry(
-                index: index, at: i,
+                entries: index.entries, at: i,
                 queries: queries,
                 broadcastLower: broadcastLower,
                 contextKeywords: contextKeywords,
                 eventStart: event.startDate,
                 windowStart: windowStart,
                 windowEnd: windowEnd,
+                allowCurrentlyLiveEPG: allowCurrentlyLiveEPG,
                 isTournament: isTournament
             )
             if score.value >= minimumScore {
                 matches.append(StreamMatch(
-                    channel: index[i].channel,
+                    channel: index.entries[i].channel,
                     score: score.value,
                     reason: score.reason,
                     programTitle: score.programTitle,
                     programDescription: score.programDescription,
                     programStart: score.programStart,
                     programEnd: score.programEnd,
-                    isHidden: index[i].isHidden
+                    isHidden: index.entries[i].isHidden
                 ))
             }
         }
@@ -199,6 +310,44 @@ nonisolated enum StreamMatcher {
         result.sort { $0.score > $1.score }
         if result.count > 10 { result.removeSubrange(10...) }
         return result
+    }
+
+    private static func candidateEntryIndices(
+        for queries: [SearchQuery],
+        in index: StreamSearchIndex
+    ) -> [Int] {
+        var candidateWeights: [Int: Double] = [:]
+
+        for query in queries {
+            for term in query.fuzzyTerms {
+                if let hits = index.tokenToEntryIndices[term] {
+                    let weight = index.inverseDocumentFrequency[term] ?? 0.1
+                    for hit in hits {
+                        candidateWeights[hit, default: 0] += weight
+                    }
+                }
+            }
+            for token in query.tokens where token.count >= 2 {
+                if let hits = index.tokenToEntryIndices[token] {
+                    let weight = index.inverseDocumentFrequency[token] ?? 0.1
+                    for hit in hits {
+                        candidateWeights[hit, default: 0] += weight
+                    }
+                }
+            }
+        }
+
+        guard candidateWeights.count > maxCandidateEntries else {
+            return Array(candidateWeights.keys)
+        }
+
+        return candidateWeights
+            .sorted { lhs, rhs in
+                if lhs.value != rhs.value { return lhs.value > rhs.value }
+                return lhs.key < rhs.key
+            }
+            .prefix(maxCandidateEntries)
+            .map(\.key)
     }
 
     // MARK: - Scoring
@@ -231,28 +380,34 @@ nonisolated enum StreamMatcher {
     }
 
     private static func scoreEntry(
-        index: [ChannelSearchIndex], at i: Int,
+        entries: [ChannelSearchIndex], at i: Int,
         queries: [SearchQuery],
         broadcastLower: [String],
         contextKeywords: [ContiguousArray<UInt8>],
         eventStart: Date,
         windowStart: Date,
         windowEnd: Date,
+        allowCurrentlyLiveEPG: Bool,
         isTournament: Bool
     ) -> Score {
         var best = Score()
-        let entry = index[i]
+        let entry = entries[i]
         let groupLabel = entry.group.isEmpty ? "" : entry.group
 
         // ── EPG titles + descriptions in event window (strongest signal) ──
         if !entry.epgTitles.isEmpty {
+            let now = Date()
             for epg in entry.epgTitles {
-                guard epg.start < windowEnd && epg.end > windowStart else { continue }
-                let timeBonus = matchTimeBonus(
-                    eventStart: eventStart,
-                    epgStart: epg.start,
-                    isTournament: isTournament
-                )
+                let overlapsEventWindow = epg.start < windowEnd && epg.end > windowStart
+                let isCurrentlyLive = allowCurrentlyLiveEPG && epg.start <= now && epg.end > now
+                guard overlapsEventWindow || isCurrentlyLive else { continue }
+                let timeBonus = overlapsEventWindow
+                    ? matchTimeBonus(
+                        eventStart: eventStart,
+                        epgStart: epg.start,
+                        isTournament: isTournament
+                    )
+                    : 12
 
                 for q in queries {
                     guard q.target != .channelOnly else { continue }
@@ -279,6 +434,21 @@ nonisolated enum StreamMatcher {
                         )
                         break
                     }
+                    if let coverage = fuzzyTokenCoverage(
+                        query: q,
+                        words: epg.titleWords,
+                        compactText: epg.titleCompact
+                    ) {
+                        best.record(
+                            q.score + 28 + (coverage * 18) + (timeBonus * 0.8),
+                            groupLabel,
+                            program: epg.title,
+                            description: epg.description,
+                            start: epg.start,
+                            end: epg.end
+                        )
+                        break
+                    }
                     // Description search: only for multi-token queries.
                     // A single word in a description is too weak a signal.
                     if q.tokenBytes.count >= 2
@@ -295,16 +465,41 @@ nonisolated enum StreamMatcher {
                         )
                         break
                     }
+                    if q.tokens.count >= 2,
+                       let coverage = fuzzyTokenCoverage(
+                        query: q,
+                        words: epg.descWords,
+                        compactText: epg.descCompact
+                       ) {
+                        best.record(
+                            q.score + 18 + (coverage * 14) + (timeBonus * 0.6),
+                            groupLabel,
+                            program: epg.title,
+                            description: epg.description,
+                            start: epg.start,
+                            end: epg.end
+                        )
+                        break
+                    }
                 }
-                if best.value > 0 { break }
             }
         }
 
         // ── Channel name ──
         for q in queries {
             guard q.target != .epgOnly else { continue }
-            if allTokensMatch(q.tokens, in: entry.nameLower) {
+            if isWeakSingleTokenChannelQuery(q, entry: entry) { continue }
+            if allTokensMatch(q.tokens, in: entry.nameLower, words: entry.nameWords, acronym: entry.nameAcronym) {
                 best.record(q.score, groupLabel)
+                break
+            }
+            if let coverage = fuzzyTokenCoverage(
+                query: q,
+                words: entry.nameWords,
+                compactText: entry.nameCompact,
+                requireExactAnchor: true
+            ) {
+                best.record(q.score * (0.78 + coverage * 0.12), groupLabel)
                 break
             }
         }
@@ -318,17 +513,33 @@ nonisolated enum StreamMatcher {
                 }
             }
             if entry.inSportsGroup { best.value *= 1.15 }
+            if entry.isAudioOnlyGroup { best.value *= 0.55 }
         }
 
         return best
     }
 
+    private static func isWeakSingleTokenChannelQuery(
+        _ query: SearchQuery,
+        entry: ChannelSearchIndex
+    ) -> Bool {
+        guard query.tokens.count == 1, query.score <= 110 else { return false }
+        return !entry.inSportsGroup || entry.nameWords.count > 4
+    }
+
     // MARK: - Token matching (String — used for channel name matching)
 
     @inline(__always)
-    private static func allTokensMatch(_ tokens: [String], in text: String) -> Bool {
+    private static func allTokensMatch(
+        _ tokens: [String],
+        in text: String,
+        words: ContiguousArray<String>? = nil,
+        acronym: String = ""
+    ) -> Bool {
         for token in tokens {
-            if token.count <= 3 {
+            if token.count <= 4 {
+                if let words, words.contains(token) { continue }
+                if !acronym.isEmpty, acronym.contains(token) { continue }
                 if !wordBoundaryMatch(token, in: text) { return false }
             } else {
                 if !text.contains(token) { return false }
@@ -389,7 +600,7 @@ nonisolated enum StreamMatcher {
                 guard nLen <= hLen else { return false }
                 let found = needle.withUnsafeBufferPointer { nBuf -> Bool in
                     guard let nBase = nBuf.baseAddress else { return false }
-                    if nLen <= 3 {
+                    if nLen <= 4 {
                         return _wordBoundaryFind(nBase, nLen, hBase, hLen)
                     } else {
                         return _substringFind(nBase, nLen, hBase, hLen)
@@ -444,21 +655,26 @@ nonisolated enum StreamMatcher {
     private struct SearchQuery {
         let tokens: [String]
         let tokenBytes: [ContiguousArray<UInt8>]  // pre-computed UTF-8 for fast matching
+        let fuzzyTerms: [String]
         let score: Double
         let label: String
         let target: QueryTarget
+        let allowsFuzzy: Bool
 
         init(
             tokens: [String],
             score: Double,
             label: String,
-            target: QueryTarget = .both
+            target: QueryTarget = .both,
+            allowsFuzzy: Bool = true
         ) {
             self.tokens = tokens
             self.tokenBytes = tokens.map { ContiguousArray($0.utf8) }
+            self.fuzzyTerms = tokens.flatMap { tokenWords(in: $0, minimumLength: 2) }
             self.score = score
             self.label = label
             self.target = target
+            self.allowsFuzzy = allowsFuzzy
         }
     }
 
@@ -487,9 +703,170 @@ nonisolated enum StreamMatcher {
         return 0
     }
 
+    private static func fuzzyTokenCoverage(
+        query: SearchQuery,
+        words: ContiguousArray<String>,
+        compactText: String,
+        requireExactAnchor: Bool = false
+    ) -> Double? {
+        guard query.allowsFuzzy, query.score >= 100, !words.isEmpty else { return nil }
+
+        let queryTerms = query.fuzzyTerms
+        guard !queryTerms.isEmpty else { return nil }
+
+        // Single fuzzy terms are prone to cross-sport false positives. Keep
+        // them only for long, high-signal names such as athletes or nicknames.
+        if queryTerms.count == 1 {
+            guard let term = queryTerms.first, term.count >= 6, query.score >= 110 else { return nil }
+            guard !ambiguousTeamNames.contains(term), !ambiguousCityNames.contains(term) else { return nil }
+        }
+
+        var total = 0.0
+        var exactHits = 0
+        var missingTerms: [String] = []
+
+        for term in queryTerms {
+            if term.count <= 3 {
+                guard words.contains(term) else { return nil }
+                total += 1.0
+                exactHits += 1
+                continue
+            }
+
+            if words.contains(term) || compactText.contains(term) {
+                total += 1.0
+                exactHits += 1
+                continue
+            }
+
+            missingTerms.append(term)
+        }
+
+        if requireExactAnchor || queryTerms.count >= 2 {
+            guard exactHits > 0 else { return nil }
+        }
+
+        // Fuzzy repair is intentionally narrow: it is for one misspelled or
+        // abbreviated word inside an otherwise plausible indexed candidate,
+        // not a second search pass over every token in the guide.
+        guard missingTerms.count <= 1 else { return nil }
+
+        for term in missingTerms {
+            let best = bestSimilarity(for: term, in: words)
+            let threshold = term.count <= 5 ? 0.91 : 0.86
+            guard best >= threshold else { return nil }
+            total += best
+        }
+
+        let coverage = total / Double(queryTerms.count)
+        return coverage >= 0.88 ? coverage : nil
+    }
+
+    private static func bestSimilarity(for term: String, in words: ContiguousArray<String>) -> Double {
+        var best = 0.0
+        for word in words {
+            guard word.count >= 4 else { continue }
+            let lengthDelta = abs(word.count - term.count)
+            guard lengthDelta <= max(3, term.count / 3) else { continue }
+            guard hasComparableShape(term, word) else { continue }
+            let score = max(jaroWinkler(term, word), diceCoefficient(term, word))
+            if score > best { best = score }
+        }
+        return best
+    }
+
+    private static func hasComparableShape(_ lhs: String, _ rhs: String) -> Bool {
+        guard let lFirst = lhs.first, let rFirst = rhs.first else { return false }
+        if lFirst == rFirst { return true }
+
+        guard let lLast = lhs.last, let rLast = rhs.last else { return false }
+        return lhs.count >= 7 && rhs.count >= 7 && lLast == rLast
+    }
+
+    private static func jaroWinkler(_ lhs: String, _ rhs: String) -> Double {
+        if lhs == rhs { return 1 }
+        let a = Array(lhs)
+        let b = Array(rhs)
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+
+        let matchDistance = max(a.count, b.count) / 2 - 1
+        var aMatches = Array(repeating: false, count: a.count)
+        var bMatches = Array(repeating: false, count: b.count)
+
+        var matches = 0
+        for i in a.indices {
+            let start = max(0, i - matchDistance)
+            let end = min(i + matchDistance + 1, b.count)
+            var j = start
+            while j < end {
+                if !bMatches[j], a[i] == b[j] {
+                    aMatches[i] = true
+                    bMatches[j] = true
+                    matches += 1
+                    break
+                }
+                j += 1
+            }
+        }
+        guard matches > 0 else { return 0 }
+
+        var transpositions = 0
+        var k = 0
+        for i in a.indices where aMatches[i] {
+            while !bMatches[k] { k += 1 }
+            if a[i] != b[k] { transpositions += 1 }
+            k += 1
+        }
+
+        let m = Double(matches)
+        let jaro = (
+            m / Double(a.count)
+            + m / Double(b.count)
+            + (m - Double(transpositions) / 2) / m
+        ) / 3
+
+        var prefix = 0
+        while prefix < min(4, a.count, b.count), a[prefix] == b[prefix] {
+            prefix += 1
+        }
+        return jaro + Double(prefix) * 0.1 * (1 - jaro)
+    }
+
+    private static func diceCoefficient(_ lhs: String, _ rhs: String) -> Double {
+        let a = Array(lhs)
+        let b = Array(rhs)
+        guard a.count >= 2, b.count >= 2 else { return lhs == rhs ? 1 : 0 }
+
+        var counts: [String: Int] = [:]
+        for i in 0..<(a.count - 1) {
+            counts[String(a[i...i + 1]), default: 0] += 1
+        }
+
+        var intersection = 0
+        for i in 0..<(b.count - 1) {
+            let gram = String(b[i...i + 1])
+            if let count = counts[gram], count > 0 {
+                intersection += 1
+                counts[gram] = count - 1
+            }
+        }
+
+        return (2.0 * Double(intersection)) / Double(a.count + b.count - 2)
+    }
+
     private static let broadcastStopWords: Set<String> = [
         "tv", "network", "networks", "sports", "sport", "channel", "chs", "hd", "fhd", "uhd",
-        "plus", "live", "stream", "streaming", "network"
+        "plus", "live", "stream", "streaming", "network",
+        "mlb", "nba", "wnba", "nfl", "nhl", "ncaaf", "ncaam"
+    ]
+
+    private static let eventTitleStopWords = trivialWords.union([
+        "vs", "v", "at", "and", "night", "fight", "game", "match",
+    ])
+
+    private static let singleTokenBroadcastChannels: Set<String> = [
+        "abc", "cbs", "espn", "fox", "fs1", "fs2", "nbc", "tnt", "tbs",
+        "peacock", "prime", "ion", "metv", "mnmt"
     ]
 
     private static func extractTokens(
@@ -508,6 +885,59 @@ nonisolated enum StreamMatcher {
             }
     }
 
+    private static func tokenWords(in normalisedText: String, minimumLength: Int = 2) -> [String] {
+        normalisedText
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { $0.count >= minimumLength }
+    }
+
+    private static func compactKey(_ normalisedText: String) -> String {
+        normalisedText.filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func acronym(for words: ContiguousArray<String>) -> String {
+        String(words.compactMap(\.first))
+    }
+
+    private static func teamSearchTerms(for team: TeamInfo) -> [String] {
+        var terms: [String] = []
+        appendTeamTerm(normalise(team.name), to: &terms)
+        appendTeamTerm(normalise(team.displayName), to: &terms)
+        appendTeamTerm(normalise(team.abbreviation), to: &terms)
+
+        for source in [normalise(team.name), normalise(team.displayName)] {
+            appendTeamTerm(clubBaseName(source), to: &terms)
+            if let aliases = clubAliases[source] {
+                for alias in aliases {
+                    appendTeamTerm(alias, to: &terms)
+                }
+            }
+        }
+
+        return terms
+    }
+
+    private static func appendTeamTerm(_ term: String, to terms: inout [String]) {
+        let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2, !terms.contains(trimmed) else { return }
+        terms.append(trimmed)
+    }
+
+    private static func clubBaseName(_ name: String) -> String {
+        var words = tokenWords(in: name, minimumLength: 2)
+        while let last = words.last, clubSuffixWords.contains(last) {
+            words.removeLast()
+        }
+        return words.joined(separator: " ")
+    }
+
+    private static func isStrongSingleTeamTerm(_ term: String) -> Bool {
+        guard term.count >= 5 else { return false }
+        guard !ambiguousTeamNames.contains(term), !ambiguousCityNames.contains(term) else { return false }
+        return true
+    }
+
     private static func buildBroadcastQueries(_ broadcasts: [String]) -> [SearchQuery] {
         var out: [SearchQuery] = []
 
@@ -524,25 +954,16 @@ nonisolated enum StreamMatcher {
                     tokens: Array(tokens.prefix(3)),
                     score: 190,
                     label: "Broadcast: \(broadcast)",
-                    target: .channelOnly
+                    target: .channelOnly,
+                    allowsFuzzy: false
                 ))
-            }
-
-            if let first = tokens.first {
+            } else if let first = tokens.first, singleTokenBroadcastChannels.contains(first) {
                 out.append(SearchQuery(
                     tokens: [first],
                     score: 120,
                     label: "Broadcast token: \(first)",
-                    target: .channelOnly
-                ))
-            }
-
-            if let second = tokens.dropFirst().first {
-                out.append(SearchQuery(
-                    tokens: [second],
-                    score: 100,
-                    label: "Broadcast token: \(second)",
-                    target: .channelOnly
+                    target: .channelOnly,
+                    allowsFuzzy: false
                 ))
             }
         }
@@ -570,7 +991,8 @@ nonisolated enum StreamMatcher {
                 queries.append(SearchQuery(
                     tokens: Array(shortTokens.prefix(3)),
                     score: 120,
-                    label: "Short title: \(event.shortTitle)"
+                    label: "Short title: \(event.shortTitle)",
+                    allowsFuzzy: false
                 ))
             }
         }
@@ -583,8 +1005,25 @@ nonisolated enum StreamMatcher {
             let t0 = teams[0], t1 = teams[1]
             let n0 = normalise(t0.name), n1 = normalise(t1.name)
             let a0 = normalise(t0.abbreviation), a1 = normalise(t1.abbreviation)
+            let t0Terms = teamSearchTerms(for: t0)
+            let t1Terms = teamSearchTerms(for: t1)
 
-            if n0.count >= 3 && n1.count >= 3 {
+            if !t0Terms.isEmpty && !t1Terms.isEmpty {
+                for left in t0Terms.prefix(4) {
+                    for right in t1Terms.prefix(4) where left != right {
+                        queries.append(SearchQuery(tokens: [left, right], score: 170,
+                                                   label: "\(left) vs \(right)"))
+                    }
+                }
+                for comp in competitionTokens {
+                    for left in t0Terms.prefix(3) {
+                        for right in t1Terms.prefix(3) where left != right {
+                            queries.append(SearchQuery(tokens: [left, right, comp], score: 200,
+                                                       label: "\(left) + \(right) + \(comp)"))
+                        }
+                    }
+                }
+            } else if n0.count >= 3 && n1.count >= 3 {
                 for comp in competitionTokens {
                     queries.append(SearchQuery(tokens: [n0, n1, comp], score: 200,
                                                label: "\(t0.name) + \(t1.name) + \(comp)"))
@@ -598,7 +1037,14 @@ nonisolated enum StreamMatcher {
             // short abbreviations matching broadly in EPG text.
             if a0.count >= 3 && a1.count >= 3 {
                 queries.append(SearchQuery(tokens: [a0, a1], score: 150,
-                                           label: "\(t0.abbreviation) vs \(t1.abbreviation)"))
+                                           label: "\(t0.abbreviation) vs \(t1.abbreviation)",
+                                           allowsFuzzy: false))
+            } else if a0.count >= 2 && a1.count >= 2 {
+                for comp in competitionTokens where comp.count >= 3 {
+                    queries.append(SearchQuery(tokens: [a0, a1, comp], score: 180,
+                                               label: "\(t0.abbreviation) vs \(t1.abbreviation) + \(comp)",
+                                               allowsFuzzy: false))
+                }
             }
 
             for (primary, secondary) in [(t0, t1), (t1, t0)] {
@@ -608,19 +1054,26 @@ nonisolated enum StreamMatcher {
                         score: 160, label: "\(primary.displayName) + \(secondary.abbreviation)"))
                 }
             }
-        }
 
-        for team in teams {
-            if team.displayName.count >= 5 {
-                queries.append(SearchQuery(tokens: [normalise(team.displayName)], score: 130,
-                                           label: team.displayName))
+            for team in teams {
+                for term in teamSearchTerms(for: team).prefix(3) where isStrongSingleTeamTerm(term) {
+                    queries.append(SearchQuery(
+                        tokens: [term],
+                        score: 88,
+                        label: "Team channel: \(term)",
+                        target: .channelOnly,
+                        allowsFuzzy: false
+                    ))
+                }
             }
         }
 
-        for team in teams {
-            let lower = normalise(team.name)
-            if lower.count >= 4, !ambiguousTeamNames.contains(lower) {
-                queries.append(SearchQuery(tokens: [lower], score: 110, label: team.name))
+        if teams.count != 2 {
+            for team in teams {
+                if team.displayName.count >= 5 {
+                    queries.append(SearchQuery(tokens: [normalise(team.displayName)], score: 130,
+                                               label: team.displayName))
+                }
             }
         }
 
@@ -628,13 +1081,6 @@ nonisolated enum StreamMatcher {
         // EPG descriptions often list just surnames (e.g. "Djokovic", "McIlroy").
         // Extract the last word of displayName as the surname.
         if athleteSports.contains(event.sport) {
-            for team in teams {
-                let surname = extractSurname(team)
-                if surname.count >= 4, surname != normalise(team.name) {
-                    queries.append(SearchQuery(tokens: [surname], score: 95,
-                                               label: "Surname: \(surname)"))
-                }
-            }
             // Both surnames together is a stronger signal
             if teams.count == 2 {
                 let s0 = extractSurname(teams[0])
@@ -649,18 +1095,36 @@ nonisolated enum StreamMatcher {
         for team in teams {
             let city = normalise(extractCity(team))
             if city.count >= 4, !ambiguousCityNames.contains(city) {
-                queries.append(SearchQuery(tokens: [city], score: 90, label: "City: \(city)"))
+                queries.append(SearchQuery(
+                    tokens: [city],
+                    score: 90,
+                    label: "City: \(city)",
+                    target: .epgOnly,
+                    allowsFuzzy: false
+                ))
             }
         }
 
         if teams.isEmpty || teams.allSatisfy({ $0.displayName == "TBD" }) {
-            let titleTokens = normalise(event.title)
-                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-                .map(String.init)
-                .filter { $0.count >= 3 }
+            let titleTokens = extractTokens(
+                from: event.title,
+                minimumLength: 3,
+                stopWords: eventTitleStopWords
+            )
             if !titleTokens.isEmpty {
-                queries.append(SearchQuery(tokens: Array(titleTokens.prefix(3)), score: 100,
-                                           label: event.title))
+                queries.append(SearchQuery(
+                    tokens: Array(titleTokens.prefix(6)),
+                    score: 165,
+                    label: "Event title: \(event.title)"
+                ))
+
+                if titleTokens.count >= 2 {
+                    queries.append(SearchQuery(
+                        tokens: Array(titleTokens.suffix(min(4, titleTokens.count))),
+                        score: 150,
+                        label: "Event title core: \(event.title)"
+                    ))
+                }
             }
         }
 
@@ -675,7 +1139,8 @@ nonisolated enum StreamMatcher {
                     tokens: Array(venueTokens.prefix(2)),
                     score: 80,
                     label: "Venue: \(venue)",
-                    target: .epgOnly
+                    target: .epgOnly,
+                    allowsFuzzy: false
                 ))
             }
         }
@@ -691,7 +1156,8 @@ nonisolated enum StreamMatcher {
                     tokens: Array(detailTokens.prefix(2)),
                     score: 75,
                     label: "Detail: \(detail)",
-                    target: .epgOnly
+                    target: .epgOnly,
+                    allowsFuzzy: false
                 ))
             }
         }
@@ -699,10 +1165,10 @@ nonisolated enum StreamMatcher {
         if teams.isEmpty {
             for comp in competitionTokens where comp.count >= 3 {
                 queries.append(SearchQuery(tokens: [comp], score: 90,
-                                         label: "League: \(comp)"))
+                                         label: "League: \(comp)", allowsFuzzy: false))
             }
             for kw in sportKeywords(for: event) where kw.count >= 3 {
-                queries.append(SearchQuery(tokens: [kw], score: 70, label: "Sport: \(kw)"))
+                queries.append(SearchQuery(tokens: [kw], score: 70, label: "Sport: \(kw)", allowsFuzzy: false))
             }
         }
 
@@ -745,11 +1211,11 @@ nonisolated enum StreamMatcher {
         // Only use for tournament sports where this is common
         if tournamentSports.contains(event.sport) {
             for kw in sportKeywords(for: event) {
-                queries.append(SearchQuery(tokens: [kw], score: 60, label: "Sport: \(kw)"))
+                queries.append(SearchQuery(tokens: [kw], score: 60, label: "Sport: \(kw)", allowsFuzzy: false))
             }
             // League-specific: "atp", "wta", "pga", "ipl", "f1"
             for comp in competitionTokens {
-                queries.append(SearchQuery(tokens: [comp], score: 70, label: "League: \(comp)"))
+                queries.append(SearchQuery(tokens: [comp], score: 70, label: "League: \(comp)", allowsFuzzy: false))
             }
         }
 
@@ -807,7 +1273,7 @@ nonisolated enum StreamMatcher {
         case (.soccer, "aus.1"):          kw.append(contentsOf: ["a-league", "aleague"])
         case (.soccer, "aus.w.1"):        kw.append(contentsOf: ["a-league", "aleague", "women"])
         case (.soccer, "eng.fa"):         kw.append(contentsOf: ["fa", "cup"])
-        case (.soccer, "eng.2"):          kw.append(contentsOf: ["championship", "efl"])
+        case (.soccer, "eng.2"):          kw.append(contentsOf: ["championship", "efl", "ch"])
         case (.mma, _):                   kw.append(contentsOf: ["ufc", "fight"])
         case (.motorsport, "f1"):         kw.append(contentsOf: ["formula", "grand prix", "f1"])
         case (.motorsport, "nascar-premier"): kw.append("nascar")
@@ -844,6 +1310,23 @@ nonisolated enum StreamMatcher {
     private static let ambiguousCityNames: Set<String> = [
         "new", "san", "los", "las", "fort", "west", "east", "north", "south",
         "st.", "bay", "salt", "lake",
+    ]
+
+    private static let clubSuffixWords: Set<String> = [
+        "afc", "fc", "cf", "sc", "city", "town", "county", "united"
+    ]
+
+    private static let clubAliases: [String: [String]] = [
+        "afc bournemouth": ["bournemouth", "cherries"],
+        "middlesbrough": ["boro"],
+        "norwich city": ["norwich", "canaries"],
+        "portsmouth": ["pompey"],
+        "queens park rangers": ["qpr"],
+        "southampton": ["saints"],
+        "sheffield united": ["sheff utd"],
+        "sheffield wednesday": ["sheff wed"],
+        "west bromwich albion": ["west brom", "wba"],
+        "wolverhampton wanderers": ["wolves"],
     ]
 
     private static func extractCity(_ team: TeamInfo) -> String {

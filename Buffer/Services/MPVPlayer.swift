@@ -62,21 +62,67 @@ final class MPVPlayer {
         static let fastAnalyzeDuration = 0.1
         static let liveLatencyEpsilon = 0.5
 
-        /// mpv's demuxer readahead still matters for how much data can build
-        /// up while playback is manually paused. Match it to the user-facing
-        /// buffer budget so a paused live stream can keep filling that window.
-        static func demuxerReadAheadSeconds(for bufferSeconds: Int) -> Double {
+        /// User-facing minimum forward buffer. Playback should start with at
+        /// least this much media available and should pause before the cache
+        /// dries out completely.
+        static func minimumCacheSeconds(for bufferSeconds: Int) -> Double {
             max(Double(bufferSeconds), 1)
         }
 
-        /// Hysteresis controls how far the cache must drain before mpv resumes
-        /// fetching. Keep it at ~40% of the buffer window so there's enough
-        /// runway to survive a network hiccup after the demuxer pauses.
-        /// Per the mpv manual, this value must be less than cache-secs to
-        /// avoid the demuxer never resuming.
+        /// Add a small hysteresis band above the minimum so brief throughput
+        /// dips do not cause pause/resume chatter.
+        static func resumeCacheSeconds(for bufferSeconds: Int) -> Double {
+            let minimum = minimumCacheSeconds(for: bufferSeconds)
+            return minimum + max(1, minimum * 0.25)
+        }
+
+        /// mpv's cache size is a capacity, not the minimum we want to hold.
+        /// Keep enough headroom above the user's live-delay target for jitter,
+        /// but cap it so "close to live" users do not drift indefinitely.
+        static func cacheCapacitySeconds(for bufferSeconds: Int) -> Double {
+            let minimum = minimumCacheSeconds(for: bufferSeconds)
+            let capacity = max(minimum * 3, resumeCacheSeconds(for: bufferSeconds) + 2)
+            return min(capacity, 60)
+        }
+
+        /// mpv's demuxer readahead still matters for how much data can build
+        /// up while playback is manually paused. Match it to the cache
+        /// capacity, not the user-facing minimum.
+        static func demuxerReadAheadSeconds(for bufferSeconds: Int) -> Double {
+            cacheCapacitySeconds(for: bufferSeconds)
+        }
+
+        /// Size the packet queue from the time budget. Fixed 16-64 MiB caps
+        /// are too small for high-bitrate live sport, which means the player
+        /// can hit the byte ceiling before it has actually built the seconds
+        /// of cache the user asked for.
+        static func demuxerMaxBytes(for bufferSeconds: Int, focused: Bool) -> String {
+            let mibPerSecond = focused ? 6 : 4
+            let floorMiB = focused ? 96 : 48
+            let capMiB = focused ? 256 : 128
+            let mib = min(max(bufferSeconds * mibPerSecond, floorMiB), capMiB)
+            return "\(mib)MiB"
+        }
+
+        static func demuxerMaxBackBytes(for bufferSeconds: Int, focused: Bool) -> String {
+            let mib = focused
+                ? min(max(bufferSeconds, 8), 32)
+                : min(max(bufferSeconds / 2, 4), 16)
+            return "\(mib)MiB"
+        }
+
+        /// Keep hysteresis disabled so mpv continuously refills the forward
+        /// cache instead of letting it drain in chunks. The app's network
+        /// buffer setting is meant to buy playback reliability, not just cap
+        /// memory use.
         static func demuxerHysteresisSeconds(for bufferSeconds: Int) -> Double {
-            let secs = Double(bufferSeconds)
-            return max(min(secs * 0.4, secs - 1), 0)
+            0
+        }
+
+        /// Amount of cached media mpv should rebuild before leaving
+        /// "buffering" mode after an underrun or initial load.
+        static func cachePauseWaitSeconds(for bufferSeconds: Int) -> Double {
+            minimumCacheSeconds(for: bufferSeconds)
         }
 
         static var liveStreamLavfOptions: String {
@@ -186,6 +232,9 @@ final class MPVPlayer {
     private var eventSource: DispatchSourceRead?
     private var statePollTimer: DispatchSourceTimer?
     private var bufferSeconds: Int = BufferSetting.read()
+    @ObservationIgnored private var activeMinimumCacheSeconds: Double = Tuning.minimumCacheSeconds(for: BufferSetting.read())
+    @ObservationIgnored private var activeResumeCacheSeconds: Double = Tuning.resumeCacheSeconds(for: BufferSetting.read())
+    @ObservationIgnored private var autoPausedForCacheFloor = false
     private var defaultsObserver: NSObjectProtocol?
     private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
 
@@ -330,39 +379,46 @@ final class MPVPlayer {
         let maxBytes: String
         let maxBackBytes: String
         let pollMs: Int
-        let cacheSecs: Int
+        let cacheFloorSecs: Int
 
         if !multiView {
-            maxBytes = "64MiB"
-            maxBackBytes = "8MiB"
+            maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true)
+            maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true)
             pollMs = 250
-            cacheSecs = bufferSeconds
+            cacheFloorSecs = bufferSeconds
         } else if focused {
-            maxBytes = "32MiB"
-            maxBackBytes = "4MiB"
+            maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true)
+            maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true)
             pollMs = 250
-            cacheSecs = bufferSeconds
+            cacheFloorSecs = bufferSeconds
         } else {
-            maxBytes = "16MiB"
-            maxBackBytes = "2MiB"
+            maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: false)
+            maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: false)
             pollMs = 1000
-            cacheSecs = max(bufferSeconds / 2, 1)
+            cacheFloorSecs = max(bufferSeconds / 2, min(bufferSeconds, 5))
         }
+
+        activeMinimumCacheSeconds = Tuning.minimumCacheSeconds(for: cacheFloorSecs)
+        activeResumeCacheSeconds = Tuning.resumeCacheSeconds(for: cacheFloorSecs)
 
         setRuntimeProperty(handle, "demuxer-max-bytes", maxBytes)
         setRuntimeProperty(handle, "demuxer-max-back-bytes", maxBackBytes)
 
-        var cacheVal = Double(cacheSecs)
+        var cacheVal = Tuning.cacheCapacitySeconds(for: cacheFloorSecs)
         _ = "cache-secs".withCString { n in
             mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &cacheVal)
         }
-        var readahead = Tuning.demuxerReadAheadSeconds(for: cacheSecs)
+        var readahead = Tuning.demuxerReadAheadSeconds(for: cacheFloorSecs)
         _ = "demuxer-readahead-secs".withCString { n in
             mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &readahead)
         }
-        var hysteresis = Tuning.demuxerHysteresisSeconds(for: cacheSecs)
+        var hysteresis = Tuning.demuxerHysteresisSeconds(for: cacheFloorSecs)
         _ = "demuxer-hysteresis-secs".withCString { n in
             mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &hysteresis)
+        }
+        var cachePauseWait = Tuning.cachePauseWaitSeconds(for: cacheFloorSecs)
+        _ = "cache-pause-wait".withCString { n in
+            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &cachePauseWait)
         }
 
         statePollTimer?.schedule(
@@ -473,13 +529,16 @@ final class MPVPlayer {
         setOption(newHandle, "volume", "100")
         setOption(newHandle, "volume-max", "130")
 
-        // Live HLS tuning — keep the cache short so IPTV streams stay close to live.
+        // Live HLS tuning. Keep the cache bounded by the user's latency
+        // budget, but let mpv pause/rebuffer instead of driving playback until
+        // the forward cache repeatedly hits zero.
         setOption(newHandle, "cache", "yes")
-        setOption(newHandle, "cache-secs", String(bufferSeconds))
-        setOption(newHandle, "cache-pause", "no")
-        setOption(newHandle, "cache-pause-initial", "no")
-        setOption(newHandle, "demuxer-max-bytes", "64MiB")
-        setOption(newHandle, "demuxer-max-back-bytes", "8MiB")
+        setOption(newHandle, "cache-secs", String(Tuning.cacheCapacitySeconds(for: bufferSeconds)))
+        setOption(newHandle, "cache-pause", "yes")
+        setOption(newHandle, "cache-pause-initial", "yes")
+        setOption(newHandle, "cache-pause-wait", String(Tuning.cachePauseWaitSeconds(for: bufferSeconds)))
+        setOption(newHandle, "demuxer-max-bytes", Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true))
+        setOption(newHandle, "demuxer-max-back-bytes", Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true))
         setOption(newHandle, "demuxer-readahead-secs", String(Tuning.demuxerReadAheadSeconds(for: bufferSeconds)))
         setOption(newHandle, "demuxer-hysteresis-secs", String(Tuning.demuxerHysteresisSeconds(for: bufferSeconds)))
         // The `low-latency` profile sets `demuxer-lavf-probe-info=nostreams`
@@ -538,8 +597,10 @@ final class MPVPlayer {
         let newValue = BufferSetting.read()
         guard newValue != bufferSeconds else { return }
         bufferSeconds = newValue
+        activeMinimumCacheSeconds = Tuning.minimumCacheSeconds(for: newValue)
+        activeResumeCacheSeconds = Tuning.resumeCacheSeconds(for: newValue)
         guard let handle else { return }
-        var value = Double(newValue)
+        var value = Tuning.cacheCapacitySeconds(for: newValue)
         _ = "cache-secs".withCString { n in
             mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &value)
         }
@@ -550,6 +611,10 @@ final class MPVPlayer {
         var hysteresis = Tuning.demuxerHysteresisSeconds(for: newValue)
         _ = "demuxer-hysteresis-secs".withCString { n in
             mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &hysteresis)
+        }
+        var cachePauseWait = Tuning.cachePauseWaitSeconds(for: newValue)
+        _ = "cache-pause-wait".withCString { n in
+            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &cachePauseWait)
         }
     }
 
@@ -997,6 +1062,32 @@ final class MPVPlayer {
         if let isSeekable = pending.isSeekable {
             setState(\.isSeekable, isSeekable)
         }
+
+        if let cacheSeconds = pending.cacheSeconds {
+            maintainLiveCacheFloor(cacheSeconds: cacheSeconds)
+        }
+    }
+
+    private func maintainLiveCacheFloor(cacheSeconds: Double) {
+        guard currentURL?.isFileURL == false,
+              !isLoading,
+              timePos > 0.5,
+              cacheSeconds.isFinite else { return }
+
+        if autoPausedForCacheFloor {
+            guard cacheSeconds >= activeResumeCacheSeconds else { return }
+            autoPausedForCacheFloor = false
+            setFlag("pause", false)
+            setState(\.isBuffering, false)
+            AppLog.playback.info("cache floor resume cache=\(cacheSeconds, privacy: .public) resume=\(self.activeResumeCacheSeconds, privacy: .public)")
+            return
+        }
+
+        guard isPlaying, cacheSeconds < activeMinimumCacheSeconds else { return }
+        autoPausedForCacheFloor = true
+        setFlag("pause", true)
+        setState(\.isBuffering, true)
+        AppLog.playback.warning("cache floor pause cache=\(cacheSeconds, privacy: .public) minimum=\(self.activeMinimumCacheSeconds, privacy: .public) resume=\(self.activeResumeCacheSeconds, privacy: .public)")
     }
 
     private func setState<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<MPVPlayer, Value>, _ value: Value) {
