@@ -141,12 +141,13 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private let slowRetryFailureWindow: TimeInterval = 60
     @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
 
-    // 509-specific backoff — much longer than transient errors.
-    // 509 means "Bandwidth Limit Exceeded" from the provider: retrying
-    // aggressively adds to the bandwidth that already exceeded the cap.
-    @ObservationIgnored private let http509BaseDelay: TimeInterval = 30
-    @ObservationIgnored private let http509MaxDelay: TimeInterval = 300
-    @ObservationIgnored private let http509MaxRetries: Int = 3
+    // 509-specific retry policy. Providers often use 509 for short CDN or
+    // account throttling blips; recover quickly and silently first, then only
+    // show UI if the same playback session keeps failing.
+    @ObservationIgnored private let http509BaseDelay: TimeInterval = 1
+    @ObservationIgnored private let http509MaxDelay: TimeInterval = 6
+    @ObservationIgnored private let http509VisibleFailureWindow: TimeInterval = 12
+    @ObservationIgnored private let http509SlowRetryDelay: TimeInterval = 10
 
     fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
         switch reason {
@@ -181,6 +182,7 @@ final class PlayerSlot: Identifiable {
     private func handleFileLoaded() {
         lastObservedTimePos = player.timePos
         lastPlaybackProgressAt = Date()
+        player.clearReconnectingErrorMessage()
     }
 
     private func handleStreamIssue(_ issue: MPVStreamIssue) {
@@ -258,20 +260,15 @@ final class PlayerSlot: Identifiable {
         stallWatchdog?.cancel()
         stallWatchdog = nil
 
-        // 509 has its own backoff tier — much longer delays because retrying
-        // adds to the bandwidth that already exceeded the cap.
         if is509 {
-            // Max 3 retries for 509, then give up permanently.
-            guard attempt < http509MaxRetries else {
-                player.setReconnectingErrorMessage("Bandwidth limit — giving up after \(http509MaxRetries) attempts.")
-                reconnectTask?.cancel()
-                reconnectTask = nil
-                pendingReconnectIs509 = false
-                return
+            let failureAge = firstFailureAt.map { Date().timeIntervalSince($0) } ?? 0
+            let fastDelay = min(http509BaseDelay * pow(2.0, Double(min(attempt, 3))), http509MaxDelay)
+            let delay = failureAge >= slowRetryFailureWindow ? http509SlowRetryDelay : fastDelay
+            if failureAge >= http509VisibleFailureWindow {
+                player.setReconnectingErrorMessage("Bandwidth limit — retrying in \(Int(delay))s…")
+            } else {
+                player.clearReconnectingErrorMessage()
             }
-
-            let delay = min(http509BaseDelay * pow(2.0, Double(attempt)), http509MaxDelay)
-            player.setReconnectingErrorMessage("Bandwidth limit — retrying in \(Int(delay))s…")
             reconnectTask?.cancel()
             pendingReconnectIs509 = true
             reconnectTask = Task { @MainActor [weak self] in
