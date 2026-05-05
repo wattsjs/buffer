@@ -62,6 +62,7 @@ final class PlayerSlot: Identifiable {
     let id = UUID()
     var channel: Channel
     var currentProgram: EPGProgram?
+    private(set) var playbackStreamHealth = StreamHealth()
 
     // MPVPlayer is created lazily on first access. SwiftUI re-invokes view
     // inits on every parent re-render; a discarded slot must not spawn an
@@ -110,6 +111,7 @@ final class PlayerSlot: Identifiable {
 
     @ObservationIgnored private var reconnectAttempt: Int = 0
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingReconnectIs509: Bool = false
     @ObservationIgnored private var firstFailureAt: Date?
     @ObservationIgnored private var playbackWatchdog: Task<Void, Never>?
     @ObservationIgnored private var stallWatchdog: Task<Void, Never>?
@@ -118,8 +120,6 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var lastPlaybackProgressAt: Date?
     @ObservationIgnored private var expectedStoppedEndFiles: Int = 0
     @ObservationIgnored private var lastReconnectAt: Date?
-    @ObservationIgnored private var streamIssueWindowStart: Date?
-    @ObservationIgnored private var streamIssueCount: Int = 0
 
     /// After this long of continuous reconnect failures without a single
     /// successful `FILE_LOADED`, surface an error to the user. The reconnect
@@ -140,9 +140,6 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private let minimumImmediateReconnectSpacing: TimeInterval = 2
     @ObservationIgnored private let slowRetryFailureWindow: TimeInterval = 60
     @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
-    @ObservationIgnored private let streamIssueWindow: TimeInterval = 20
-    @ObservationIgnored private let repeatedStreamIssueThreshold: Int = 2
-    @ObservationIgnored private let http509Count: Int = 0
 
     // 509-specific backoff — much longer than transient errors.
     // 509 means "Bandwidth Limit Exceeded" from the provider: retrying
@@ -150,7 +147,6 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private let http509BaseDelay: TimeInterval = 30
     @ObservationIgnored private let http509MaxDelay: TimeInterval = 300
     @ObservationIgnored private let http509MaxRetries: Int = 3
-    @ObservationIgnored private let http509ImmediateSpacing: TimeInterval = 15
 
     fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
         switch reason {
@@ -185,41 +181,52 @@ final class PlayerSlot: Identifiable {
     private func handleFileLoaded() {
         lastObservedTimePos = player.timePos
         lastPlaybackProgressAt = Date()
-        streamIssueWindowStart = nil
-        streamIssueCount = 0
     }
 
     private func handleStreamIssue(_ issue: MPVStreamIssue) {
         guard playbackMode == .live else { return }
         if let event = streamHealthEvent(for: issue) {
-            StreamProbeService.shared.recordStreamHealthEvent(
-                channelID: channel.id,
-                event: event
-            )
+            playbackStreamHealth.record(event)
         }
         guard reconnectTask == nil else { return }
 
-        let shouldRecover: Bool
+        let recoveryReason: MPVEndReason?
         switch issue {
-        case .hlsReloadFailed, .httpError:
-            shouldRecover = true
+        case .hlsReloadFailed:
+            recoveryReason = .error(
+                code: 0,
+                message: "stream network recovery: \(issue.recoveryMessage)"
+            )
+        case .httpError(let message) where isHTTP509Message(message):
+            recoveryReason = .http509(message: message)
+        case .httpError:
+            recoveryReason = .error(
+                code: 0,
+                message: "stream network recovery: \(issue.recoveryMessage)"
+            )
         case .reconnecting:
-            shouldRecover = noteRepeatedStreamIssue()
+            // mpv's libavformat reconnect is a lightweight segment-level
+            // recovery path. Escalating these warnings to `loadfile replace`
+            // interrupts otherwise healthy playback; the stall watchdog will
+            // still reload if the playhead actually stops advancing.
+            recoveryReason = nil
         }
 
-        guard shouldRecover else { return }
-
-        let reason = MPVEndReason.error(
-            code: 0,
-            message: "stream network recovery: \(issue.recoveryMessage)"
-        )
+        guard let reason = recoveryReason else { return }
         scheduleReconnect(reason: reason, immediate: true)
+    }
+
+    private func isHTTP509Message(_ message: String) -> Bool {
+        message.range(
+            of: #"\b(?:HTTP error|HTTP|Server returned)\s+509\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     private func streamHealthEvent(for issue: MPVStreamIssue) -> StreamHealthEvent? {
         switch issue {
         case .httpError(let message):
-            return message.contains("509") ? .http509 : nil
+            return isHTTP509Message(message) ? .http509 : nil
         case .hlsReloadFailed:
             return .playlistReloadFailure
         case .reconnecting:
@@ -227,31 +234,29 @@ final class PlayerSlot: Identifiable {
         }
     }
 
-    private func noteRepeatedStreamIssue() -> Bool {
-        let now = Date()
-        if let windowStart = streamIssueWindowStart,
-           now.timeIntervalSince(windowStart) <= streamIssueWindow {
-            streamIssueCount += 1
-        } else {
-            streamIssueWindowStart = now
-            streamIssueCount = 1
-        }
-        return streamIssueCount >= repeatedStreamIssueThreshold
-    }
-
     private func scheduleReconnect(reason: MPVEndReason, immediate: Bool = false) {
         let is509 = if case .http509 = reason { true } else { false }
+        if reconnectTask != nil {
+            guard is509, !pendingReconnectIs509 else {
+                AppLog.playback.debug("Reconnect already scheduled channel=\(self.channel.name, privacy: .public) pendingIs509=\(self.pendingReconnectIs509, privacy: .public) ignoredReason=\(String(describing: reason), privacy: .public)")
+                return
+            }
+        }
         AppLog.playback.warning("Scheduling reconnect channel=\(self.channel.name, privacy: .public) is509=\(is509, privacy: .public) reason=\(String(describing: reason), privacy: .public) immediate=\(immediate, privacy: .public) attempt=\(self.reconnectAttempt, privacy: .public)")
 
         // Mark the start of a failure streak so we know when to give up
-        // visibly.  is cleared on every successful playback
-        // beyond .
+        // visibly. It is cleared after sustained successful playback.
         if firstFailureAt == nil {
             firstFailureAt = Date()
         }
 
         let attempt = reconnectAttempt
         reconnectAttempt += 1
+
+        playbackWatchdog?.cancel()
+        playbackWatchdog = nil
+        stallWatchdog?.cancel()
+        stallWatchdog = nil
 
         // 509 has its own backoff tier — much longer delays because retrying
         // adds to the bandwidth that already exceeded the cap.
@@ -261,12 +266,14 @@ final class PlayerSlot: Identifiable {
                 player.setReconnectingErrorMessage("Bandwidth limit — giving up after \(http509MaxRetries) attempts.")
                 reconnectTask?.cancel()
                 reconnectTask = nil
+                pendingReconnectIs509 = false
                 return
             }
 
             let delay = min(http509BaseDelay * pow(2.0, Double(attempt)), http509MaxDelay)
             player.setReconnectingErrorMessage("Bandwidth limit — retrying in \(Int(delay))s…")
             reconnectTask?.cancel()
+            pendingReconnectIs509 = true
             reconnectTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(delay))
                 guard !Task.isCancelled, let self else { return }
@@ -302,12 +309,8 @@ final class PlayerSlot: Identifiable {
             }
         }
 
-        playbackWatchdog?.cancel()
-        playbackWatchdog = nil
-        stallWatchdog?.cancel()
-        stallWatchdog = nil
-
         reconnectTask?.cancel()
+        pendingReconnectIs509 = false
         reconnectTask = Task { @MainActor [weak self] in
             if delay > 0 {
                 try? await Task.sleep(for: .seconds(delay))
@@ -320,12 +323,10 @@ final class PlayerSlot: Identifiable {
     private func performReconnect() {
         guard playbackMode == .live else { return }
         AppLog.playback.info("Performing reconnect channel=\(self.channel.name, privacy: .public)")
-        StreamProbeService.shared.recordStreamHealthEvent(
-            channelID: channel.id,
-            event: .recoveryReload
-        )
+        playbackStreamHealth.record(.recoveryReload)
         lastReconnectAt = Date()
         reconnectTask = nil
+        pendingReconnectIs509 = false
         stopRecoveryTasks(resetFailureWindow: false)
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(channel.streamURL, autoplay: true)
@@ -373,7 +374,9 @@ final class PlayerSlot: Identifiable {
 
                 self.lastObservedTimePos = currentTimePos
 
-                if !self.player.isPlaying {
+                if !self.player.isPlaying,
+                   !self.player.isBuffering,
+                   !self.player.isLoading {
                     self.lastPlaybackProgressAt = Date()
                     continue
                 }
@@ -412,6 +415,7 @@ final class PlayerSlot: Identifiable {
     private func stopRecoveryTasks(resetFailureWindow: Bool) {
         reconnectTask?.cancel()
         reconnectTask = nil
+        pendingReconnectIs509 = false
         playbackWatchdog?.cancel()
         playbackWatchdog = nil
         stallWatchdog?.cancel()
@@ -424,8 +428,6 @@ final class PlayerSlot: Identifiable {
             lastReconnectAt = nil
         }
 
-        streamIssueWindowStart = nil
-        streamIssueCount = 0
     }
 
     private func noteExpectedStopIfReplacingCurrentItem() {
@@ -449,6 +451,7 @@ final class PlayerSlot: Identifiable {
 
     func loadInitialLive() {
         playbackMode = .live
+        playbackStreamHealth = StreamHealth()
         stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
@@ -461,6 +464,7 @@ final class PlayerSlot: Identifiable {
 
     func loadLive() {
         playbackMode = .live
+        playbackStreamHealth = StreamHealth()
         stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
@@ -471,6 +475,7 @@ final class PlayerSlot: Identifiable {
 
     func loadCatchup(_ url: URL) {
         playbackMode = .catchup
+        playbackStreamHealth = StreamHealth()
         cancelReconnect()
         player.clearReconnectingErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
