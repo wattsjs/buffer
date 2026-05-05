@@ -72,7 +72,22 @@ struct MPVMediaInfo: Equatable, Sendable {
     }
 }
 
-    @ObservationIgnored private var focusedScaling: Bool = true
+struct MPVPlaybackStats: Equatable, Sendable {
+    var containerFps: Double = 0
+    var estimatedFps: Double = 0
+    var videoBitrateBps: Int64 = 0
+    var audioBitrateBps: Int64 = 0
+    var frameDrops: Int64 = 0
+    var decoderFrameDrops: Int64 = 0
+    var delayedFrames: Int64 = 0
+    var mistimedFrames: Int64 = 0
+    var configuredBufferSeconds: Int = BufferSetting.read()
+    var cachePauseFloorSeconds: Double = 0
+    var cachePauseResumeSeconds: Double = 0
+    var renderProfile: String = "focused"
+    var autoPausedForCacheFloor: Bool = false
+}
+
 @MainActor
 @Observable
 final class MPVPlayer {
@@ -80,19 +95,33 @@ final class MPVPlayer {
         static let stateEpsilon = 0.01
         static let timePosEpsilon = 0.05
         static let cacheEpsilon = 0.25
-        static let demuxerLavfProbeSize = 1_048_576
+        static let demuxerLavfProbeSize = 4_194_304
         // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
         // AVOption surface.
-        static let demuxerLavfAnalyzeDuration = 3.0
+        static let demuxerLavfAnalyzeDuration = 5.0
         static let fastProbeSize = 65_536
         static let fastAnalyzeDuration = 0.1
         static let liveLatencyEpsilon = 0.5
 
-        /// User-facing minimum forward buffer. Playback should start with at
-        /// least this much media available and should pause before the cache
-        /// dries out completely.
+        /// User-facing forward buffer target. Startup and mpv's cache-pause
+        /// wait should use this target, but steady-state playback should not
+        /// pause just because live cache briefly dips below it.
         static func minimumCacheSeconds(for bufferSeconds: Int) -> Double {
             max(Double(bufferSeconds), 1)
+        }
+
+        /// Critical steady-state floor for Buffer's own pause guard. mpv's
+        /// built-in cache-pause handles normal underruns; this app-level guard
+        /// is only for near-empty cache where continuing would visibly freeze.
+        static func cachePauseFloorSeconds(for bufferSeconds: Int) -> Double {
+            let minimum = minimumCacheSeconds(for: bufferSeconds)
+            return min(max(0.5, minimum * 0.2), 1.0)
+        }
+
+        /// Resume quickly from the app-level emergency pause. Waiting for the
+        /// full user-facing target here turns brief dips into long stalls.
+        static func cachePauseResumeSeconds(for bufferSeconds: Int) -> Double {
+            max(cachePauseFloorSeconds(for: bufferSeconds) + 0.75, 1.5)
         }
 
         /// Add a small hysteresis band above the minimum so brief throughput
@@ -146,9 +175,10 @@ final class MPVPlayer {
         }
 
         /// Amount of cached media mpv should rebuild before leaving
-        /// "buffering" mode after an underrun or initial load.
+        /// "buffering" mode after an underrun or initial load. Use a partial
+        /// target so recovery does not add the full user buffer as latency.
         static func cachePauseWaitSeconds(for bufferSeconds: Int) -> Double {
-            minimumCacheSeconds(for: bufferSeconds)
+            min(max(1.25, minimumCacheSeconds(for: bufferSeconds) * 0.5), 3.0)
         }
 
         static var liveStreamLavfOptions: String {
@@ -177,6 +207,7 @@ final class MPVPlayer {
     }
 
     private(set) var mediaInfo = MPVMediaInfo()
+    private(set) var playbackStats = MPVPlaybackStats()
     private(set) var isPlaying = false
     private(set) var errorMessage: String?
     private(set) var cacheSeconds: Double = 0
@@ -267,15 +298,17 @@ final class MPVPlayer {
     private var eventSource: DispatchSourceRead?
     private var statePollTimer: DispatchSourceTimer?
     private var bufferSeconds: Int = BufferSetting.read()
-    @ObservationIgnored private var activeMinimumCacheSeconds: Double = Tuning.minimumCacheSeconds(for: BufferSetting.read())
-    @ObservationIgnored private var activeResumeCacheSeconds: Double = Tuning.resumeCacheSeconds(for: BufferSetting.read())
+    @ObservationIgnored private var activeCachePauseFloorSeconds: Double = Tuning.cachePauseFloorSeconds(for: BufferSetting.read())
+    @ObservationIgnored private var activeCachePauseResumeSeconds: Double = Tuning.cachePauseResumeSeconds(for: BufferSetting.read())
     @ObservationIgnored private var autoPausedForCacheFloor = false
+    @ObservationIgnored private var focusedScaling: Bool = true
     private var defaultsObserver: NSObjectProtocol?
     private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
     @ObservationIgnored private var lastHTTPStatusCode: Int = 0
 
     init() {
         setupMPV()
+        refreshPlaybackTuningStats(renderProfile: "focused")
         defaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: nil,
@@ -306,6 +339,8 @@ final class MPVPlayer {
         isSeekable = false
         cacheSeconds = 0
         isBuffering = false
+        autoPausedForCacheFloor = false
+        refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
         setFlag("pause", !autoplay)
         isPlaying = autoplay
         isLoading = true
@@ -440,8 +475,9 @@ final class MPVPlayer {
             focusedScaling = false
         }
 
-        activeMinimumCacheSeconds = Tuning.minimumCacheSeconds(for: cacheFloorSecs)
-        activeResumeCacheSeconds = Tuning.resumeCacheSeconds(for: cacheFloorSecs)
+        activeCachePauseFloorSeconds = Tuning.cachePauseFloorSeconds(for: cacheFloorSecs)
+        activeCachePauseResumeSeconds = Tuning.cachePauseResumeSeconds(for: cacheFloorSecs)
+        refreshPlaybackTuningStats(renderProfile: focusedScaling ? "focused" : "background")
 
         setRuntimeProperty(handle, "demuxer-max-bytes", maxBytes)
         setRuntimeProperty(handle, "demuxer-max-back-bytes", maxBackBytes)
@@ -659,6 +695,12 @@ final class MPVPlayer {
         mpv_observe_property(newHandle, PropID.timePos.rawValue, "time-pos", MPV_FORMAT_DOUBLE)
         mpv_observe_property(newHandle, PropID.duration.rawValue, "duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(newHandle, PropID.seekable.rawValue, "seekable", MPV_FORMAT_FLAG)
+        mpv_observe_property(newHandle, PropID.videoBitrate.rawValue, "video-bitrate", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, PropID.audioBitrate.rawValue, "audio-bitrate", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, PropID.frameDrops.rawValue, "frame-drop-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, PropID.decoderFrameDrops.rawValue, "decoder-frame-drop-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, PropID.delayedFrames.rawValue, "vo-delayed-frame-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, PropID.mistimedFrames.rawValue, "mistimed-frame-count", MPV_FORMAT_INT64)
         startEventPump(handle: newHandle)
         startCacheFloorTimer()
 
@@ -672,8 +714,9 @@ final class MPVPlayer {
         let newValue = BufferSetting.read()
         guard newValue != bufferSeconds else { return }
         bufferSeconds = newValue
-        activeMinimumCacheSeconds = Tuning.minimumCacheSeconds(for: newValue)
-        activeResumeCacheSeconds = Tuning.resumeCacheSeconds(for: newValue)
+        activeCachePauseFloorSeconds = Tuning.cachePauseFloorSeconds(for: newValue)
+        activeCachePauseResumeSeconds = Tuning.cachePauseResumeSeconds(for: newValue)
+        refreshPlaybackTuningStats()
         guard let handle else { return }
         var value = Tuning.cacheCapacitySeconds(for: newValue)
         _ = "cache-secs".withCString { n in
@@ -1025,6 +1068,12 @@ final class MPVPlayer {
         case timePos
         case duration
         case seekable
+        case videoBitrate
+        case audioBitrate
+        case frameDrops
+        case decoderFrameDrops
+        case delayedFrames
+        case mistimedFrames
     }
 
     private struct PendingChanges {
@@ -1044,6 +1093,12 @@ final class MPVPlayer {
         var timePos: Double?
         var duration: Double?
         var isSeekable: Bool?
+        var videoBitrateBps: Int64?
+        var audioBitrateBps: Int64?
+        var frameDrops: Int64?
+        var decoderFrameDrops: Int64?
+        var delayedFrames: Int64?
+        var mistimedFrames: Int64?
 
         var hasChanges: Bool {
             isPlaying != nil ||
@@ -1061,7 +1116,13 @@ final class MPVPlayer {
             isMuted != nil ||
             timePos != nil ||
             duration != nil ||
-            isSeekable != nil
+            isSeekable != nil ||
+            videoBitrateBps != nil ||
+            audioBitrateBps != nil ||
+            frameDrops != nil ||
+            decoderFrameDrops != nil ||
+            delayedFrames != nil ||
+            mistimedFrames != nil
         }
     }
 
@@ -1124,6 +1185,18 @@ final class MPVPlayer {
             if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
                 pending.isSeekable = data.assumingMemoryBound(to: Int32.self).pointee != 0
             }
+        case .videoBitrate:
+            pending.videoBitrateBps = readInt64(prop)
+        case .audioBitrate:
+            pending.audioBitrateBps = readInt64(prop)
+        case .frameDrops:
+            pending.frameDrops = readInt64(prop)
+        case .decoderFrameDrops:
+            pending.decoderFrameDrops = readInt64(prop)
+        case .delayedFrames:
+            pending.delayedFrames = readInt64(prop)
+        case .mistimedFrames:
+            pending.mistimedFrames = readInt64(prop)
         }
     }
 
@@ -1217,6 +1290,35 @@ final class MPVPlayer {
             setState(\.isSeekable, isSeekable)
         }
 
+        var nextStats = playbackStats
+        if let containerFps = pending.containerFps {
+            nextStats.containerFps = containerFps
+        }
+        if let estimatedFps = pending.estimatedFps {
+            nextStats.estimatedFps = estimatedFps
+        }
+        if let videoBitrateBps = pending.videoBitrateBps {
+            nextStats.videoBitrateBps = videoBitrateBps
+        }
+        if let audioBitrateBps = pending.audioBitrateBps {
+            nextStats.audioBitrateBps = audioBitrateBps
+        }
+        if let frameDrops = pending.frameDrops {
+            nextStats.frameDrops = frameDrops
+        }
+        if let decoderFrameDrops = pending.decoderFrameDrops {
+            nextStats.decoderFrameDrops = decoderFrameDrops
+        }
+        if let delayedFrames = pending.delayedFrames {
+            nextStats.delayedFrames = delayedFrames
+        }
+        if let mistimedFrames = pending.mistimedFrames {
+            nextStats.mistimedFrames = mistimedFrames
+        }
+        if nextStats != playbackStats {
+            playbackStats = nextStats
+        }
+
         if let cacheSeconds = pending.cacheSeconds {
             maintainLiveCacheFloor(cacheSeconds: cacheSeconds)
         }
@@ -1229,19 +1331,42 @@ final class MPVPlayer {
               cacheSeconds.isFinite else { return }
 
         if autoPausedForCacheFloor {
-            guard cacheSeconds >= activeResumeCacheSeconds else { return }
+            guard cacheSeconds >= activeCachePauseResumeSeconds else { return }
             autoPausedForCacheFloor = false
             setFlag("pause", false)
             setState(\.isBuffering, false)
-            AppLog.playback.info("cache floor resume cache=\(cacheSeconds, privacy: .public) resume=\(self.activeResumeCacheSeconds, privacy: .public)")
+            refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
+            AppLog.playback.info("cache floor resume cache=\(cacheSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
             return
         }
 
-        guard isPlaying, cacheSeconds < activeMinimumCacheSeconds else { return }
+        guard isPlaying, cacheSeconds < activeCachePauseFloorSeconds else { return }
         autoPausedForCacheFloor = true
         setFlag("pause", true)
         setState(\.isBuffering, true)
-        AppLog.playback.warning("cache floor pause cache=\(cacheSeconds, privacy: .public) minimum=\(self.activeMinimumCacheSeconds, privacy: .public) resume=\(self.activeResumeCacheSeconds, privacy: .public)")
+        refreshPlaybackTuningStats(autoPausedForCacheFloor: true)
+        AppLog.playback.warning("cache floor pause cache=\(cacheSeconds, privacy: .public) floor=\(self.activeCachePauseFloorSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
+    }
+
+    private func refreshPlaybackTuningStats(
+        renderProfile: String? = nil,
+        autoPausedForCacheFloor: Bool? = nil
+    ) {
+        var next = playbackStats
+        next.configuredBufferSeconds = bufferSeconds
+        next.cachePauseFloorSeconds = activeCachePauseFloorSeconds
+        next.cachePauseResumeSeconds = activeCachePauseResumeSeconds
+        if let renderProfile {
+            next.renderProfile = renderProfile
+        }
+        if let autoPausedForCacheFloor {
+            next.autoPausedForCacheFloor = autoPausedForCacheFloor
+        } else {
+            next.autoPausedForCacheFloor = self.autoPausedForCacheFloor
+        }
+        if next != playbackStats {
+            playbackStats = next
+        }
     }
 
     private func setState<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<MPVPlayer, Value>, _ value: Value) {
@@ -1257,6 +1382,11 @@ final class MPVPlayer {
     private func readInt(_ prop: mpv_event_property) -> Int {
         guard prop.format == MPV_FORMAT_INT64, let data = prop.data else { return 0 }
         return Int(data.assumingMemoryBound(to: Int64.self).pointee)
+    }
+
+    private func readInt64(_ prop: mpv_event_property) -> Int64 {
+        guard prop.format == MPV_FORMAT_INT64, let data = prop.data else { return 0 }
+        return data.assumingMemoryBound(to: Int64.self).pointee
     }
 
     private func readString(_ prop: mpv_event_property) -> String {

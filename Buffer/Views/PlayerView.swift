@@ -87,6 +87,7 @@ struct PlayerView: View {
     /// moment playback of the new clip actually begins.
     @State private var isSeekingCatchup: Bool = false
     @State private var seekingTimeoutTask: Task<Void, Never>? = nil
+    @State private var liveReconciliationTask: Task<Void, Never>? = nil
     private let catchupClipDuration: TimeInterval = 2 * 60 * 60
 
     /// Sticky live indicator. Starts true for any source that has a live
@@ -131,9 +132,8 @@ struct PlayerView: View {
 
     private var channel: Channel? { session?.focusedSlot.channel }
     private var currentProgram: EPGProgram? { session?.focusedSlot.currentProgram }
-    private var focusedStreamHealth: StreamHealth? {
-        guard let channel else { return nil }
-        return streamProbeService.probe(for: channel.id)?.streamHealth
+    private var focusedStreamHealth: StreamHealth {
+        session?.focusedSlot.playbackStreamHealth ?? StreamHealth()
     }
     private var liveProgram: EPGProgram? {
         guard let c = channel else { return nil }
@@ -211,88 +211,98 @@ struct PlayerView: View {
     // MARK: - Body
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        GeometryReader { viewport in
+            ZStack {
+                Color.black.ignoresSafeArea()
 
-            // Render stack differs by mode, but chrome is unified below.
-            if let s = session {
-                PlayerGridView(session: s)
-                    .padding(s.isMulti ? 8 : 0)
-                    .ignoresSafeArea()
-            } else {
-                MPVLayerView(player: player)
-                    .ignoresSafeArea()
-            }
+                // Render stack differs by mode, but chrome is unified below.
+                if let s = session {
+                    PlayerGridView(session: s)
+                        .padding(s.isMulti ? 8 : 0)
+                        .ignoresSafeArea()
+                } else {
+                    MPVLayerView(player: player)
+                        .ignoresSafeArea()
+                }
 
-            // Tap-to-toggle-pause layer. Only the bottom 2/3 receives
-            // taps; the top 1/3 is a passthrough drag region for window
-            // movement. Disabled in multi-view (per-cell taps handle focus).
-            if !isMulti {
-                GeometryReader { geo in
-                    VStack(spacing: 0) {
-                        Color.clear
-                            .frame(height: geo.size.height / 3)
-                            .allowsHitTesting(false)
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                player.togglePause()
-                            }
+                // Tap-to-toggle-pause layer. Only the bottom 2/3 receives
+                // taps; the top 1/3 is a passthrough drag region for window
+                // movement. Disabled in multi-view (per-cell taps handle focus).
+                if !isMulti {
+                    GeometryReader { geo in
+                        VStack(spacing: 0) {
+                            Color.clear
+                                .frame(height: geo.size.height / 3)
+                                .allowsHitTesting(false)
+                            Color.clear
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    player.togglePause()
+                                }
+                        }
                     }
                 }
             }
-        }
-        .overlay(alignment: .topLeading) {
-            if showChrome && !isMulti {
-                infoStack
-                    .padding(16)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
+            .overlay(alignment: .topLeading) {
+                if showChrome && !isMulti {
+                    infoStack
+                        .padding(16)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
             }
-        }
-        .overlay(alignment: .topTrailing) {
-            if showChrome {
-                chromeButtons
-                    .padding(.top, 4)
-                    .padding(.trailing, 8)
-                    .transition(.opacity)
+            .overlay(alignment: .topTrailing) {
+                if showChrome {
+                    chromeButtons
+                        .padding(.top, 4)
+                        .padding(.trailing, 8)
+                        .transition(.opacity)
+                }
             }
-        }
-        .overlay(alignment: .bottomLeading) {
-            if showChrome && !isMulti {
-                controlsBar
-                    .padding(16)
-                    .transition(.opacity)
+            .overlay(alignment: .bottomLeading) {
+                if showChrome && !isMulti {
+                    controlsBar
+                        .padding(16)
+                        .transition(.opacity)
+                }
             }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if showChrome && !isMulti {
-                mediaInfoCard
-                    .padding(16)
-                    .transition(.opacity)
+            .overlay(alignment: .bottomTrailing) {
+                if showChrome && !isMulti {
+                    mediaInfoCard(maxStatsPanelHeight: statsPanelMaxHeight(for: viewport.size))
+                        .padding(16)
+                        .transition(.opacity)
+                }
             }
-        }
-        .overlay {
-            if let error = player.errorMessage {
-                playbackErrorView(error)
-                    .padding(24)
+            .overlay {
+                if let error = player.errorMessage {
+                    playbackErrorView(error)
+                        .padding(24)
+                }
             }
+            .onContinuousHover(coordinateSpace: .local) { phase in
+                switch phase {
+                case .active:
+                    if let s = session { PlayerSessionRegistry.shared.setActive(s) }
+                    revealChrome()
+                case .ended:
+                    scheduleChromeHide()
+                }
+            }
+            .onChange(of: player.errorMessage) { _, error in
+                if error == nil {
+                    scheduleChromeHide()
+                } else {
+                    chromeHideTask?.cancel()
+                    showChrome = true
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: showChrome)
         }
         .preferredColorScheme(.dark)
         .environment(\.colorScheme, .dark)
         .frame(minWidth: 640, minHeight: 360)
         .onAppear { handleOnAppear() }
         .onDisappear { handleOnDisappear() }
-        .onChange(of: player.timePos) { _, _ in
-            endSeekingIfPlaying()
-            reconcileLiveLatch()
-        }
-        .onChange(of: player.isBuffering) { _, _ in
-            endSeekingIfPlaying()
-        }
-        .onChange(of: player.duration) { _, _ in
-            reconcileLiveLatch()
-        }
         .background(WindowAccessor(
             showChrome: $showChrome,
             isPinned: chromeState.isPinned,
@@ -305,24 +315,6 @@ struct PlayerView: View {
                 handleKeyboardCommand(command, in: window)
             }
         )
-        .onContinuousHover(coordinateSpace: .local) { phase in
-            switch phase {
-            case .active:
-                if let s = session { PlayerSessionRegistry.shared.setActive(s) }
-                revealChrome()
-            case .ended:
-                scheduleChromeHide()
-            }
-        }
-        .onChange(of: player.errorMessage) { _, error in
-            if error == nil {
-                scheduleChromeHide()
-            } else {
-                chromeHideTask?.cancel()
-                showChrome = true
-            }
-        }
-        .animation(.easeInOut(duration: 0.2), value: showChrome)
     }
 
     // MARK: - Lifecycle
@@ -350,9 +342,12 @@ struct PlayerView: View {
             }
         }
         scheduleChromeHide()
+        startLiveReconciliationLoop()
     }
 
     private func handleOnDisappear() {
+        liveReconciliationTask?.cancel()
+        liveReconciliationTask = nil
         if let s = session {
             PlayerSessionRegistry.shared.unregister(s)
             for slot in s.slots {
@@ -1105,14 +1100,14 @@ struct PlayerView: View {
     // MARK: - Bottom-right: media info
 
     @ViewBuilder
-    private var mediaInfoCard: some View {
+    private func mediaInfoCard(maxStatsPanelHeight: CGFloat) -> some View {
         let info = player.mediaInfo
         let hasAny = info.width > 0 || info.fps > 0 || !info.videoCodec.isEmpty
 
         if hasAny {
             VStack(alignment: .trailing, spacing: 8) {
                 if showStatsForNerds {
-                    statsForNerdsPanel(info)
+                    statsForNerdsPanel(info, maxHeight: maxStatsPanelHeight)
                         .transition(.asymmetric(
                             insertion: .opacity
                                 .combined(with: .move(edge: .bottom))
@@ -1134,6 +1129,12 @@ struct PlayerView: View {
             .animation(.easeInOut(duration: 0.18), value: chromeState.mediaInfoDisplay)
             .animation(.easeInOut(duration: 0.18), value: showStatsForNerds)
         }
+    }
+
+    private func statsPanelMaxHeight(for viewportSize: CGSize) -> CGFloat {
+        // Leave room for the bottom media pill and overlay padding so the
+        // nerd panel scrolls inside the player window instead of escaping it.
+        max(170, viewportSize.height - 92)
     }
 
     @ViewBuilder
@@ -1210,37 +1211,102 @@ struct PlayerView: View {
     }
 
     @ViewBuilder
-    private func statsForNerdsPanel(_ info: MPVMediaInfo) -> some View {
-        let _ = streamProbeService.version
-        let streamHealth = focusedStreamHealth ?? StreamHealth()
+    private func statsForNerdsPanel(_ info: MPVMediaInfo, maxHeight: CGFloat) -> some View {
+        let streamHealth = focusedStreamHealth
+        let stats = player.playbackStats
+        let bodyMaxHeight = max(120, maxHeight - 48)
 
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Stats for Nerds")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-
-            VStack(spacing: 5) {
-                statsRow("Resolution", info.resolutionLabel)
-                statsRow("Frame rate", info.fps > 0 ? String(format: "%.2f fps", info.fps) : "")
-                statsRow("Video codec", info.videoCodec.uppercased())
-                statsRow("Audio", audioStatsLabel(info))
-                statsRow("Hardware decode", info.hwdec.isEmpty ? "" : info.hwdec)
-                statsRow("Cache", String(format: "%.1fs", player.cacheSeconds))
-                statsRow("Live latency", info.liveLatencySeconds.map { String(format: "%.1fs", $0) } ?? "")
-                statsRow("Position", playbackPositionLabel)
-                statsRow("Volume", "\(Int(player.volume.rounded()))%\(player.isMuted ? " muted" : "")")
-                if isChannelMode {
-                    statsRow("Stream health", streamHealth.statusLabel)
-                    statsRow("HTTP 509", "\(streamHealth.http509Count)")
-                    statsRow("Playlist reloads", "\(streamHealth.playlistReloadFailureCount)")
-                    statsRow("Reconnects", "\(streamHealth.reconnectCount)")
-                    statsRow("Recovery reloads", "\(streamHealth.recoveryReloadCount)")
-                }
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.green.opacity(0.9))
+                Text("Stats for Nerds")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                Spacer(minLength: 0)
+                Text(playbackStateLabel)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(player.isPlaying ? .green.opacity(0.95) : .yellow.opacity(0.95))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(.white.opacity(0.08), in: Capsule())
             }
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 10) {
+                    statsSection("Source") {
+                        statsRow("Channel", channel?.name ?? "")
+                        statsRow("Group", channel?.group ?? "")
+                        statsRow("Program", displayedProgram?.title ?? playback?.recording.title ?? "")
+                        statsRow("Mode", sourceModeLabel)
+                        statsRow("Host", streamHostLabel)
+                    }
+
+                    statsSection("Playback") {
+                        statsRow("Position", playbackPositionLabel)
+                        statsRow("Duration", player.duration > 0 ? formatDuration(player.duration) : "")
+                        statsRow("Seekable", boolLabel(player.isSeekable))
+                        statsRow("Live offset", nerdLiveOffsetLabel)
+                        statsRow("Preferred delay", player.preferredLiveDelay > 0 ? String(format: "%.1fs", player.preferredLiveDelay) : "")
+                        statsRow("Buffer target", String(format: "%ds", stats.configuredBufferSeconds))
+                        statsRow("Forward cache", String(format: "%.2fs", player.cacheSeconds))
+                        statsRow("Cache guard", String(format: "floor %.2fs / resume %.2fs", stats.cachePauseFloorSeconds, stats.cachePauseResumeSeconds))
+                        statsRow("Cache pause", stats.autoPausedForCacheFloor ? "app guard active" : (player.isBuffering ? "mpv cache pause" : "off"))
+                        statsRow("Volume", "\(Int(player.volume.rounded()))%\(player.isMuted ? " muted" : "")")
+                    }
+
+                    statsSection("Video") {
+                        statsRow("Resolution", info.resolutionLabel)
+                        statsRow("Display FPS", info.fps > 0 ? String(format: "%.2f fps", info.fps) : "")
+                        statsRow("FPS sources", fpsSourceLabel(stats))
+                        statsRow("Video codec", info.videoCodec.uppercased())
+                        statsRow("Hardware decode", info.hwdec.isEmpty ? "" : info.hwdec)
+                        statsRow("Render profile", stats.renderProfile)
+                        statsRow("Video bitrate", bitrateLabel(stats.videoBitrateBps))
+                        statsRow("Frame health", frameHealthLabel(stats))
+                    }
+
+                    statsSection("Audio") {
+                        statsRow("Codec", info.audioCodec.uppercased())
+                        statsRow("Channels", info.audioChannels > 0 ? "\(info.audioChannels)" : "")
+                        statsRow("Bitrate", bitrateLabel(stats.audioBitrateBps))
+                    }
+
+                    if isChannelMode {
+                        statsSection("Stream Health") {
+                            statsRow("Status", streamHealth.statusLabel)
+                            statsRow("HTTP 509", "\(streamHealth.http509Count)")
+                            statsRow("Playlist reloads", "\(streamHealth.playlistReloadFailureCount)")
+                            statsRow("Segment reconnects", "\(streamHealth.reconnectCount)")
+                            statsRow("Recovery reloads", "\(streamHealth.recoveryReloadCount)")
+                        }
+                    }
+                }
+                .padding(.trailing, 6)
+            }
+            .scrollIndicators(.visible)
+            .frame(maxHeight: bodyMaxHeight)
         }
         .padding(12)
-        .frame(width: 286, alignment: .leading)
+        .frame(width: 390, alignment: .topLeading)
+        .frame(maxHeight: maxHeight, alignment: .topLeading)
         .chromeSurface(in: RoundedRectangle(cornerRadius: 12, style: .continuous), fill: Color.black.opacity(0.68))
+    }
+
+    @ViewBuilder
+    private func statsSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title.uppercased())
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.white.opacity(0.48))
+            VStack(spacing: 4) {
+                content()
+            }
+        }
     }
 
     @ViewBuilder
@@ -1250,11 +1316,11 @@ struct PlayerView: View {
                 Text(label)
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.55))
-                    .frame(width: 112, alignment: .leading)
+                    .frame(width: 126, alignment: .leading)
                 Text(value)
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.white.opacity(0.88))
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
@@ -1273,6 +1339,68 @@ struct PlayerView: View {
             return "\(formatDuration(player.timePos)) / \(formatDuration(player.duration))"
         }
         return formatDuration(player.timePos)
+    }
+
+    private var playbackStateLabel: String {
+        if player.isLoading { return "LOADING" }
+        if player.isBuffering { return "BUFFERING" }
+        if player.isPlaying { return "PLAYING" }
+        return "PAUSED"
+    }
+
+    private var sourceModeLabel: String {
+        if isRecordingMode {
+            return playback?.isInProgress == true ? "recording live" : "recording file"
+        }
+        if isCatchup { return "catchup" }
+        if isMulti { return "multi-view live" }
+        return "live"
+    }
+
+    private var streamHostLabel: String {
+        guard let host = player.currentURL?.host else { return "" }
+        return host
+    }
+
+    private var nerdLiveOffsetLabel: String {
+        if let latency = player.mediaInfo.liveLatencySeconds {
+            return String(format: "%.1fs behind preferred live", latency)
+        }
+        if let behind = secondsBehindLive {
+            return String(format: "%.1fs behind", behind)
+        }
+        return ""
+    }
+
+    private func boolLabel(_ value: Bool) -> String {
+        value ? "yes" : "no"
+    }
+
+    private func fpsSourceLabel(_ stats: MPVPlaybackStats) -> String {
+        let parts = [
+            stats.containerFps > 0 ? String(format: "container %.2f", stats.containerFps) : "",
+            stats.estimatedFps > 0 ? String(format: "estimated %.2f", stats.estimatedFps) : "",
+        ].filter { !$0.isEmpty }
+        return parts.joined(separator: " · ")
+    }
+
+    private func bitrateLabel(_ bps: Int64) -> String {
+        guard bps > 0 else { return "" }
+        let mbps = Double(bps) / 1_000_000
+        if mbps >= 1 {
+            return String(format: "%.2f Mbps", mbps)
+        }
+        return String(format: "%.0f kbps", Double(bps) / 1_000)
+    }
+
+    private func frameHealthLabel(_ stats: MPVPlaybackStats) -> String {
+        let parts = [
+            stats.decoderFrameDrops > 0 ? "decoder \(stats.decoderFrameDrops)" : "",
+            stats.frameDrops > 0 ? "vo \(stats.frameDrops)" : "",
+            stats.delayedFrames > 0 ? "late \(stats.delayedFrames)" : "",
+            stats.mistimedFrames > 0 ? "mistimed \(stats.mistimedFrames)" : "",
+        ].filter { !$0.isEmpty }
+        return parts.isEmpty ? "clean" : parts.joined(separator: " · ")
     }
 
     private func formatDuration(_ seconds: Double) -> String {
@@ -1387,6 +1515,17 @@ struct PlayerView: View {
         seekingTimeoutTask?.cancel()
     }
 
+    private func startLiveReconciliationLoop() {
+        liveReconciliationTask?.cancel()
+        liveReconciliationTask = Task { @MainActor in
+            while !Task.isCancelled {
+                endSeekingIfPlaying()
+                reconcileLiveLatch()
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
     // MARK: - Live latch reconciliation
 
     /// Drives the sticky `liveLatched` state from observed offset. Called
@@ -1420,6 +1559,16 @@ struct PlayerView: View {
             seekByShortcut(-10)
         case .seekForward:
             seekByShortcut(10)
+        case .toggleStatsForNerds:
+            withAnimation(.spring(duration: 0.24, bounce: 0.18)) {
+                showStatsForNerds.toggle()
+            }
+            if showStatsForNerds {
+                chromeHideTask?.cancel()
+                showChrome = true
+            } else {
+                scheduleChromeHide()
+            }
         case .toggleFullScreen:
             window.toggleFullScreen(nil)
         case .dismiss:
@@ -1851,6 +2000,7 @@ private enum PlayerKeyboardCommand {
     case togglePlayPause
     case seekBackward
     case seekForward
+    case toggleStatsForNerds
     case toggleFullScreen
     case dismiss
 }
@@ -1942,6 +2092,9 @@ private struct PlayerKeyboardMonitor: NSViewRepresentable {
 
             if event.charactersIgnoringModifiers?.lowercased() == "f" {
                 return .toggleFullScreen
+            }
+            if event.charactersIgnoringModifiers?.lowercased() == "i" {
+                return .toggleStatsForNerds
             }
 
             return nil
