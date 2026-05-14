@@ -14,7 +14,7 @@ struct StreamProbeBadge: View {
     }
 
     @State private var service = StreamProbeService.shared
-    @AppStorage(StreamProbeSetting.enabledKey) private var probesEnabled: Bool = false
+    @AppStorage(StreamProbeSetting.enabledKey) private var probesEnabled: Bool = StreamProbeSetting.defaultEnabled
 
     var body: some View {
         // Touch `version` so SwiftUI re-renders when probe state changes.
@@ -155,7 +155,7 @@ extension View {
 private struct FadeIfStreamDeadModifier: ViewModifier {
     let channelID: String
     @State private var service = StreamProbeService.shared
-    @AppStorage(StreamProbeSetting.enabledKey) private var probesEnabled: Bool = false
+    @AppStorage(StreamProbeSetting.enabledKey) private var probesEnabled: Bool = StreamProbeSetting.defaultEnabled
 
     func body(content: Content) -> some View {
         let _ = service.version

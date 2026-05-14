@@ -391,34 +391,81 @@ class EPGViewModel {
     /// before its first fire — startup syncs are kicked off separately.
     func startSyncScheduler() {
         playlistSchedulerTask?.cancel()
-        playlistSchedulerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let hours = UserDefaults.standard.object(forKey: SyncInterval.playlistStorageKey) as? Int
-                    ?? SyncInterval.playlistDefault.hours
-                do {
-                    try await Task.sleep(for: .seconds(Double(hours) * 3600))
-                } catch {
-                    return
+        playlistSchedulerTask = nil
+        if SyncInterval.automaticRefreshEnabled(for: SyncInterval.playlistStorageKey, default: SyncInterval.playlistDefault) {
+            playlistSchedulerTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    let interval = SyncInterval.storedValue(
+                        for: SyncInterval.playlistStorageKey,
+                        default: SyncInterval.playlistDefault
+                    )
+                    guard let timeInterval = interval.timeInterval else { return }
+                    do {
+                        try await Task.sleep(for: .seconds(timeInterval))
+                    } catch {
+                        return
+                    }
+                    if Task.isCancelled { return }
+                    self?.sync(silent: true, scope: .all)
                 }
-                if Task.isCancelled { return }
-                self?.sync(silent: true, scope: .all)
             }
         }
 
         epgSchedulerTask?.cancel()
-        epgSchedulerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let hours = UserDefaults.standard.object(forKey: SyncInterval.epgStorageKey) as? Int
-                    ?? SyncInterval.epgDefault.hours
-                do {
-                    try await Task.sleep(for: .seconds(Double(hours) * 3600))
-                } catch {
-                    return
+        epgSchedulerTask = nil
+        if SyncInterval.automaticRefreshEnabled(for: SyncInterval.epgStorageKey, default: SyncInterval.epgDefault) {
+            epgSchedulerTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    let interval = SyncInterval.storedValue(
+                        for: SyncInterval.epgStorageKey,
+                        default: SyncInterval.epgDefault
+                    )
+                    guard let timeInterval = interval.timeInterval else { return }
+                    do {
+                        try await Task.sleep(for: .seconds(timeInterval))
+                    } catch {
+                        return
+                    }
+                    if Task.isCancelled { return }
+                    self?.sync(silent: true, scope: .epg)
                 }
-                if Task.isCancelled { return }
-                self?.sync(silent: true, scope: .epg)
             }
         }
+    }
+
+    func automaticRefreshEnabled(scope: SyncScope) -> Bool {
+        switch scope {
+        case .all:
+            SyncInterval.automaticRefreshEnabled(
+                for: SyncInterval.playlistStorageKey,
+                default: SyncInterval.playlistDefault
+            )
+        case .epg:
+            SyncInterval.automaticRefreshEnabled(
+                for: SyncInterval.epgStorageKey,
+                default: SyncInterval.epgDefault
+            )
+        }
+    }
+
+    private func syncIfAutomatic(scope: SyncScope, silent: Bool = false) {
+        if automaticRefreshEnabled(scope: scope) {
+            sync(silent: silent, scope: scope)
+        }
+    }
+
+    func syncOnLaunchIfNeeded() {
+        guard activePlaylist != nil else { return }
+        if channels.isEmpty {
+            syncIfAutomatic(scope: .all)
+        } else {
+            syncIfAutomatic(scope: .epg, silent: true)
+        }
+    }
+
+    private func syncAfterPlaylistSwapIfNeeded() {
+        guard channels.isEmpty && serverConfig != nil else { return }
+        syncIfAutomatic(scope: .all)
     }
 
     func stopSyncScheduler() {
@@ -645,12 +692,10 @@ class EPGViewModel {
         hydrationTask?.cancel()
         hydrationTask = Task { [weak self] in
             await self?.hydrateFromDisk()
-            // If the cache is empty, fetch fresh data so the user sees channels
-            // immediately rather than a blank window.
+            // If playlist auto-refresh is enabled, fetch fresh data when the
+            // cache is empty so the user sees channels immediately.
             guard let self else { return }
-            if self.channels.isEmpty && self.serverConfig != nil {
-                self.sync()
-            }
+            self.syncAfterPlaylistSwapIfNeeded()
         }
     }
 

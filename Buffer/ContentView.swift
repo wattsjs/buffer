@@ -353,18 +353,8 @@ struct ContentView: View {
             AppLog.appSignposter.endInterval("LaunchHydration", hydrationState)
             let launchHydrateElapsed = launchHydrateStarted.duration(to: .now).components.seconds
             AppLog.sync.info("Launch hydration finished seconds=\(launchHydrateElapsed, privacy: .public) channels=\(viewModel.channels.count, privacy: .public)")
-            // If the cache is empty (first launch, or cache invalidated by a
-            // schema bump) kick off an immediate sync so the user doesn't have
-            // to hit refresh manually.
-            if viewModel.activePlaylist != nil {
-                if viewModel.channels.isEmpty {
-                    viewModel.sync(scope: .all)
-                } else {
-                    // Cache had channels — refresh just the EPG so the guide
-                    // is current without re-fetching the whole playlist.
-                    viewModel.sync(silent: true, scope: .epg)
-                }
-            }
+            // Launch refreshes follow the user's automatic refresh settings.
+            viewModel.syncOnLaunchIfNeeded()
             viewModel.startSyncScheduler()
 
             // Pre-load sports data so live events show on the Home page.

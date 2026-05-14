@@ -6,9 +6,10 @@ import Observation
 /// can show up as a "viewer" against an Xtream session limit.
 nonisolated enum StreamProbeSetting {
     static let enabledKey = "buffer_stream_probe_enabled"
+    static let defaultEnabled = false
 
     static var isEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: enabledKey) }
+        get { (UserDefaults.standard.object(forKey: enabledKey) as? Bool) ?? defaultEnabled }
         set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
     }
 }

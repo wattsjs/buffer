@@ -950,7 +950,7 @@ private struct GeneralAppSettingsTab: View {
 private struct PlaybackSettingsTab: View {
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
     @AppStorage(BufferSetting.appStorageKey) private var bufferSeconds: Int = BufferSetting.default
-    @AppStorage(StreamProbeSetting.enabledKey) private var probeStreams: Bool = false
+    @AppStorage(StreamProbeSetting.enabledKey) private var probeStreams: Bool = StreamProbeSetting.defaultEnabled
 
     var body: some View {
         Form {
@@ -1109,7 +1109,7 @@ private struct SyncSettingsTab: View {
                         Text(interval.title).tag(interval.hours)
                     }
                 }
-                Text("Refreshes in the background while Buffer is open. The guide also refreshes on launch.")
+                Text("Refreshes in the background while Buffer is open. Set either option to Never to disable its automatic refresh, including launch refreshes.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
