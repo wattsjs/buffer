@@ -247,6 +247,7 @@ fi
 create-dmg \
   --volname "$PRODUCT_NAME" \
   "${VOLICON_ARGS[@]}" \
+  --skip-jenkins \
   --window-pos 200 120 \
   --window-size 660 400 \
   --icon-size 128 \
