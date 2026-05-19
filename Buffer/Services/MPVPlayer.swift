@@ -1,4 +1,5 @@
 import Foundation
+import IOKit.pwr_mgt
 import Libmpv
 import Observation
 import OSLog
@@ -305,6 +306,9 @@ final class MPVPlayer {
     private var defaultsObserver: NSObjectProtocol?
     private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
     @ObservationIgnored private var lastHTTPStatusCode: Int = 0
+    @ObservationIgnored private var playbackRequested = false
+    @ObservationIgnored private var displayPowerAssertion = IOPMAssertionID(0)
+    @ObservationIgnored private var holdsDisplayPowerAssertion = false
 
     init() {
         setupMPV()
@@ -342,9 +346,11 @@ final class MPVPlayer {
         autoPausedForCacheFloor = false
         refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
         setFlag("pause", !autoplay)
+        playbackRequested = autoplay
         isPlaying = autoplay
         isLoading = true
         currentURL = url
+        updateDisplayPowerAssertion()
 
         // Fast-probe path is used for known local MPEG-TS sources (recording
         // files). With the default 1 MiB probesize +
@@ -393,20 +399,26 @@ final class MPVPlayer {
 
     func play() {
         setFlag("pause", false)
+        playbackRequested = true
         isPlaying = true
+        updateDisplayPowerAssertion()
     }
 
     func pause() {
         setFlag("pause", true)
+        playbackRequested = false
         isPlaying = false
+        updateDisplayPowerAssertion()
     }
 
     func stop() {
         guard let handle else { return }
+        playbackRequested = false
         command(handle, ["stop"])
         isPlaying = false
         isBuffering = false
         isLoading = false
+        updateDisplayPowerAssertion()
     }
 
     func togglePause() {
@@ -737,6 +749,7 @@ final class MPVPlayer {
     }
 
     private func destroy() {
+        releaseDisplayPowerAssertion()
         if let observer = defaultsObserver {
             NotificationCenter.default.removeObserver(observer)
             defaultsObserver = nil
@@ -867,6 +880,7 @@ final class MPVPlayer {
         setState(\.isPlaying, false)
         setState(\.isBuffering, false)
         setState(\.isLoading, false)
+        updateDisplayPowerAssertion()
 
         let endReason: MPVEndReason
         switch event.reason {
@@ -1322,6 +1336,7 @@ final class MPVPlayer {
         if let cacheSeconds = pending.cacheSeconds {
             maintainLiveCacheFloor(cacheSeconds: cacheSeconds)
         }
+        updateDisplayPowerAssertion()
     }
 
     private func maintainLiveCacheFloor(cacheSeconds: Double) {
@@ -1336,6 +1351,7 @@ final class MPVPlayer {
             setFlag("pause", false)
             setState(\.isBuffering, false)
             refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
+            updateDisplayPowerAssertion()
             AppLog.playback.info("cache floor resume cache=\(cacheSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
             return
         }
@@ -1345,7 +1361,49 @@ final class MPVPlayer {
         setFlag("pause", true)
         setState(\.isBuffering, true)
         refreshPlaybackTuningStats(autoPausedForCacheFloor: true)
+        updateDisplayPowerAssertion()
         AppLog.playback.warning("cache floor pause cache=\(cacheSeconds, privacy: .public) floor=\(self.activeCachePauseFloorSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
+    }
+
+    // MARK: - Display sleep prevention
+
+    private var shouldHoldDisplayPowerAssertion: Bool {
+        playbackRequested &&
+            currentURL != nil &&
+            (isPlaying || isLoading || isBuffering || autoPausedForCacheFloor)
+    }
+
+    private func updateDisplayPowerAssertion() {
+        if shouldHoldDisplayPowerAssertion {
+            acquireDisplayPowerAssertion()
+        } else {
+            releaseDisplayPowerAssertion()
+        }
+    }
+
+    private func acquireDisplayPowerAssertion() {
+        guard !holdsDisplayPowerAssertion else { return }
+        let reason = "Buffer is playing video" as CFString
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason,
+            &displayPowerAssertion
+        )
+        if result == kIOReturnSuccess {
+            holdsDisplayPowerAssertion = true
+            AppLog.playback.info("display sleep assertion acquired")
+        } else {
+            AppLog.playback.warning("display sleep assertion failed result=\(result, privacy: .public)")
+        }
+    }
+
+    private func releaseDisplayPowerAssertion() {
+        guard holdsDisplayPowerAssertion else { return }
+        IOPMAssertionRelease(displayPowerAssertion)
+        holdsDisplayPowerAssertion = false
+        displayPowerAssertion = IOPMAssertionID(0)
+        AppLog.playback.info("display sleep assertion released")
     }
 
     private func refreshPlaybackTuningStats(
