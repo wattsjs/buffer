@@ -12,6 +12,16 @@ nonisolated enum DataCache {
         let programs: [String: [EPGProgram]]
     }
 
+    struct CachedVODItems: Codable, Sendable {
+        let savedAt: Date
+        let items: [VODItem]
+    }
+
+    struct CachedVODSeries: Codable, Sendable {
+        let savedAt: Date
+        let series: [VODSeries]
+    }
+
     struct CachedProbes: Codable, Sendable {
         let savedAt: Date
         let probes: [String: StreamProbe]
@@ -31,7 +41,7 @@ nonisolated enum DataCache {
 
     // Bumped when Channel/EPGProgram layouts change so old on-disk caches
     // don't silently hide newly-parsed fields (e.g. catchup support).
-    private static let schemaVersion = "v2"
+    private static let schemaVersion = "v6"
 
     nonisolated static func cacheKey(for config: ServerConfig) -> String {
         let raw: String
@@ -61,6 +71,14 @@ nonisolated enum DataCache {
 
     nonisolated private static func programsURL(for key: String) -> URL? {
         cacheDirectory()?.appendingPathComponent("programs_\(key).json")
+    }
+
+    nonisolated private static func vodURL(for key: String) -> URL? {
+        cacheDirectory()?.appendingPathComponent("vod_\(key).json")
+    }
+
+    nonisolated private static func vodSeriesURL(for key: String) -> URL? {
+        cacheDirectory()?.appendingPathComponent("vod_series_\(key).json")
     }
 
     nonisolated private static func probesURL(for key: String) -> URL? {
@@ -94,6 +112,36 @@ nonisolated enum DataCache {
     nonisolated static func savePrograms(_ programs: [String: [EPGProgram]], key: String) {
         guard let url = programsURL(for: key) else { return }
         let payload = CachedPrograms(savedAt: Date(), programs: programs)
+        if let data = try? JSONEncoder.cacheEncoder.encode(payload) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    // MARK: - VOD
+
+    nonisolated static func loadVODItems(key: String) -> CachedVODItems? {
+        guard let url = vodURL(for: key),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        return try? JSONDecoder.cacheDecoder.decode(CachedVODItems.self, from: data)
+    }
+
+    nonisolated static func saveVODItems(_ items: [VODItem], key: String) {
+        guard let url = vodURL(for: key) else { return }
+        let payload = CachedVODItems(savedAt: Date(), items: items)
+        if let data = try? JSONEncoder.cacheEncoder.encode(payload) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    nonisolated static func loadVODSeries(key: String) -> CachedVODSeries? {
+        guard let url = vodSeriesURL(for: key),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        return try? JSONDecoder.cacheDecoder.decode(CachedVODSeries.self, from: data)
+    }
+
+    nonisolated static func saveVODSeries(_ series: [VODSeries], key: String) {
+        guard let url = vodSeriesURL(for: key) else { return }
+        let payload = CachedVODSeries(savedAt: Date(), series: series)
         if let data = try? JSONEncoder.cacheEncoder.encode(payload) {
             try? data.write(to: url, options: .atomic)
         }

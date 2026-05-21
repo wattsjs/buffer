@@ -13,6 +13,11 @@ nonisolated struct CatchupInfo: Codable, Hashable, Sendable {
     let source: String?
 }
 
+nonisolated enum ChannelContentType: String, Codable, Sendable {
+    case live
+    case vod
+}
+
 nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let name: String
@@ -21,6 +26,7 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
     let streamURL: URL
     let epgChannelID: String?
     let catchup: CatchupInfo?
+    let contentType: ChannelContentType
 
     init(
         id: String,
@@ -29,7 +35,8 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
         group: String,
         streamURL: URL,
         epgChannelID: String?,
-        catchup: CatchupInfo? = nil
+        catchup: CatchupInfo? = nil,
+        contentType: ChannelContentType = .live
     ) {
         self.id = id
         self.name = name
@@ -38,11 +45,14 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
         self.streamURL = streamURL
         self.epgChannelID = epgChannelID
         self.catchup = catchup
+        self.contentType = contentType
     }
 
     var supportsRewind: Bool {
-        (catchup?.days ?? 0) > 0
+        contentType == .live && (catchup?.days ?? 0) > 0
     }
+
+    var isOnDemand: Bool { contentType == .vod }
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)

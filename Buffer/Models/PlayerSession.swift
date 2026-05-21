@@ -57,6 +57,7 @@ final class PlayerSlot: Identifiable {
     private enum PlaybackMode {
         case live
         case catchup
+        case onDemand
     }
 
     let id = UUID()
@@ -447,6 +448,10 @@ final class PlayerSlot: Identifiable {
     }
 
     func loadInitialLive() {
+        if channel.isOnDemand {
+            loadOnDemand()
+            return
+        }
         playbackMode = .live
         playbackStreamHealth = StreamHealth()
         stopRecoveryTasks(resetFailureWindow: true)
@@ -460,6 +465,10 @@ final class PlayerSlot: Identifiable {
     }
 
     func loadLive() {
+        if channel.isOnDemand {
+            loadOnDemand()
+            return
+        }
         playbackMode = .live
         playbackStreamHealth = StreamHealth()
         stopRecoveryTasks(resetFailureWindow: true)
@@ -477,6 +486,15 @@ final class PlayerSlot: Identifiable {
         player.clearReconnectingErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(url, autoplay: true)
+    }
+
+    private func loadOnDemand() {
+        playbackMode = .onDemand
+        playbackStreamHealth = StreamHealth()
+        cancelReconnect()
+        player.clearReconnectingErrorMessage()
+        noteExpectedStopIfReplacingCurrentItem()
+        player.loadURL(channel.streamURL, autoplay: true)
     }
 }
 

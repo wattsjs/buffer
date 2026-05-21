@@ -12,6 +12,21 @@ nonisolated struct ChannelSearchEntry: Sendable {
     let nameLower: String
 }
 
+nonisolated struct VODSearchEntry: Sendable {
+    let item: VODItem?
+    let series: VODSeries?
+    let title: String
+    let subtitle: String
+    let searchText: String
+    let posterURL: URL?
+
+    var id: String {
+        if let item { return "vod-item:\(item.id)" }
+        if let series { return "vod-series:\(series.id)" }
+        return title
+    }
+}
+
 nonisolated struct ProgramSearchResult: Identifiable, Sendable {
     var id: String { program.id }
     let program: EPGProgram
@@ -25,16 +40,24 @@ nonisolated struct ChannelSearchResult: Identifiable, Sendable {
     let score: Double
 }
 
+nonisolated struct VODSearchResult: Identifiable, Sendable {
+    var id: String { entry.id }
+    let entry: VODSearchEntry
+    let score: Double
+}
+
 @Observable
 @MainActor
 final class ProgramSearchController {
     var query: String = ""
     var programResults: [ProgramSearchResult] = []
     var channelResults: [ChannelSearchResult] = []
+    var vodResults: [VODSearchResult] = []
     var isSearching: Bool = false
 
     private var programEntries: [ProgramSearchEntry] = []
     private var channelEntries: [ChannelSearchEntry] = []
+    private var vodEntries: [VODSearchEntry] = []
     private var currentTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
 
@@ -43,13 +66,34 @@ final class ProgramSearchController {
     }
 
     var totalResultCount: Int {
-        programResults.count + channelResults.count
+        programResults.count + channelResults.count + vodResults.count
     }
 
-    func updateIndex(programs: [ProgramSearchEntry], channels: [Channel]) {
+    func updateIndex(programs: [ProgramSearchEntry], channels: [Channel], vodItems: [VODItem], vodSeries: [VODSeries]) {
         self.programEntries = programs
         self.channelEntries = channels.map {
             ChannelSearchEntry(channel: $0, nameLower: $0.name.lowercased())
+        }
+        self.vodEntries = vodItems.map { item in
+            VODSearchEntry(
+                item: item,
+                series: nil,
+                title: item.name,
+                subtitle: item.genre ?? item.group,
+                searchText: [item.name, item.group, item.genre, item.rating, item.releaseDate, item.summary]
+                    .compactMap { $0?.lowercased() }
+                    .joined(separator: " "),
+                posterURL: item.posterURL
+            )
+        } + vodSeries.map { series in
+            VODSearchEntry(
+                item: nil,
+                series: series,
+                title: series.name,
+                subtitle: series.group,
+                searchText: "\(series.name) \(series.group)".lowercased(),
+                posterURL: series.posterURL
+            )
         }
         if hasQuery { runSearch() }
     }
@@ -63,6 +107,7 @@ final class ProgramSearchController {
             currentTask?.cancel()
             programResults = []
             channelResults = []
+            vodResults = []
             isSearching = false
             return
         }
@@ -86,15 +131,17 @@ final class ProgramSearchController {
         guard !trimmed.isEmpty else {
             programResults = []
             channelResults = []
+            vodResults = []
             isSearching = false
             return
         }
 
         let programSnapshot = programEntries
         let channelSnapshot = channelEntries
+        let vodSnapshot = vodEntries
         let now = Date()
 
-        currentTask = Task.detached(priority: .userInitiated) { [trimmed, programSnapshot, channelSnapshot, now] in
+        currentTask = Task.detached(priority: .userInitiated) { [trimmed, programSnapshot, channelSnapshot, vodSnapshot, now] in
             let tokens = trimmed
                 .split(whereSeparator: { $0 == " " || $0 == "\t" })
                 .map(String.init)
@@ -193,15 +240,49 @@ final class ProgramSearchController {
             }
             channelHits.sort { $0.score > $1.score }
 
+            // MARK: VOD matches
+            var vodHits: [VODSearchResult] = []
+            vodHits.reserveCapacity(64)
+            for entry in vodSnapshot {
+                let haystack = entry.searchText
+                var allMatch = true
+                for token in tokens {
+                    if !haystack.contains(token) {
+                        allMatch = false
+                        break
+                    }
+                }
+                if !allMatch { continue }
+
+                let title = entry.title.lowercased()
+                var score: Double = 0
+                if title == trimmed {
+                    score += 210
+                } else if title.hasPrefix(trimmed) {
+                    score += 130
+                } else if title.contains(trimmed) {
+                    score += 90
+                } else {
+                    score += 45
+                }
+                vodHits.append(VODSearchResult(entry: entry, score: score))
+            }
+            vodHits.sort {
+                if $0.score != $1.score { return $0.score > $1.score }
+                return $0.entry.title.localizedStandardCompare($1.entry.title) == .orderedAscending
+            }
+
             if Task.isCancelled { return }
 
             let finalPrograms = cappedPrograms
             let finalChannels = channelHits
+            let finalVOD = Array(vodHits.prefix(120))
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 if Task.isCancelled { return }
                 self.programResults = finalPrograms
                 self.channelResults = finalChannels
+                self.vodResults = finalVOD
                 self.isSearching = false
             }
         }
@@ -215,6 +296,8 @@ struct ProgramSearchResultsPage: View {
     let totalIndexed: Int
     let currentProgram: (Channel) -> EPGProgram?
     let onSelect: (Channel) -> Void
+    let onSelectVOD: (VODItem) -> Void
+    let onOpenSeries: (VODSeries) -> Void
     let onShowInEPG: (Channel) -> Void
 
     var body: some View {
@@ -272,6 +355,10 @@ struct ProgramSearchResultsPage: View {
                     channelsStrip
                     Divider()
                 }
+                if !controller.vodResults.isEmpty {
+                    vodStrip
+                    Divider()
+                }
                 programsList
             }
         }
@@ -299,6 +386,33 @@ struct ProgramSearchResultsPage: View {
                 .padding(.horizontal, 18)
             }
             .frame(height: 74)
+            .padding(.bottom, 12)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    // MARK: VOD strip
+
+    private var vodStrip: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionLabel("ON DEMAND", count: controller.vodResults.count)
+                .padding(.horizontal, 18)
+                .padding(.top, 12)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 10) {
+                    ForEach(controller.vodResults) { result in
+                        VODSearchCompactCard(
+                            result: result,
+                            query: controller.query,
+                            onOpenMovie: { item in onSelectVOD(item) },
+                            onOpenSeries: { series in onOpenSeries(series) }
+                        )
+                    }
+                }
+                .padding(.horizontal, 18)
+            }
+            .frame(height: 122)
             .padding(.bottom, 12)
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -487,7 +601,7 @@ struct ProgramSearchResultsPage: View {
             Text("Search programs & channels")
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary)
-            Text("\(totalIndexed.formatted()) programs indexed")
+            Text("\(totalIndexed.formatted()) programs indexed, plus VOD")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .monospacedDigit()
@@ -503,7 +617,7 @@ struct ProgramSearchResultsPage: View {
             Text("No matches for \u{201C}\(controller.query)\u{201D}")
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary)
-            Text("Searched \(totalIndexed) program\(totalIndexed == 1 ? "" : "s")")
+            Text("Searched programs, channels, and VOD")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .monospacedDigit()
@@ -605,6 +719,99 @@ private struct ChannelCompactCard: View {
             }
             AddToMultiViewMenuItem(channel: channel)
         }
+    }
+}
+
+// MARK: - VOD compact card (horizontal strip)
+
+private struct VODSearchCompactCard: View {
+    let result: VODSearchResult
+    let query: String
+    let onOpenMovie: (VODItem) -> Void
+    let onOpenSeries: (VODSeries) -> Void
+
+    @State private var hovered = false
+
+    var body: some View {
+        Button {
+            if let item = result.entry.item {
+                onOpenMovie(item)
+            } else if let series = result.entry.series {
+                onOpenSeries(series)
+            }
+        } label: {
+            HStack(spacing: 10) {
+                VODSearchPoster(url: result.entry.posterURL, fallbackSystemImage: result.entry.series == nil ? "film" : "rectangle.stack")
+                    .frame(width: 54, height: 81)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(highlighted(result.entry.title, query: query))
+                        .font(.system(size: 12, weight: .semibold))
+                        .lineLimit(2)
+
+                    Text(result.entry.series == nil ? "Movie" : "Series")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.tertiary)
+
+                    if !result.entry.subtitle.isEmpty {
+                        Text(result.entry.subtitle)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(width: 270, height: 102, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(hovered ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(hovered ? Color.accentColor.opacity(0.4) : Color.black.opacity(0.08), lineWidth: 0.75)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+    }
+}
+
+private struct VODSearchPoster: View {
+    let url: URL?
+    let fallbackSystemImage: String
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+
+            if let url {
+                AsyncImage(url: url) { image in
+                    image
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFill()
+                } placeholder: {
+                    fallbackIcon
+                }
+            } else {
+                fallbackIcon
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private var fallbackIcon: some View {
+        Image(systemName: fallbackSystemImage)
+            .font(.system(size: 22, weight: .regular))
+            .foregroundStyle(.tertiary)
     }
 }
 

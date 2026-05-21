@@ -7,6 +7,12 @@ enum SidebarSelection: Hashable {
     case sports
     case reminders
     case recordings
+    case movies
+    case movieGroup(String)
+    case movieDetail(VODItem)
+    case series
+    case seriesGroup(String)
+    case seriesDetail(VODSeries)
     case search
     case favorites
     case allChannels
@@ -16,7 +22,17 @@ enum SidebarSelection: Hashable {
 @MainActor
 @Observable
 class EPGViewModel {
+    static let disableVODKey = "disableVOD"
+
     var channels: [Channel] = []
+    var vodItems: [VODItem] = []
+    var vodSeries: [VODSeries] = []
+    var seriesEpisodes: [String: [VODItem]] = [:]
+    var seriesEpisodeLoadErrors: [String: String] = [:]
+    var loadingSeriesIDs: Set<String> = []
+    var vodItemDetails: [String: VODItem] = [:]
+    var vodItemDetailLoadErrors: [String: String] = [:]
+    var loadingVODItemIDs: Set<String> = []
     var programs: [String: [EPGProgram]] = [:] // keyed by channel epgID
     var storedGroupOrder: [String] = []
     var hiddenGroupNames: Set<String> = []
@@ -85,6 +101,22 @@ class EPGViewModel {
         allGroups.filter { hiddenGroupNames.contains($0) }
     }
 
+    var movieGroups: [String] {
+        Set(movieItems.map(\.group)).sorted()
+    }
+
+    var seriesGroups: [String] {
+        Set(vodSeries.map(\.group)).sorted()
+    }
+
+    var movieItems: [VODItem] {
+        vodItems.filter { $0.kind != .seriesEpisode }
+    }
+
+    var isVODDisabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.disableVODKey)
+    }
+
     func moveGroups(fromOffsets source: IndexSet, toOffset destination: Int) {
         var visible = groups
         visible.move(fromOffsets: source, toOffset: destination)
@@ -120,6 +152,34 @@ class EPGViewModel {
             result = favoriteChannels
         default:
             break
+        }
+
+        if !searchText.isEmpty {
+            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        }
+
+        return result
+    }
+
+    var filteredMovieItems: [VODItem] {
+        var result = movieItems
+
+        if case .movieGroup(let group) = selection {
+            result = result.filter { $0.group == group }
+        }
+
+        if !searchText.isEmpty {
+            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        }
+
+        return result
+    }
+
+    var filteredSeries: [VODSeries] {
+        var result = vodSeries
+
+        if case .seriesGroup(let group) = selection {
+            result = result.filter { $0.group == group }
         }
 
         if !searchText.isEmpty {
@@ -254,6 +314,23 @@ class EPGViewModel {
             channels = channelsCache.channels
             lastUpdated = channelsCache.savedAt
         }
+        if let vodCache = await Task.detached(priority: .userInitiated, operation: {
+            DataCache.loadVODItems(key: key)
+        }).value {
+            vodItems = vodCache.items
+            if lastUpdated == nil {
+                lastUpdated = vodCache.savedAt
+            }
+        }
+        if let seriesCache = await Task.detached(priority: .userInitiated, operation: {
+            DataCache.loadVODSeries(key: key)
+        }).value {
+            vodSeries = seriesCache.series
+            if lastUpdated == nil {
+                lastUpdated = seriesCache.savedAt
+            }
+        }
+        searchIndexVersion &+= 1
         hasLoadedOnce = true
 
         let programsCache = await Task.detached(priority: .userInitiated) {
@@ -334,6 +411,15 @@ class EPGViewModel {
 
                 let freshChannels = try await fetchChannels(config: config)
                 syncedStatus.channelCount = freshChannels.count
+                let freshVODItems: [VODItem]
+                let freshSeries: [VODSeries]
+                if isVODDisabled {
+                    freshVODItems = []
+                    freshSeries = []
+                } else {
+                    freshVODItems = try await fetchVODItems(config: config)
+                    freshSeries = try await fetchSeries(config: config, vodItems: freshVODItems)
+                }
 
                 if !freshChannels.isEmpty {
                     channels = freshChannels
@@ -341,6 +427,18 @@ class EPGViewModel {
 
                     Task.detached(priority: .utility) {
                         DataCache.saveChannels(freshChannels, key: cacheKey)
+                    }
+                }
+                vodItems = freshVODItems
+                vodSeries = freshSeries
+                vodItemDetails = [:]
+                vodItemDetailLoadErrors = [:]
+                loadingVODItemIDs = []
+                searchIndexVersion &+= 1
+                if !isVODDisabled {
+                    Task.detached(priority: .utility) {
+                        DataCache.saveVODItems(freshVODItems, key: cacheKey)
+                        DataCache.saveVODSeries(freshSeries, key: cacheKey)
                     }
                 }
             } else {
@@ -509,6 +607,162 @@ class EPGViewModel {
         }
     }
 
+    private func fetchVODItems(config: ServerConfig) async throws -> [VODItem] {
+        switch config.type {
+        case .xtream:
+            let client = XtreamClient(config: config)
+            return (try? await client.fetchVODItems()) ?? []
+        case .m3u:
+            guard let url = config.m3uSourceURL else {
+                throw XtreamError.invalidURL
+            }
+            return try await M3UParser.parseContent(from: url).vodItems
+        }
+    }
+
+    private func fetchSeries(config: ServerConfig, vodItems: [VODItem]) async throws -> [VODSeries] {
+        switch config.type {
+        case .xtream:
+            return (try? await XtreamClient(config: config).fetchSeries()) ?? []
+        case .m3u:
+            return seriesFromM3UEpisodes(vodItems)
+        }
+    }
+
+    func episodes(for series: VODSeries) -> [VODItem] {
+        seriesEpisodes[series.id] ?? []
+    }
+
+    func detailItem(for item: VODItem) -> VODItem {
+        vodItemDetails[item.id] ?? item
+    }
+
+    func loadDetails(for item: VODItem) async {
+        if isVODDisabled {
+            return
+        }
+
+        if vodItemDetails[item.id] != nil || loadingVODItemIDs.contains(item.id) {
+            return
+        }
+
+        guard let config = serverConfig, config.type == .xtream, item.kind == .movie else {
+            vodItemDetails[item.id] = item
+            vodItemDetailLoadErrors[item.id] = nil
+            return
+        }
+
+        loadingVODItemIDs.insert(item.id)
+        defer { loadingVODItemIDs.remove(item.id) }
+
+        do {
+            let detailed = try await XtreamClient(config: config).fetchVODItemDetails(item: item)
+            vodItemDetails[item.id] = detailed
+            vodItemDetailLoadErrors[item.id] = nil
+            searchIndexVersion &+= 1
+        } catch {
+            vodItemDetailLoadErrors[item.id] = error.localizedDescription
+        }
+    }
+
+    func loadEpisodes(for series: VODSeries) async {
+        if isVODDisabled {
+            seriesEpisodes[series.id] = []
+            seriesEpisodeLoadErrors[series.id] = nil
+            return
+        }
+
+        if seriesEpisodes[series.id] != nil || loadingSeriesIDs.contains(series.id) {
+            return
+        }
+
+        loadingSeriesIDs.insert(series.id)
+        defer { loadingSeriesIDs.remove(series.id) }
+
+        if let local = localEpisodes(for: series), !local.isEmpty {
+            seriesEpisodes[series.id] = local
+            seriesEpisodeLoadErrors[series.id] = nil
+            searchIndexVersion &+= 1
+            return
+        }
+
+        guard let config = serverConfig, config.type == .xtream else {
+            seriesEpisodes[series.id] = []
+            seriesEpisodeLoadErrors[series.id] = nil
+            return
+        }
+
+        do {
+            let episodes = try await XtreamClient(config: config).fetchSeriesEpisodes(series: series)
+            seriesEpisodes[series.id] = episodes
+            seriesEpisodeLoadErrors[series.id] = nil
+            searchIndexVersion &+= 1
+        } catch {
+            seriesEpisodes[series.id] = []
+            seriesEpisodeLoadErrors[series.id] = error.localizedDescription
+        }
+    }
+
+    private func localEpisodes(for series: VODSeries) -> [VODItem]? {
+        let episodes = vodItems.filter { $0.kind == .seriesEpisode && $0.group == series.name }
+        return episodes.isEmpty ? nil : episodes.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func seriesFromM3UEpisodes(_ items: [VODItem]) -> [VODSeries] {
+        let episodes = items.filter { $0.kind == .seriesEpisode }
+        let byGroup = Dictionary(grouping: episodes, by: \.group)
+        return byGroup.map { group, episodes in
+            let first = episodes.sorted { $0.name < $1.name }.first
+            return VODSeries(
+                id: "m3u:\(group)",
+                name: group,
+                posterURL: first?.posterURL,
+                group: first?.genre ?? "Series",
+                genre: first?.genre,
+                rating: first?.rating,
+                releaseDate: first?.releaseDate,
+                summary: first?.summary,
+                director: first?.director,
+                cast: first?.cast,
+                episodeCount: episodes.count
+            )
+        }
+        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func applyVODPreference(disabled: Bool) {
+        if disabled {
+            vodItems = []
+            vodSeries = []
+            seriesEpisodes = [:]
+            seriesEpisodeLoadErrors = [:]
+            loadingSeriesIDs = []
+            vodItemDetails = [:]
+            vodItemDetailLoadErrors = [:]
+            loadingVODItemIDs = []
+            if case .movies = selection {
+                selection = .allChannels
+            } else if case .movieGroup = selection {
+                selection = .allChannels
+            } else if case .movieDetail = selection {
+                selection = .allChannels
+            } else if case .series = selection {
+                selection = .allChannels
+            } else if case .seriesGroup = selection {
+                selection = .allChannels
+            } else if case .seriesDetail = selection {
+                selection = .allChannels
+            }
+            searchIndexVersion &+= 1
+        } else if vodItems.isEmpty && vodSeries.isEmpty {
+            sync(silent: false, scope: .all)
+        } else {
+            searchIndexVersion &+= 1
+        }
+    }
+
     private func epgURL(for config: ServerConfig) -> URL? {
         switch config.type {
         case .xtream:
@@ -667,6 +921,14 @@ class EPGViewModel {
     /// cache was empty.
     private func swapInActivePlaylistState(previousKey: String?) {
         channels = []
+        vodItems = []
+        vodSeries = []
+        seriesEpisodes = [:]
+        seriesEpisodeLoadErrors = [:]
+        loadingSeriesIDs = []
+        vodItemDetails = [:]
+        vodItemDetailLoadErrors = [:]
+        loadingVODItemIDs = []
         programs = [:]
         searchEntries = []
         searchIndexVersion &+= 1
@@ -680,6 +942,14 @@ class EPGViewModel {
         // once channels hydrate.
         if case .group = selection {
             selection = .allChannels
+        } else if case .movieGroup = selection {
+            selection = .movies
+        } else if case .movieDetail = selection {
+            selection = .movies
+        } else if case .seriesGroup = selection {
+            selection = .series
+        } else if case .seriesDetail = selection {
+            selection = .series
         }
 
         loadServerStatus()
@@ -705,6 +975,14 @@ class EPGViewModel {
         activePlaylistID = nil
         saveActivePlaylistID()
         channels = []
+        vodItems = []
+        vodSeries = []
+        seriesEpisodes = [:]
+        seriesEpisodeLoadErrors = [:]
+        loadingSeriesIDs = []
+        vodItemDetails = [:]
+        vodItemDetailLoadErrors = [:]
+        loadingVODItemIDs = []
         programs = [:]
         searchEntries = []
         searchIndexVersion &+= 1

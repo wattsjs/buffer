@@ -19,7 +19,7 @@ struct SettingsView: View {
             SyncSettingsTab(viewModel: viewModel)
                 .tabItem { Label("Sync", systemImage: "arrow.triangle.2.circlepath") }
 
-            GeneralAppSettingsTab()
+            GeneralAppSettingsTab(viewModel: viewModel)
                 .tabItem { Label("General", systemImage: "gearshape") }
         }
         .frame(width: 720, height: 560)
@@ -696,7 +696,9 @@ private enum ServerConnectionTester {
         let client = XtreamClient(config: config)
         let accountInfo = try await client.fetchAccountInfo()
         let channels = try await client.fetchChannels()
-        if channels.isEmpty {
+        let vodItems = (try? await client.fetchVODItems()) ?? []
+        let series = (try? await client.fetchSeries()) ?? []
+        if channels.isEmpty && vodItems.isEmpty && series.isEmpty {
             throw Error.noChannelsFound
         }
 
@@ -706,7 +708,7 @@ private enum ServerConnectionTester {
         status.guideStatus = epg.message
         status.apply(accountInfo)
         return Result(
-            message: "Connected to Xtream. Found \(channels.count) channels. \(epg.message).",
+            message: "Connected to Xtream. Found \(channels.count) channels, \(vodItems.count) movies, and \(series.count) series. \(epg.message).",
             status: status
         )
     }
@@ -721,11 +723,14 @@ private enum ServerConnectionTester {
             throw Error.invalidPlaylist
         }
 
-        let channels = M3UParser.parse(content)
+        let parsed = M3UParser.parseContent(content)
+        let channels = parsed.channels
         guard content.contains("#EXTINF") || content.contains("#EXTM3U") else {
             throw Error.invalidPlaylist
         }
-        guard !channels.isEmpty else {
+        let seriesCount = Set(parsed.vodItems.filter { $0.kind == .seriesEpisode }.map(\.group)).count
+        let movieCount = parsed.vodItems.filter { $0.kind != .seriesEpisode }.count
+        guard !channels.isEmpty || movieCount > 0 || seriesCount > 0 else {
             throw Error.noChannelsFound
         }
 
@@ -735,7 +740,7 @@ private enum ServerConnectionTester {
         status.guideStatus = epg.message
         status.lastChecked = .now
         return Result(
-            message: "Playlist loaded. Found \(channels.count) channels. \(epg.message).",
+            message: "Playlist loaded. Found \(channels.count) channels, \(movieCount) movies, and \(seriesCount) series. \(epg.message).",
             status: status
         )
     }
@@ -928,7 +933,9 @@ private struct SetupFeedbackCard: View {
 // MARK: - Playback
 
 private struct GeneralAppSettingsTab: View {
+    @Bindable var viewModel: EPGViewModel
     @AppStorage("hideSport") private var hideSport = false
+    @AppStorage(EPGViewModel.disableVODKey) private var disableVOD = false
 
     var body: some View {
         Form {
@@ -938,6 +945,14 @@ private struct GeneralAppSettingsTab: View {
                     set: { hideSport = !$0 }
                 ))
                 Text("Shows ESPN live scores on Home and in the sidebar. Turn it off to stop background polling.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Disable VOD", isOn: $disableVOD)
+                    .onChange(of: disableVOD) { _, newValue in
+                        viewModel.applyVODPreference(disabled: newValue)
+                    }
+                Text("Hides Movies and TV, removes them from search, and skips VOD fetches during playlist sync.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

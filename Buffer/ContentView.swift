@@ -19,6 +19,7 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
     @AppStorage("hideSport") private var hideSport = false
+    @AppStorage(EPGViewModel.disableVODKey) private var disableVOD = false
 
     private var playlistSelectionBinding: Binding<UUID> {
         Binding(
@@ -35,6 +36,17 @@ struct ContentView: View {
             ExternalPlayer.launch(streamURL: channel.streamURL, using: selectedPlayer)
         } else {
             AppLog.playback.info("Opening channel in Buffer name=\(channel.name, privacy: .public)")
+            openWindow(value: channel)
+        }
+    }
+
+    private func openVODItem(_ item: VODItem) {
+        let channel = item.playbackChannel
+        if selectedPlayer != .none {
+            AppLog.playback.info("Opening VOD externally name=\(item.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
+            ExternalPlayer.launch(streamURL: item.streamURL, using: selectedPlayer)
+        } else {
+            AppLog.playback.info("Opening VOD in Buffer name=\(item.name, privacy: .public)")
             openWindow(value: channel)
         }
     }
@@ -121,6 +133,12 @@ struct ContentView: View {
         case .sports:      return "Sports"
         case .reminders:   return "Reminders"
         case .recordings:  return "Recordings"
+        case .movies:      return "Movies"
+        case .movieGroup(let g): return g
+        case .movieDetail(let item): return item.name
+        case .series:      return "TV"
+        case .seriesGroup(let g): return g
+        case .seriesDetail(let series): return series.name
         case .search:      return "Search"
         case .favorites:   return "Favorites"
         case .allChannels: return "All Channels"
@@ -158,12 +176,82 @@ struct ContentView: View {
                 channels: viewModel.channels,
                 onPlayChannel: { openChannel($0) }
             )
+        case .movies, .movieGroup:
+            if disableVOD {
+                ContentUnavailableView("VOD Disabled", systemImage: "film")
+            } else {
+                VODLibraryView(
+                    items: viewModel.filteredMovieItems,
+                    itemProvider: { viewModel.detailItem(for: $0) },
+                    isItemLoading: { viewModel.loadingVODItemIDs.contains($0.id) },
+                    itemLoadError: { viewModel.vodItemDetailLoadErrors[$0.id] },
+                    hasLoadedOnce: viewModel.hasLoadedOnce,
+                    onItemFocused: { item in
+                        Task { await viewModel.loadDetails(for: item) }
+                    },
+                    onItemSelected: { openVODItem($0) }
+                )
+            }
+        case .movieDetail(let item):
+            if disableVOD {
+                ContentUnavailableView("VOD Disabled", systemImage: "film")
+            } else {
+                VODItemDetailPage(
+                    item: viewModel.detailItem(for: item),
+                    isLoadingMetadata: viewModel.loadingVODItemIDs.contains(item.id),
+                    metadataLoadError: viewModel.vodItemDetailLoadErrors[item.id],
+                    backTitle: "Search",
+                    onBack: { viewModel.selection = .search },
+                    onPlay: { openVODItem(viewModel.detailItem(for: item)) }
+                )
+                .task(id: item.id) {
+                    await viewModel.loadDetails(for: item)
+                }
+            }
+        case .series, .seriesGroup:
+            if disableVOD {
+                ContentUnavailableView("VOD Disabled", systemImage: "rectangle.stack")
+            } else {
+                SeriesLibraryView(
+                    series: viewModel.filteredSeries,
+                    episodesProvider: { viewModel.episodes(for: $0) },
+                    isLoading: { viewModel.loadingSeriesIDs.contains($0.id) },
+                    loadError: { viewModel.seriesEpisodeLoadErrors[$0.id] },
+                    hasLoadedOnce: viewModel.hasLoadedOnce,
+                    onSeriesSelected: { series in
+                        Task { await viewModel.loadEpisodes(for: series) }
+                    },
+                    onEpisodeSelected: { openVODItem($0) }
+                )
+            }
+        case .seriesDetail(let series):
+            if disableVOD {
+                ContentUnavailableView("VOD Disabled", systemImage: "rectangle.stack")
+            } else {
+                SeriesDetailPage(
+                    series: series,
+                    episodes: viewModel.episodes(for: series),
+                    isLoading: viewModel.loadingSeriesIDs.contains(series.id),
+                    loadError: viewModel.seriesEpisodeLoadErrors[series.id],
+                    backTitle: "Search",
+                    onBack: { viewModel.selection = .search },
+                    onEpisodeSelected: { openVODItem($0) }
+                )
+                .task {
+                    await viewModel.loadEpisodes(for: series)
+                }
+            }
         case .search:
             ProgramSearchResultsPage(
                 controller: searchController,
                 totalIndexed: viewModel.searchEntries.count,
                 currentProgram: { viewModel.currentProgram(for: $0) },
                 onSelect: { openChannel($0) },
+                onSelectVOD: { viewModel.selection = .movieDetail($0) },
+                onOpenSeries: { series in
+                    viewModel.selection = .seriesDetail(series)
+                    Task { await viewModel.loadEpisodes(for: series) }
+                },
                 onShowInEPG: { channel in
                     searchController.clear()
                     let group = channel.group
@@ -235,7 +323,7 @@ struct ContentView: View {
                 set: { searchController.setQuery($0) }
             ),
             placement: .automatic,
-            prompt: "Search programs…"
+            prompt: "Search programs, channels, movies…"
         )
         .searchFocused($searchFieldFocused)
         .background {
@@ -300,7 +388,9 @@ struct ContentView: View {
         .onAppear {
             searchController.updateIndex(
                 programs: viewModel.searchEntries,
-                channels: viewModel.channels
+                channels: viewModel.channels,
+                vodItems: disableVOD ? [] : viewModel.movieItems + viewModel.seriesEpisodes.values.flatMap { $0 },
+                vodSeries: disableVOD ? [] : viewModel.vodSeries
             )
             updateSportsMatchingContext()
         }
@@ -322,10 +412,21 @@ struct ContentView: View {
         .onChange(of: hideSport) { _, hidden in
             handleSportsVisibilityChange(hidden: hidden)
         }
+        .onChange(of: disableVOD) { _, disabled in
+            viewModel.applyVODPreference(disabled: disabled)
+            searchController.updateIndex(
+                programs: viewModel.searchEntries,
+                channels: viewModel.channels,
+                vodItems: disabled ? [] : viewModel.movieItems + viewModel.seriesEpisodes.values.flatMap { $0 },
+                vodSeries: disabled ? [] : viewModel.vodSeries
+            )
+        }
         .onChange(of: viewModel.searchIndexVersion) { _, _ in
             searchController.updateIndex(
                 programs: viewModel.searchEntries,
-                channels: viewModel.channels
+                channels: viewModel.channels,
+                vodItems: disableVOD ? [] : viewModel.movieItems + viewModel.seriesEpisodes.values.flatMap { $0 },
+                vodSeries: disableVOD ? [] : viewModel.vodSeries
             )
             updateSportsMatchingContext()
         }

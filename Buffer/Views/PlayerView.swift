@@ -107,7 +107,7 @@ struct PlayerView: View {
             currentProgram: currentProgram
         ))
         _recordingPlayback = State(initialValue: nil)
-        _liveLatched = State(initialValue: true)
+        _liveLatched = State(initialValue: !channel.isOnDemand)
     }
 
     init(recording: Recording) {
@@ -122,6 +122,7 @@ struct PlayerView: View {
 
     private var isRecordingMode: Bool { mode == .recording }
     private var isChannelMode: Bool { mode == .channel }
+    private var isOnDemandMode: Bool { channel?.isOnDemand ?? false }
 
     private var session: PlayerSession? { channelSession }
     private var playback: RecordingPlayback? { recordingPlayback }
@@ -178,6 +179,9 @@ struct PlayerView: View {
             guard let p = playback, p.isInProgress else { return nil }
             return max(0, p.totalDuration - player.timePos)
         }
+        if isOnDemandMode {
+            return nil
+        }
         if isCatchup {
             return max(0, -catchupCurrentOffset)
         }
@@ -204,6 +208,9 @@ struct PlayerView: View {
     private var canJumpToLive: Bool {
         if isRecordingMode {
             return (playback?.isInProgress ?? false) && !isDisplayedLive
+        }
+        if isOnDemandMode {
+            return false
         }
         return !isDisplayedLive
     }
@@ -525,7 +532,7 @@ struct PlayerView: View {
             .foregroundStyle(.white)
             .help(chromeState.mediaInfoDisplay.label)
 
-            if isChannelMode {
+            if isChannelMode && !isOnDemandMode {
                 favoriteButton
                 recordButton
 
@@ -687,6 +694,9 @@ struct PlayerView: View {
             if isRecordingMode {
                 Divider().frame(height: 18)
                 recordingTransport
+            } else if isOnDemandMode || isCatchup {
+                Divider().frame(height: 18)
+                playbackTimelineBar
             } else if supportsRewind {
                 Divider().frame(height: 18)
                 catchupStepControls
@@ -1026,6 +1036,9 @@ struct PlayerView: View {
 
     @ViewBuilder
     private var liveButton: some View {
+        if isOnDemandMode {
+            EmptyView()
+        } else {
         let atLive = isDisplayedLive
         Button {
             if !atLive {
@@ -1038,6 +1051,7 @@ struct PlayerView: View {
         .buttonStyle(.plain)
         .disabled(atLive)
         .help(atLive ? "Live" : "Jump to live + buffer")
+        }
     }
 
     @ViewBuilder
@@ -1095,6 +1109,44 @@ struct PlayerView: View {
         if behind < 60 { return String(format: "-%ds", Int(behind)) }
         let mins = Int(behind / 60)
         return "-\(mins)m"
+    }
+
+    @ViewBuilder
+    private var playbackTimelineBar: some View {
+        let total = playbackTimelineDuration
+        let maxPos = max(total, 1)
+        let currentPos = min(scrubPosition ?? player.timePos, maxPos)
+
+        HStack(spacing: 8) {
+            Text(formatHMS(currentPos))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(width: 45, alignment: .trailing)
+
+            ScrubBar(
+                value: currentPos,
+                total: maxPos,
+                onScrub: { scrubPosition = $0 },
+                onCommit: { target in
+                    player.seek(to: min(target, maxPos))
+                    scrubPosition = nil
+                }
+            )
+            .frame(width: 170)
+
+            Text(total > 1 ? formatHMS(total) : "--:--")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.65))
+                .frame(width: 45, alignment: .leading)
+        }
+        .help(isCatchup ? "Catchup playback position" : "Playback position")
+    }
+
+    private var playbackTimelineDuration: Double {
+        if isCatchup {
+            return player.duration > 1 ? player.duration : catchupClipDuration
+        }
+        return player.duration
     }
 
     // MARK: - Bottom-right: media info
@@ -1352,6 +1404,7 @@ struct PlayerView: View {
         if isRecordingMode {
             return playback?.isInProgress == true ? "recording live" : "recording file"
         }
+        if isOnDemandMode { return "on demand" }
         if isCatchup { return "catchup" }
         if isMulti { return "multi-view live" }
         return "live"

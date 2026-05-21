@@ -6,6 +6,11 @@ struct ChannelSidebarView: View {
     @State private var recordingManager = RecordingManager.shared
     @Environment(\.openSettings) private var openSettings
     @AppStorage("hideSport") private var hideSport = false
+    @AppStorage(EPGViewModel.disableVODKey) private var disableVOD = false
+    @AppStorage("sidebarLiveExpanded") private var liveExpanded = true
+    @AppStorage("sidebarMoviesExpanded") private var moviesExpanded = true
+    @AppStorage("sidebarTVExpanded") private var tvExpanded = true
+    @AppStorage("sidebarHiddenExpanded") private var hiddenExpanded = false
 
     private var activeRecordingCount: Int {
         recordingManager.recordings.filter {
@@ -100,68 +105,171 @@ struct ChannelSidebarView: View {
                 }
             }
 
-            Section {
-                Label("Home", systemImage: "house")
-                    .tag(SidebarSelection.home)
+            Label("Home", systemImage: "house")
+                .tag(SidebarSelection.home)
 
-                Label("Search", systemImage: "magnifyingglass")
-                    .tag(SidebarSelection.search)
+            Label("Search", systemImage: "magnifyingglass")
+                .tag(SidebarSelection.search)
 
-                if !hideSport {
-                    Label("Sports", systemImage: "sportscourt.fill")
-                        .tag(SidebarSelection.sports)
-                }
-
-                remindersRow
-                recordingsRow
+            if !hideSport {
+                Label("Sports", systemImage: "sportscourt.fill")
+                    .tag(SidebarSelection.sports)
             }
 
-            Section("Guide") {
-                if !viewModel.favoriteChannelIDs.isEmpty {
-                    HStack {
-                        Label("Favorites", systemImage: "star.fill")
-                        Spacer()
-                        Text("\(viewModel.favoriteChannelIDs.count)")
-                            .font(.system(size: 11, weight: .semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(
-                                Capsule().fill(Color.secondary.opacity(0.15))
-                            )
+            remindersRow
+            recordingsRow
+
+            Section {
+                if liveExpanded {
+                    liveRows
+                }
+            } header: {
+                SidebarSectionHeader(title: "Live", isExpanded: $liveExpanded)
+            }
+
+            if !disableVOD, !viewModel.movieItems.isEmpty {
+                Section {
+                    if moviesExpanded {
+                        moviesRows
                     }
-                    .tag(SidebarSelection.favorites)
+                } header: {
+                    SidebarSectionHeader(title: "Movies", isExpanded: $moviesExpanded)
                 }
+            }
 
-                Label("All Channels", systemImage: "tv")
-                    .tag(SidebarSelection.allChannels)
-
-                ForEach(viewModel.groups, id: \.self) { group in
-                    Label(group, systemImage: "folder")
-                        .tag(SidebarSelection.group(group))
-                        .contextMenu {
-                            Button("Hide Folder") {
-                                viewModel.hideGroup(group)
-                            }
-                        }
-                }
-                .onMove { offsets, destination in
-                    viewModel.moveGroups(fromOffsets: offsets, toOffset: destination)
+            if !disableVOD, !viewModel.vodSeries.isEmpty {
+                Section {
+                    if tvExpanded {
+                        tvRows
+                    }
+                } header: {
+                    SidebarSectionHeader(title: "TV", isExpanded: $tvExpanded)
                 }
             }
 
             if !viewModel.hiddenGroups.isEmpty {
-                Section("Hidden") {
-                    ForEach(viewModel.hiddenGroups, id: \.self) { group in
-                        HiddenFolderRow(name: group) {
-                            viewModel.showGroup(group)
-                        }
+                Section {
+                    if hiddenExpanded {
+                        hiddenRows
                     }
+                } header: {
+                    SidebarSectionHeader(title: "Hidden", isExpanded: $hiddenExpanded)
                 }
             }
         }
         .listStyle(.sidebar)
+    }
+
+    @ViewBuilder
+    private var liveRows: some View {
+        if !viewModel.favoriteChannelIDs.isEmpty {
+            HStack {
+                Label("Favorites", systemImage: "star.fill")
+                Spacer()
+                Text("\(viewModel.favoriteChannelIDs.count)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(
+                        Capsule().fill(Color.secondary.opacity(0.15))
+                    )
+            }
+            .tag(SidebarSelection.favorites)
+        }
+
+        Label("All Channels", systemImage: "tv")
+            .tag(SidebarSelection.allChannels)
+
+        ForEach(viewModel.groups, id: \.self) { group in
+            Label(group, systemImage: "folder")
+                .tag(SidebarSelection.group(group))
+                .contextMenu {
+                    Button("Hide Folder") {
+                        viewModel.hideGroup(group)
+                    }
+                }
+        }
+        .onMove { offsets, destination in
+            viewModel.moveGroups(fromOffsets: offsets, toOffset: destination)
+        }
+    }
+
+    @ViewBuilder
+    private var moviesRows: some View {
+        HStack {
+            Label("Movies", systemImage: "film")
+            Spacer()
+            Text("\(viewModel.movieItems.count)")
+                .font(.system(size: 11, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(
+                    Capsule().fill(Color.secondary.opacity(0.15))
+                )
+        }
+        .tag(SidebarSelection.movies)
+
+        ForEach(viewModel.movieGroups, id: \.self) { group in
+            Label(group, systemImage: "folder")
+                .tag(SidebarSelection.movieGroup(group))
+        }
+    }
+
+    @ViewBuilder
+    private var tvRows: some View {
+        HStack {
+            Label("TV Shows", systemImage: "rectangle.stack")
+            Spacer()
+            Text("\(viewModel.vodSeries.count)")
+                .font(.system(size: 11, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(
+                    Capsule().fill(Color.secondary.opacity(0.15))
+                )
+        }
+        .tag(SidebarSelection.series)
+
+        ForEach(viewModel.seriesGroups, id: \.self) { group in
+            Label(group, systemImage: "folder")
+                .tag(SidebarSelection.seriesGroup(group))
+        }
+    }
+
+    @ViewBuilder
+    private var hiddenRows: some View {
+        ForEach(viewModel.hiddenGroups, id: \.self) { group in
+            HiddenFolderRow(name: group) {
+                viewModel.showGroup(group)
+            }
+        }
+    }
+}
+
+private struct SidebarSectionHeader: View {
+    let title: String
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        Button {
+            isExpanded.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .frame(width: 10)
+                Text(title)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
