@@ -573,7 +573,7 @@ private struct PlaylistEditor: View {
     private var displayConfig: ServerConfig? {
         if isActive,
            let current = viewModel.activePlaylist,
-           DataCache.cacheKey(for: current) == DataCache.cacheKey(for: draft) {
+           DataCache.preferenceKey(for: current) == DataCache.preferenceKey(for: draft) {
             return current
         }
         return isValid ? draft : viewModel.activePlaylist
@@ -587,7 +587,7 @@ private struct PlaylistEditor: View {
         guard isActive,
               let current = viewModel.activePlaylist,
               current.type == .xtream,
-              DataCache.cacheKey(for: current) == DataCache.cacheKey(for: draft),
+              DataCache.preferenceKey(for: current) == DataCache.preferenceKey(for: draft),
               statusPreview == nil,
               viewModel.serverStatus == nil,
               !viewModel.isRefreshing,
@@ -743,7 +743,7 @@ private enum ServerConnectionTester {
         }
 
         let epg = await probe(url: config.xtreamEPGURL)
-        var status = ServerAccountStatus.initial(for: config, cacheKey: DataCache.cacheKey(for: config))
+        var status = ServerAccountStatus.initial(for: config, cacheKey: DataCache.preferenceKey(for: config))
         status.channelCount = channels.count
         status.guideStatus = epg.message
         status.apply(accountInfo)
@@ -775,7 +775,7 @@ private enum ServerConnectionTester {
         }
 
         let epg = await probe(url: config.epgSourceURL)
-        var status = ServerAccountStatus.initial(for: config, cacheKey: DataCache.cacheKey(for: config))
+        var status = ServerAccountStatus.initial(for: config, cacheKey: DataCache.preferenceKey(for: config))
         status.channelCount = channels.count
         status.guideStatus = epg.message
         status.lastChecked = .now

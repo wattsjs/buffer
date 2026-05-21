@@ -144,7 +144,7 @@ class EPGViewModel {
             await self?.hydrateFromDisk()
         }
         if let config = serverConfig {
-            StreamProbeService.shared.setActiveCacheKey(DataCache.cacheKey(for: config))
+            setActiveStreamProbeScope(for: config)
         }
 
         // Seed caches from any prefs loaded in loadConfig (groups, etc.) + empty data.
@@ -366,6 +366,13 @@ class EPGViewModel {
         rebuildFilteredCaches()
     }
 
+    private func setActiveStreamProbeScope(for config: ServerConfig) {
+        StreamProbeService.shared.setActiveCacheKey(
+            DataCache.preferenceKey(for: config),
+            legacyKeys: DataCache.legacyCacheKeys(for: config)
+        )
+    }
+
     private func rebuildRecentAndFavoriteChannels() {
         recentChannelsCached = recentChannelIDs.compactMap { channelByID[$0] }
         favoriteChannelsCached = favoriteChannelIDs.compactMap { channelByID[$0] }
@@ -550,7 +557,7 @@ class EPGViewModel {
         )
         let started = ContinuousClock.now
         let cacheKey = DataCache.cacheKey(for: config)
-        var syncedStatus = ServerAccountStatus.initial(for: config, cacheKey: cacheKey)
+        var syncedStatus = ServerAccountStatus.initial(for: config, cacheKey: DataCache.preferenceKey(for: config))
 
         if !silent {
             isRefreshing = true
@@ -756,10 +763,10 @@ class EPGViewModel {
 
     func refreshServerStatus() async {
         guard let config = serverConfig else { return }
-        let cacheKey = DataCache.cacheKey(for: config)
-        var refreshed = serverStatus?.cacheKey == cacheKey
-            ? (serverStatus ?? ServerAccountStatus.initial(for: config, cacheKey: cacheKey))
-            : ServerAccountStatus.initial(for: config, cacheKey: cacheKey)
+        let statusKey = DataCache.preferenceKey(for: config)
+        var refreshed = serverStatus?.cacheKey == statusKey
+            ? (serverStatus ?? ServerAccountStatus.initial(for: config, cacheKey: statusKey))
+            : ServerAccountStatus.initial(for: config, cacheKey: statusKey)
         refreshed.channelCount = channels.count
         refreshed.guideStatus = epgURL(for: config) == nil ? "Not configured" : refreshed.guideStatus
 
@@ -1145,7 +1152,7 @@ class EPGViewModel {
         saveActivePlaylistID()
         swapInActivePlaylistState(previousKey: nil)
         if let config = serverConfig {
-            StreamProbeService.shared.setActiveCacheKey(DataCache.cacheKey(for: config))
+            setActiveStreamProbeScope(for: config)
         }
     }
 
@@ -1245,6 +1252,13 @@ class EPGViewModel {
         "buffer_server_status_\(cacheKey)"
     }
 
+    private func serverStatusKeys(for config: ServerConfig) -> (primary: String, legacy: [String]) {
+        (
+            Self.serverStatusKey(for: DataCache.preferenceKey(for: config)),
+            DataCache.legacyCacheKeys(for: config).map { Self.serverStatusKey(for: $0) }
+        )
+    }
+
     private struct StoredServerConfig: Codable {
         let id: UUID
         var name: String
@@ -1317,6 +1331,8 @@ class EPGViewModel {
         loadRecents()
         loadVODResumeEntries()
         loadFavorites()
+        loadChannelUsage()
+        loadGroupUsage()
         loadGroupPreferences()
     }
 
@@ -1339,20 +1355,29 @@ class EPGViewModel {
             activePlaylistID = playlists.first?.id
             saveActivePlaylistID()
 
-            // Migrate the old single-slot server status into the new
-            // per-cache-key slot so the user doesn't lose their status card.
+            // Migrate the old single-slot server status into the stable
+            // per-source slot so the user doesn't lose their status card.
             if let data = UserDefaults.standard.data(forKey: Self.legacyServerStatusKey),
-               let stored = try? JSONDecoder().decode(ServerAccountStatus.self, from: data) {
-                UserDefaults.standard.set(data, forKey: Self.serverStatusKey(for: stored.cacheKey))
-                UserDefaults.standard.removeObject(forKey: Self.legacyServerStatusKey)
+               var stored = try? JSONDecoder().decode(ServerAccountStatus.self, from: data),
+               let config = serverConfig {
+                stored.cacheKey = DataCache.preferenceKey(for: config)
+                if let migrated = try? JSONEncoder().encode(stored) {
+                    UserDefaults.standard.set(migrated, forKey: serverStatusKeys(for: config).primary)
+                    UserDefaults.standard.removeObject(forKey: Self.legacyServerStatusKey)
+                }
             }
         }
     }
 
     private func updateServerStatus(_ status: ServerAccountStatus) {
+        var status = status
+        if let config = serverConfig {
+            status.cacheKey = DataCache.preferenceKey(for: config)
+        }
         serverStatus = status
-        if let data = try? JSONEncoder().encode(status) {
-            UserDefaults.standard.set(data, forKey: Self.serverStatusKey(for: status.cacheKey))
+        if let config = serverConfig,
+           let data = try? JSONEncoder().encode(status) {
+            UserDefaults.standard.set(data, forKey: serverStatusKeys(for: config).primary)
         }
     }
 
@@ -1362,55 +1387,114 @@ class EPGViewModel {
             return
         }
 
-        let cacheKey = DataCache.cacheKey(for: config)
-        guard let data = UserDefaults.standard.data(forKey: Self.serverStatusKey(for: cacheKey)),
-              let stored = try? JSONDecoder().decode(ServerAccountStatus.self, from: data) else {
+        let keys = serverStatusKeys(for: config)
+        let defaults = UserDefaults.standard
+        let data = defaults.data(forKey: keys.primary)
+            ?? keys.legacy.lazy.compactMap { defaults.data(forKey: $0) }.first
+        guard let data,
+              var stored = try? JSONDecoder().decode(ServerAccountStatus.self, from: data) else {
             serverStatus = nil
             return
         }
 
+        stored.cacheKey = DataCache.preferenceKey(for: config)
         serverStatus = stored
+        if defaults.data(forKey: keys.primary) == nil,
+           let migrated = try? JSONEncoder().encode(stored) {
+            defaults.set(migrated, forKey: keys.primary)
+        }
+    }
+
+    // MARK: - Per-Source Preferences
+
+    private func preferenceKeys(prefix: String) -> (primary: String, legacy: [String])? {
+        guard let config = serverConfig else { return nil }
+        return (
+            "\(prefix)_\(DataCache.preferenceKey(for: config))",
+            DataCache.legacyCacheKeys(for: config).map { "\(prefix)_\($0)" }
+        )
+    }
+
+    private func loadStringArrayPreference(primaryKey: String?, legacyKeys: [String] = []) -> [String] {
+        guard let primaryKey else { return [] }
+        let defaults = UserDefaults.standard
+
+        if defaults.object(forKey: primaryKey) != nil {
+            return defaults.array(forKey: primaryKey) as? [String] ?? []
+        }
+
+        for key in legacyKeys where defaults.object(forKey: key) != nil {
+            let value = defaults.array(forKey: key) as? [String] ?? []
+            defaults.set(value, forKey: primaryKey)
+            return value
+        }
+
+        return []
+    }
+
+    private func loadIntDictionaryPreference(primaryKey: String?, legacyKeys: [String] = []) -> [String: Int] {
+        guard let primaryKey else { return [:] }
+        let defaults = UserDefaults.standard
+
+        if defaults.object(forKey: primaryKey) != nil {
+            return defaults.dictionary(forKey: primaryKey) as? [String: Int] ?? [:]
+        }
+
+        for key in legacyKeys where defaults.object(forKey: key) != nil {
+            let value = defaults.dictionary(forKey: key) as? [String: Int] ?? [:]
+            defaults.set(value, forKey: primaryKey)
+            return value
+        }
+
+        return [:]
+    }
+
+    private func loadDataPreference(primaryKey: String?, legacyKeys: [String] = []) -> Data? {
+        guard let primaryKey else { return nil }
+        let defaults = UserDefaults.standard
+
+        if defaults.object(forKey: primaryKey) != nil {
+            return defaults.data(forKey: primaryKey)
+        }
+
+        for key in legacyKeys where defaults.object(forKey: key) != nil {
+            guard let value = defaults.data(forKey: key) else { continue }
+            defaults.set(value, forKey: primaryKey)
+            return value
+        }
+
+        return nil
     }
 
     // MARK: - Recents
 
-    private func recentsKey() -> String? {
-        guard let config = serverConfig else { return nil }
-        return "buffer_recents_\(DataCache.cacheKey(for: config))"
-    }
-
     private func saveRecents() {
-        guard let key = recentsKey() else { return }
-        UserDefaults.standard.set(recentChannelIDs, forKey: key)
+        guard let keys = preferenceKeys(prefix: "buffer_recents") else { return }
+        UserDefaults.standard.set(recentChannelIDs, forKey: keys.primary)
     }
 
     private func loadRecents() {
-        guard let key = recentsKey() else {
+        guard let keys = preferenceKeys(prefix: "buffer_recents") else {
             recentChannelIDs = []
             return
         }
-        recentChannelIDs = (UserDefaults.standard.array(forKey: key) as? [String]) ?? []
+        recentChannelIDs = loadStringArrayPreference(primaryKey: keys.primary, legacyKeys: keys.legacy)
     }
 
     // MARK: - VOD Resume
 
-    private func vodResumeKey() -> String? {
-        guard let config = serverConfig else { return nil }
-        return "buffer_vod_resume_\(DataCache.cacheKey(for: config))"
-    }
-
     private func saveVODResumeEntries() {
-        guard let key = vodResumeKey(),
+        guard let keys = preferenceKeys(prefix: "buffer_vod_resume"),
               let data = try? JSONEncoder().encode(vodResumeEntries) else { return }
-        UserDefaults.standard.set(data, forKey: key)
+        UserDefaults.standard.set(data, forKey: keys.primary)
     }
 
     private func loadVODResumeEntries() {
-        guard let key = vodResumeKey() else {
+        guard let keys = preferenceKeys(prefix: "buffer_vod_resume") else {
             vodResumeEntries = []
             return
         }
-        guard let data = UserDefaults.standard.data(forKey: key),
+        guard let data = loadDataPreference(primaryKey: keys.primary, legacyKeys: keys.legacy),
               let entries = try? JSONDecoder().decode([VODResumeEntry].self, from: data) else {
             vodResumeEntries = []
             return
@@ -1420,31 +1504,21 @@ class EPGViewModel {
 
     // MARK: - Favorites
 
-    private func favoritesKey() -> String? {
-        guard let config = serverConfig else { return nil }
-        return "buffer_favorites_\(DataCache.cacheKey(for: config))"
-    }
-
     private func saveFavorites() {
-        guard let key = favoritesKey() else { return }
-        UserDefaults.standard.set(Array(favoriteChannelIDs), forKey: key)
+        guard let keys = preferenceKeys(prefix: "buffer_favorites") else { return }
+        UserDefaults.standard.set(Array(favoriteChannelIDs), forKey: keys.primary)
     }
 
     private func loadFavorites() {
-        guard let key = favoritesKey() else {
+        guard let keys = preferenceKeys(prefix: "buffer_favorites") else {
             favoriteChannelIDs = []
             return
         }
-        let ids = (UserDefaults.standard.array(forKey: key) as? [String]) ?? []
+        let ids = loadStringArrayPreference(primaryKey: keys.primary, legacyKeys: keys.legacy)
         favoriteChannelIDs = Set(ids)
     }
 
     // MARK: - Channel Usage
-
-    private func channelUsageKey() -> String? {
-        guard let config = serverConfig else { return nil }
-        return "buffer_channel_usage_\(DataCache.cacheKey(for: config))"
-    }
 
     private func trimChannelUsageCounts() {
         guard channelUsageCounts.count > Self.channelUsageLimit else { return }
@@ -1455,25 +1529,20 @@ class EPGViewModel {
     }
 
     private func saveChannelUsage() {
-        guard let key = channelUsageKey() else { return }
-        UserDefaults.standard.set(channelUsageCounts, forKey: key)
+        guard let keys = preferenceKeys(prefix: "buffer_channel_usage") else { return }
+        UserDefaults.standard.set(channelUsageCounts, forKey: keys.primary)
     }
 
     private func loadChannelUsage() {
-        guard let key = channelUsageKey() else {
+        guard let keys = preferenceKeys(prefix: "buffer_channel_usage") else {
             channelUsageCounts = [:]
             return
         }
-        channelUsageCounts = (UserDefaults.standard.dictionary(forKey: key) as? [String: Int]) ?? [:]
+        channelUsageCounts = loadIntDictionaryPreference(primaryKey: keys.primary, legacyKeys: keys.legacy)
         trimChannelUsageCounts()
     }
 
     // MARK: - Group Usage
-
-    private func groupUsageKey() -> String? {
-        guard let config = serverConfig else { return nil }
-        return "buffer_group_usage_\(DataCache.cacheKey(for: config))"
-    }
 
     private func trimGroupUsageCounts() {
         guard groupUsageCounts.count > Self.groupUsageLimit else { return }
@@ -1484,25 +1553,35 @@ class EPGViewModel {
     }
 
     private func saveGroupUsage() {
-        guard let key = groupUsageKey() else { return }
-        UserDefaults.standard.set(groupUsageCounts, forKey: key)
+        guard let keys = preferenceKeys(prefix: "buffer_group_usage") else { return }
+        UserDefaults.standard.set(groupUsageCounts, forKey: keys.primary)
     }
 
     private func loadGroupUsage() {
-        guard let key = groupUsageKey() else {
+        guard let keys = preferenceKeys(prefix: "buffer_group_usage") else {
             groupUsageCounts = [:]
             return
         }
-        groupUsageCounts = (UserDefaults.standard.dictionary(forKey: key) as? [String: Int]) ?? [:]
+        groupUsageCounts = loadIntDictionaryPreference(primaryKey: keys.primary, legacyKeys: keys.legacy)
         trimGroupUsageCounts()
     }
 
     // MARK: - Group Preferences
 
-    private func groupPrefsKeys() -> (order: String, hidden: String)? {
-        guard let config = serverConfig else { return nil }
-        let base = DataCache.cacheKey(for: config)
-        return ("buffer_group_order_\(base)", "buffer_group_hidden_\(base)")
+    private func groupPrefsKeys() -> (
+        order: String,
+        hidden: String,
+        legacyOrder: [String],
+        legacyHidden: [String]
+    )? {
+        guard let orderKeys = preferenceKeys(prefix: "buffer_group_order"),
+              let hiddenKeys = preferenceKeys(prefix: "buffer_group_hidden") else { return nil }
+        return (
+            orderKeys.primary,
+            hiddenKeys.primary,
+            orderKeys.legacy,
+            hiddenKeys.legacy
+        )
     }
 
     private func saveGroupPreferences() {
@@ -1517,8 +1596,8 @@ class EPGViewModel {
             hiddenGroupNames = []
             return
         }
-        storedGroupOrder = (UserDefaults.standard.array(forKey: keys.order) as? [String]) ?? []
-        let hidden = (UserDefaults.standard.array(forKey: keys.hidden) as? [String]) ?? []
+        storedGroupOrder = loadStringArrayPreference(primaryKey: keys.order, legacyKeys: keys.legacyOrder)
+        let hidden = loadStringArrayPreference(primaryKey: keys.hidden, legacyKeys: keys.legacyHidden)
         hiddenGroupNames = Set(hidden)
     }
 }

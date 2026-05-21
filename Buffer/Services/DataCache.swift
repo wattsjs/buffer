@@ -42,17 +42,38 @@ nonisolated enum DataCache {
     // Bumped when Channel/EPGProgram layouts change so old on-disk caches
     // don't silently hide newly-parsed fields (e.g. catchup support).
     private static let schemaVersion = "v6"
+    private static let legacySchemaVersions = ["v5", "v4", "v3", "v2", "v1"]
 
     nonisolated static func cacheKey(for config: ServerConfig) -> String {
+        cacheKey(for: config, schemaVersion: schemaVersion)
+    }
+
+    nonisolated static func preferenceKey(for config: ServerConfig) -> String {
+        digestKey("prefs|\(sourceIdentity(for: config))")
+    }
+
+    nonisolated static func legacyCacheKeys(for config: ServerConfig) -> [String] {
+        [cacheKey(for: config)] + legacySchemaVersions.map { cacheKey(for: config, schemaVersion: $0) }
+    }
+
+    nonisolated private static func cacheKey(for config: ServerConfig, schemaVersion: String) -> String {
+        digestKey("\(sourceIdentity(for: config))|\(schemaVersion)")
+    }
+
+    nonisolated private static func sourceIdentity(for config: ServerConfig) -> String {
         let raw: String
         switch config.type {
         case .xtream:
-            raw = "xtream|\(config.xtreamBaseURL)|\(config.username)|\(schemaVersion)"
+            raw = "xtream|\(config.xtreamBaseURL)|\(config.username)"
         case .m3u:
             let m3uKey = cacheInput(for: config.m3uSourceURL, fallback: config.m3uURL)
             let epgKey = cacheInput(for: config.epgSourceURL, fallback: config.epgURL)
-            raw = "m3u|\(m3uKey)|\(epgKey)|\(schemaVersion)"
+            raw = "m3u|\(m3uKey)|\(epgKey)"
         }
+        return raw
+    }
+
+    nonisolated private static func digestKey(_ raw: String) -> String {
         let digest = SHA256.hash(data: Data(raw.utf8))
         return digest.compactMap { String(format: "%02x", $0) }.joined().prefix(16).description
     }

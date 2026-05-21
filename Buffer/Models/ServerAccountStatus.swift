@@ -1,7 +1,7 @@
 import Foundation
 
 struct ServerAccountStatus: Codable, Equatable {
-    let cacheKey: String
+    var cacheKey: String
     let serverType: ServerType
     var channelCount: Int
     var guideStatus: String

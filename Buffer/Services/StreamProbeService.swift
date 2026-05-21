@@ -48,10 +48,10 @@ final class StreamProbeService {
         let priority: TaskPriority
     }
 
-    /// Switch the probe scope to a new cache key. Pending probes are dropped
+    /// Switch the probe scope to a new source key. Pending probes are dropped
     /// (their results would no longer be relevant) and the on-disk cache for
-    /// the new key is loaded.
-    func setActiveCacheKey(_ key: String?) {
+    /// the new source is loaded.
+    func setActiveCacheKey(_ key: String?, legacyKeys: [String] = []) {
         guard activeCacheKey != key else { return }
         activeCacheKey = key
         pending.removeAll()
@@ -61,10 +61,12 @@ final class StreamProbeService {
 
         Task.detached(priority: .utility) { [weak self] in
             let cached = DataCache.loadProbes(key: key)
+                ?? legacyKeys.lazy.compactMap { DataCache.loadProbes(key: $0) }.first
             await MainActor.run { [weak self] in
                 guard let self, self.activeCacheKey == key, let cached else { return }
                 self.probes = cached.probes
                 self.version &+= 1
+                DataCache.saveProbes(cached.probes, key: key)
             }
         }
     }
