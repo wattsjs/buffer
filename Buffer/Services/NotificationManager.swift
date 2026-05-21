@@ -15,8 +15,24 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
 
     var reminders: [ProgramReminder] = []
     var authorizationStatus: UNAuthorizationStatus = .notDetermined
+    /// Fast O(1) lookup for the hot path in EPG rows / popovers (Agent 02/09).
+    /// Kept in sync with the public array so badge checks and "has reminder?"
+    /// queries are cheap even on 500+ channel guides with many reminders.
+    private var reminderIDIndex: Set<String> = []
 
     private let storageKey = "Buffer_reminders_v1"
+
+    private func rebuildReminderIndex() {
+        reminderIDIndex = Set(reminders.map(\.id))
+    }
+
+    private func addToIndex(_ reminder: ProgramReminder) {
+        reminderIDIndex.insert(reminder.id)
+    }
+
+    private func removeFromIndex(id: String) {
+        reminderIDIndex.remove(id)
+    }
     private static let categoryID = "Buffer.program.reminder"
     private static let actionWatchNow = "Buffer.action.watchNow"
 
@@ -68,7 +84,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
             channelID: program.channelID,
             programID: program.id
         )
-        return reminders.contains { $0.id == id }
+        return reminderIDIndex.contains(id)
     }
 
     func reminder(playlistID: UUID, for program: EPGProgram) -> ProgramReminder? {
@@ -77,6 +93,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
             channelID: program.channelID,
             programID: program.id
         )
+        guard reminderIDIndex.contains(id) else { return nil }
         return reminders.first { $0.id == id }
     }
 
@@ -160,7 +177,9 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
             streamURL: channel.streamURL
         )
         reminders.removeAll { $0.id == id }
+        removeFromIndex(id: id)
         reminders.append(reminder)
+        addToIndex(reminder)
         saveReminders()
         return true
     }
@@ -178,6 +197,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         UNUserNotificationCenter.current()
             .removePendingNotificationRequests(withIdentifiers: [id])
         reminders.removeAll { $0.id == id }
+        removeFromIndex(id: id)
         saveReminders()
     }
 
@@ -224,6 +244,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         decoder.dateDecodingStrategy = .secondsSince1970
         if let list = try? decoder.decode([ProgramReminder].self, from: data) {
             reminders = list
+            rebuildReminderIndex()
         }
     }
 
@@ -296,6 +317,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         // Consume the reminder now — the system will also clear its pending
         // request by identifier since fire + activate implies completion.
         reminders.removeAll { $0.id == id }
+        removeFromIndex(id: id)
         saveReminders()
 
         NSApp.activate(ignoringOtherApps: true)

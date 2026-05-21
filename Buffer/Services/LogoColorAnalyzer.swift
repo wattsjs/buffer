@@ -4,7 +4,16 @@ import AppKit
 
 enum LogoColorAnalyzer {
     private static let cacheLock = NSLock()
-    private static var cache: [URL: NSColor] = [:]
+    // Bounded runtime cache (Agent 07)
+    private static let cache: NSCache<NSURL, NSColor> = {
+        let c = NSCache<NSURL, NSColor>()
+        c.countLimit = 4096
+        c.name = "com.buffer.logoColors.runtime"
+        return c
+    }()
+
+    // Small side map used only for persistence (kept in sync, bounded by the same limit logic)
+    private static var persistMap: [URL: NSColor] = [:]
     private static let workQueue = DispatchQueue(
         label: "com.buffer.logo-color",
         qos: .utility,
@@ -19,7 +28,10 @@ enum LogoColorAnalyzer {
         ensurePersistedLoaded()
         cacheLock.lock()
         defer { cacheLock.unlock() }
-        return cache[url]
+        if let color = cache.object(forKey: url as NSURL) {
+            return color
+        }
+        return persistMap[url]
     }
 
     static func color(
@@ -34,7 +46,14 @@ enum LogoColorAnalyzer {
         workQueue.async {
             let color = extract(from: image)
             cacheLock.lock()
-            cache[url] = color
+            cache.setObject(color, forKey: url as NSURL)
+            persistMap[url] = color
+            // Trim persistMap to keep memory reasonable
+            if persistMap.count > 4500 {
+                // Simple trim: drop oldest (not perfect LRU but good enough)
+                let keysToRemove = Array(persistMap.keys.prefix(persistMap.count - 4000))
+                for k in keysToRemove { persistMap.removeValue(forKey: k) }
+            }
             cacheLock.unlock()
             schedulePersist()
             DispatchQueue.main.async { completion(color) }
@@ -52,7 +71,9 @@ enum LogoColorAnalyzer {
         cacheLock.lock()
         for (key, hex) in dict {
             guard let url = URL(string: key), let color = Self.color(fromHex: hex) else { continue }
-            if cache[url] == nil { cache[url] = color }
+            if cache.object(forKey: url as NSURL) == nil {
+                cache.setObject(color, forKey: url as NSURL)
+            }
         }
         cacheLock.unlock()
     }
@@ -63,11 +84,13 @@ enum LogoColorAnalyzer {
         pendingFlush?.cancel()
         let work = DispatchWorkItem {
             cacheLock.lock()
-            let snapshot = cache.reduce(into: [String: String]()) { acc, pair in
+            let snapshot = persistMap.reduce(into: [String: String]()) { acc, pair in
                 acc[pair.key.absoluteString] = hex(from: pair.value)
             }
             cacheLock.unlock()
-            UserDefaults.standard.set(snapshot, forKey: persistKey)
+            if !snapshot.isEmpty {
+                UserDefaults.standard.set(snapshot, forKey: persistKey)
+            }
         }
         pendingFlush = work
         workQueue.asyncAfter(deadline: .now() + 1.0, execute: work)

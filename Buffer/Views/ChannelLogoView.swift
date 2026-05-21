@@ -44,8 +44,8 @@ struct ChannelLogoView: View {
 
     private func handleCompletion(url: URL, result: Result<ImageResponse, Error>) {
         switch result {
-        case .failure:
-            ImageLoader.markFailed(url)
+        case .failure(let error):
+            ImageLoader.markFailed(url, unlessCancelled: error)
         case .success(let response):
             // Parent cells seed their background from `LogoColorAnalyzer.cachedColor`
             // at init. If that cache already holds a value, delivering it again
@@ -53,6 +53,11 @@ struct ChannelLogoView: View {
             // in turn re-instantiates this view and refires onCompletion — a
             // tight feedback loop that pegged the CPU when combined with
             // uncached failing logo URLs.
+            // Only perform (expensive) color analysis when the caller actually
+            // subscribes to the result. This eliminates wasted decode + CG work
+            // for the many logo sites that only need the image (player chrome,
+            // small list rows, etc.).
+            guard onComputedColor != nil else { return }
             if LogoColorAnalyzer.cachedColor(for: url) != nil {
                 return
             }
@@ -63,6 +68,52 @@ struct ChannelLogoView: View {
                 onComputedColor?(color)
             }
         }
+    }
+}
+
+struct RemoteArtworkView: View {
+    let url: URL?
+    let fallbackSystemImage: String
+    let width: CGFloat
+    let height: CGFloat
+    var scaledToFill = true
+
+    var body: some View {
+        ZStack {
+            if let url, !ImageLoader.isFailed(url) {
+                LazyImage(url: url) { state in
+                    if let image = state.image {
+                        image
+                            .resizable()
+                            .interpolation(.medium)
+                            .aspectRatio(contentMode: scaledToFill ? .fill : .fit)
+                    } else {
+                        fallbackIcon
+                    }
+                }
+                .processors([
+                    .resize(
+                        size: CGSize(width: width, height: height),
+                        contentMode: scaledToFill ? .aspectFill : .aspectFit
+                    )
+                ])
+                .onCompletion { result in
+                    if case .failure(let error) = result {
+                        ImageLoader.markFailed(url, unlessCancelled: error)
+                    }
+                }
+                .pipeline(ImageLoader.pipeline)
+            } else {
+                fallbackIcon
+            }
+        }
+        .frame(width: width, height: height)
+    }
+
+    private var fallbackIcon: some View {
+        Image(systemName: fallbackSystemImage)
+            .font(.system(size: min(width, height) * 0.42, weight: .regular))
+            .foregroundStyle(.tertiary)
     }
 }
 

@@ -12,4 +12,5 @@ enum AppLog {
 
     nonisolated static let appSignposter = OSSignposter(subsystem: subsystem, category: .pointsOfInterest)
     nonisolated static let syncSignposter = OSSignposter(subsystem: subsystem, category: .pointsOfInterest)
+    nonisolated static let sportsSignposter = OSSignposter(subsystem: subsystem, category: .pointsOfInterest)
 }

@@ -45,6 +45,11 @@ enum ImageLoader {
         failureLock.unlock()
     }
 
+    static func markFailed(_ url: URL, unlessCancelled error: Error) {
+        guard !isCancellation(error) else { return }
+        markFailed(url)
+    }
+
     static func isFailed(_ url: URL) -> Bool {
         failureLock.lock()
         defer { failureLock.unlock() }
@@ -54,5 +59,23 @@ enum ImageLoader {
             return false
         }
         return true
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+            return true
+        }
+
+        if let pipelineError = error as? ImagePipeline.Error,
+           let underlying = pipelineError.dataLoadingError {
+            return isCancellation(underlying)
+        }
+
+        return false
     }
 }

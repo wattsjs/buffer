@@ -401,6 +401,11 @@ private struct SportEventCard: View {
         .onTapGesture {
             handleTap()
         }
+        // a11y for tap target (was missing label/traits on card; Agent 10 / sports audit item)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(event.displayTitle), \(event.status.label)")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Double-tap to view streams or play")
         .onChange(of: viewModel.searchIndexVersion) { _, newVersion in
             guard showStreams, newVersion != lastIndexVersion else { return }
             lastIndexVersion = newVersion
@@ -441,16 +446,13 @@ private struct SportEventCard: View {
     private func teamRow(_ team: TeamInfo, isHome: Bool) -> some View {
         let hasScore = event.status.isLive || event.status.isFinished
         return HStack(spacing: 8) {
-            if let url = team.logoURL {
-                AsyncImage(url: url) { image in
-                    image.resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                } placeholder: {
-                    Color.clear
-                }
-                .frame(width: 24, height: 24)
-            }
+            RemoteArtworkView(
+                url: team.logoURL,
+                fallbackSystemImage: "sportscourt",
+                width: 24,
+                height: 24,
+                scaledToFill: false
+            )
 
             Text(team.displayName)
                 .font(.system(size: 13, weight: .semibold))

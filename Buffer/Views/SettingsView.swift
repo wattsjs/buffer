@@ -4,31 +4,112 @@ import SwiftUI
 
 struct SettingsView: View {
     @Bindable var viewModel: EPGViewModel
+    @State private var selection: SettingsSection = .sources
+    @State private var searchText = ""
 
     var body: some View {
-        TabView {
-            PlaylistsSettingsTab(viewModel: viewModel)
-                .tabItem { Label("Playlists", systemImage: "server.rack") }
-
-            PlaybackSettingsTab()
-                .tabItem { Label("Playback", systemImage: "play.rectangle") }
-
-            RecordingsSettingsTab()
-                .tabItem { Label("Recordings", systemImage: "record.circle") }
-
-            SyncSettingsTab(viewModel: viewModel)
-                .tabItem { Label("Sync", systemImage: "arrow.triangle.2.circlepath") }
-
-            GeneralAppSettingsTab(viewModel: viewModel)
-                .tabItem { Label("General", systemImage: "gearshape") }
+        NavigationSplitView {
+            settingsSidebar
+        } detail: {
+            SettingsDetail(section: selection, viewModel: viewModel)
         }
-        .frame(width: 720, height: 560)
+        .navigationSplitViewStyle(.balanced)
+        .searchable(text: $searchText, placement: .toolbar, prompt: "Search settings")
+        .frame(width: 920, height: 640)
+    }
+
+    private var settingsSidebar: some View {
+        SettingsSidebar(
+            selection: $selection,
+            searchText: $searchText
+        )
+        .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 260)
     }
 }
 
-// MARK: - Playlists
+private enum SettingsSection: String, CaseIterable, Identifiable {
+    case sources
+    case refresh
+    case playback
+    case recordings
+    case content
 
-private struct PlaylistsSettingsTab: View {
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .sources: return "Sources"
+        case .refresh: return "Refresh"
+        case .playback: return "Playback"
+        case .recordings: return "Recordings"
+        case .content: return "Content"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .sources: return "server.rack"
+        case .refresh: return "arrow.triangle.2.circlepath"
+        case .playback: return "play.rectangle"
+        case .recordings: return "record.circle"
+        case .content: return "rectangle.stack"
+        }
+    }
+}
+
+private struct SettingsSidebar: View {
+    @Binding var selection: SettingsSection
+    @Binding var searchText: String
+
+    private var visibleSections: [SettingsSection] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return SettingsSection.allCases }
+        return SettingsSection.allCases.filter {
+            $0.title.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var body: some View {
+        List(selection: $selection) {
+            ForEach(visibleSections) { section in
+                Label(section.title, systemImage: section.systemImage)
+                    .tag(section)
+            }
+        }
+        .listStyle(.sidebar)
+        .navigationTitle("Settings")
+    }
+}
+
+private struct SettingsDetail: View {
+    let section: SettingsSection
+    @Bindable var viewModel: EPGViewModel
+
+    var body: some View {
+        detailContent
+        .navigationTitle(section.title)
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        switch section {
+        case .sources:
+            SourcesSettingsTab(viewModel: viewModel)
+        case .refresh:
+            RefreshSettingsTab(viewModel: viewModel)
+        case .playback:
+            PlaybackSettingsTab()
+        case .recordings:
+            RecordingsSettingsTab()
+        case .content:
+            ContentSettingsTab(viewModel: viewModel)
+        }
+    }
+}
+
+// MARK: - Sources
+
+private struct SourcesSettingsTab: View {
     @Bindable var viewModel: EPGViewModel
     @State private var selection: PlaylistEditorSelection = .none
 
@@ -37,19 +118,17 @@ private struct PlaylistsSettingsTab: View {
             if viewModel.playlists.isEmpty && !selection.isNewDraft {
                 firstRunView
             } else {
-                HStack(spacing: 0) {
-                    PlaylistSidebar(viewModel: viewModel, selection: $selection)
-                        .frame(width: 220)
-
-                    Divider()
-
-                    PlaylistDetail(viewModel: viewModel, selection: $selection)
-                        .frame(maxWidth: .infinity)
-                }
+                SourceDetail(
+                    viewModel: viewModel,
+                    selection: $selection,
+                    sourceControls: sourceControls
+                )
+                .frame(maxWidth: .infinity)
             }
         }
         .onAppear { ensureSelectionIsValid() }
         .onChange(of: viewModel.playlists.map(\.id)) { _, _ in ensureSelectionIsValid() }
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private var firstRunView: some View {
@@ -57,16 +136,16 @@ private struct PlaylistsSettingsTab: View {
             Image(systemName: "tv.badge.wifi")
                 .font(.system(size: 40))
                 .foregroundStyle(.secondary)
-            Text("Add your first playlist")
+            Text("Add a source")
                 .font(.title3.weight(.semibold))
-            Text("Connect Buffer to an Xtream Codes provider or an M3U playlist to start watching.")
+            Text("Connect an Xtream Codes account or M3U playlist.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 360)
             Button {
                 selection = .new(ServerConfig())
             } label: {
-                Label("Add Playlist", systemImage: "plus.circle.fill")
+                Label("Add Source", systemImage: "plus.circle.fill")
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
@@ -99,6 +178,50 @@ private struct PlaylistsSettingsTab: View {
             break
         }
     }
+
+    private var sourcePickerBinding: Binding<SourcePickerSelection> {
+        Binding(
+            get: {
+                switch selection {
+                case .existing(let id): return .existing(id)
+                case .new: return .new
+                case .none:
+                    if let active = viewModel.activePlaylist {
+                        return .existing(active.id)
+                    }
+                    if let first = viewModel.playlists.first {
+                        return .existing(first.id)
+                    }
+                    return .new
+                }
+            },
+            set: { pickerSelection in
+                switch pickerSelection {
+                case .existing(let id): selection = .existing(id)
+                case .new:
+                    if !selection.isNewDraft {
+                        selection = .new(ServerConfig())
+                    }
+                }
+            }
+        )
+    }
+
+    private var sourceControls: SourceSelectionControls {
+        SourceSelectionControls(
+            playlists: viewModel.playlists,
+            selection: sourcePickerBinding,
+            canDelete: selection.existingID != nil,
+            add: {
+                selection = .new(ServerConfig())
+            },
+            delete: {
+                if let id = selection.existingID {
+                    viewModel.removePlaylist(id: id)
+                }
+            }
+        )
+    }
 }
 
 private enum PlaylistEditorSelection {
@@ -122,147 +245,25 @@ private enum PlaylistEditorSelection {
     }
 }
 
-// MARK: - Sidebar
-
-private struct PlaylistSidebar: View {
-    @Bindable var viewModel: EPGViewModel
-    @Binding var selection: PlaylistEditorSelection
-
-    var body: some View {
-        VStack(spacing: 0) {
-            List(selection: sidebarBinding) {
-                ForEach(viewModel.playlists) { playlist in
-                    PlaylistRow(
-                        playlist: playlist,
-                        isActive: viewModel.activePlaylistID == playlist.id
-                    )
-                    .tag(PlaylistRowTag.existing(playlist.id))
-                    .contextMenu { rowMenu(for: playlist) }
-                }
-
-                if case .new = selection {
-                    Label("New Playlist", systemImage: "plus.circle")
-                        .foregroundStyle(.secondary)
-                        .tag(PlaylistRowTag.new)
-                }
-            }
-            .listStyle(.sidebar)
-            .scrollContentBackground(.hidden)
-            .background(Color(nsColor: .controlBackgroundColor))
-
-            Divider()
-
-            HStack(spacing: 4) {
-                Button {
-                    selection = .new(ServerConfig())
-                } label: {
-                    Image(systemName: "plus")
-                        .frame(width: 22, height: 22)
-                }
-                .help("Add playlist")
-
-                Button {
-                    if let id = selection.existingID {
-                        viewModel.removePlaylist(id: id)
-                    }
-                } label: {
-                    Image(systemName: "minus")
-                        .frame(width: 22, height: 22)
-                }
-                .disabled(selection.existingID == nil)
-                .help("Delete playlist")
-
-                Spacer()
-            }
-            .buttonStyle(.borderless)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-            .background(Color(nsColor: .controlBackgroundColor))
-        }
-    }
-
-    @ViewBuilder
-    private func rowMenu(for playlist: ServerConfig) -> some View {
-        if viewModel.activePlaylistID != playlist.id {
-            Button("Use This Playlist") {
-                viewModel.setActivePlaylist(id: playlist.id)
-            }
-        }
-        Button("Duplicate") { duplicate(playlist) }
-        Divider()
-        Button("Delete", role: .destructive) {
-            viewModel.removePlaylist(id: playlist.id)
-        }
-    }
-
-    private var sidebarBinding: Binding<PlaylistRowTag?> {
-        Binding(
-            get: {
-                switch selection {
-                case .existing(let id): return .existing(id)
-                case .new: return .new
-                case .none: return nil
-                }
-            },
-            set: { tag in
-                switch tag {
-                case .existing(let id): selection = .existing(id)
-                case .new: selection = .new(ServerConfig())
-                case .none: break
-                }
-            }
-        )
-    }
-
-    private func duplicate(_ playlist: ServerConfig) {
-        let copy = ServerConfig(
-            id: UUID(),
-            name: playlist.name.isEmpty ? "Playlist Copy" : "\(playlist.name) Copy",
-            type: playlist.type,
-            serverURL: playlist.serverURL,
-            username: playlist.username,
-            password: playlist.password,
-            m3uURL: playlist.m3uURL,
-            epgURL: playlist.epgURL
-        )
-        viewModel.addPlaylist(copy, makeActive: false)
-        selection = .existing(copy.id)
-    }
-}
-
-private enum PlaylistRowTag: Hashable {
+private enum SourcePickerSelection: Hashable {
     case existing(UUID)
     case new
 }
 
-private struct PlaylistRow: View {
-    let playlist: ServerConfig
-    let isActive: Bool
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(isActive ? Color.accentColor : Color.secondary.opacity(0.4))
-                .font(.system(size: 13))
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(playlist.name.isEmpty ? "Untitled Playlist" : playlist.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .lineLimit(1)
-                Text(playlist.type.rawValue)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-    }
+private struct SourceSelectionControls {
+    let playlists: [ServerConfig]
+    let selection: Binding<SourcePickerSelection>
+    let canDelete: Bool
+    let add: () -> Void
+    let delete: () -> Void
 }
 
-// MARK: - Detail (editor)
+// MARK: - Source Detail
 
-private struct PlaylistDetail: View {
+private struct SourceDetail: View {
     @Bindable var viewModel: EPGViewModel
     @Binding var selection: PlaylistEditorSelection
+    var sourceControls: SourceSelectionControls?
 
     var body: some View {
         switch selection {
@@ -272,7 +273,8 @@ private struct PlaylistDetail: View {
             if let playlist = viewModel.playlists.first(where: { $0.id == id }) {
                 PlaylistEditor(
                     viewModel: viewModel,
-                    mode: .existing(id: id, original: playlist)
+                    mode: .existing(id: id, original: playlist),
+                    sourceControls: sourceControls
                 )
                 .id(id)
             } else {
@@ -282,6 +284,7 @@ private struct PlaylistDetail: View {
             PlaylistEditor(
                 viewModel: viewModel,
                 mode: .new(initial: draft),
+                sourceControls: sourceControls,
                 onCreated: { newID in
                     selection = .existing(newID)
                 }
@@ -293,7 +296,7 @@ private struct PlaylistDetail: View {
     private var emptyDetail: some View {
         VStack {
             Spacer()
-            Text("Select a playlist to edit its details.")
+            Text("Select a source to edit it.")
                 .foregroundStyle(.secondary)
             Spacer()
         }
@@ -325,6 +328,7 @@ private struct PlaylistEditor: View {
 
     @Bindable var viewModel: EPGViewModel
     let mode: Mode
+    var sourceControls: SourceSelectionControls? = nil
     var onCreated: ((UUID) -> Void)? = nil
 
     @State private var draft: ServerConfig
@@ -332,16 +336,52 @@ private struct PlaylistEditor: View {
     @State private var statusPreview: ServerAccountStatus?
     @State private var justApplied = false
 
-    init(viewModel: EPGViewModel, mode: Mode, onCreated: ((UUID) -> Void)? = nil) {
+    init(
+        viewModel: EPGViewModel,
+        mode: Mode,
+        sourceControls: SourceSelectionControls? = nil,
+        onCreated: ((UUID) -> Void)? = nil
+    ) {
         self.viewModel = viewModel
         self.mode = mode
+        self.sourceControls = sourceControls
         self.onCreated = onCreated
         self._draft = State(initialValue: mode.initialConfig)
     }
 
     var body: some View {
         Form {
-            Section("Playlist") {
+            if let sourceControls {
+                Section("Source") {
+                    Picker("Source", selection: sourceControls.selection) {
+                        ForEach(sourceControls.playlists) { playlist in
+                            Text(playlist.name.isEmpty ? "Untitled Source" : playlist.name)
+                                .tag(SourcePickerSelection.existing(playlist.id))
+                        }
+
+                        if mode.isNew {
+                            Text("New Source").tag(SourcePickerSelection.new)
+                        }
+                    }
+
+                    HStack {
+                        Button {
+                            sourceControls.add()
+                        } label: {
+                            Label("Add Source", systemImage: "plus")
+                        }
+
+                        Button {
+                            sourceControls.delete()
+                        } label: {
+                            Label("Delete Source", systemImage: "minus")
+                        }
+                        .disabled(!sourceControls.canDelete)
+                    }
+                }
+            }
+
+            Section("Connection") {
                 TextField("Name", text: $draft.name, prompt: Text("My provider"))
                 Picker("Type", selection: $draft.type) {
                     ForEach(ServerType.allCases, id: \.self) { type in
@@ -413,7 +453,7 @@ private struct PlaylistEditor: View {
                     .disabled(!isValid || connectionTestState.isTesting || viewModel.isRefreshing)
 
                     if !isActive && !mode.isNew {
-                        Button("Use This Playlist") {
+                        Button("Make Active") {
                             applyEdits()
                             if let id = mode.existingID {
                                 viewModel.setActivePlaylist(id: id)
@@ -486,7 +526,7 @@ private struct PlaylistEditor: View {
 
         if viewModel.isRefreshing, justApplied {
             return (
-                title: "Syncing your channels",
+                title: "Refreshing source",
                 message: viewModel.loadingStage ?? "Connecting and downloading channels.",
                 systemImage: "arrow.triangle.2.circlepath",
                 tint: .accentColor,
@@ -496,8 +536,8 @@ private struct PlaylistEditor: View {
 
         if justApplied, viewModel.lastUpdated != nil {
             return (
-                title: "Playlist ready",
-                message: "Sync complete. You can close Settings.",
+                title: "Source refreshed",
+                message: "Channels and guide are up to date.",
                 systemImage: "checkmark.circle.fill",
                 tint: .green,
                 showsProgress: false
@@ -823,7 +863,7 @@ private struct AccountStatusCard: View {
     }
 
     private var statusLabel: String {
-        status?.accountStatus ?? (config?.type == .m3u ? "Playlist" : "Unknown")
+        status?.accountStatus ?? (config?.type == .m3u ? "M3U Source" : "Unknown")
     }
 
     private var lastUpdatedText: String {
@@ -930,35 +970,57 @@ private struct SetupFeedbackCard: View {
     }
 }
 
-// MARK: - Playback
+// MARK: - Content
 
-private struct GeneralAppSettingsTab: View {
+private struct ContentSettingsTab: View {
     @Bindable var viewModel: EPGViewModel
     @AppStorage("hideSport") private var hideSport = false
     @AppStorage(EPGViewModel.disableVODKey) private var disableVOD = false
 
     var body: some View {
         Form {
-            Section("Features") {
-                Toggle("Show Live Sport", isOn: Binding(
+            Section("Library") {
+                Toggle("Show Live Sports", isOn: Binding(
                     get: { !hideSport },
                     set: { hideSport = !$0 }
                 ))
-                Text("Shows ESPN live scores on Home and in the sidebar. Turn it off to stop background polling.")
+                Text("Shows ESPN live scores on Home and in the sidebar. Disabling it stops background sports polling.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Toggle("Disable VOD", isOn: $disableVOD)
+                Toggle("Show Movies and TV", isOn: Binding(
+                    get: { !disableVOD },
+                    set: { disableVOD = !$0 }
+                ))
                     .onChange(of: disableVOD) { _, newValue in
                         viewModel.applyVODPreference(disabled: newValue)
                     }
-                Text("Hides Movies and TV, removes them from search, and skips VOD fetches during playlist sync.")
+                Text("Shows Movies and TV in the library and search, and fetches VOD during source refresh.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("History") {
+                Button("Clear Recently Watched") {
+                    viewModel.clearRecentlyWatched()
+                }
+                .disabled(viewModel.recentChannelIDs.isEmpty)
+
+                Button("Reset Recommendations") {
+                    viewModel.resetRecommendations()
+                }
+                .disabled(
+                    viewModel.recentChannelIDs.isEmpty &&
+                        viewModel.channelUsageCounts.isEmpty &&
+                        viewModel.groupUsageCounts.isEmpty
+                )
+
+                Text("Clears Home history and the channel/group ranking used for suggestions.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .scrollDisabled(true)
     }
 }
 
@@ -966,42 +1028,58 @@ private struct PlaybackSettingsTab: View {
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
     @AppStorage(BufferSetting.appStorageKey) private var bufferSeconds: Int = BufferSetting.default
     @AppStorage(StreamProbeSetting.enabledKey) private var probeStreams: Bool = StreamProbeSetting.defaultEnabled
+    @AppStorage("buffer_media_info_display") private var mediaInfoDisplay: MediaInfoDisplay = .expanded
 
     var body: some View {
         Form {
-            Section("Network Buffer") {
+            Section("Player") {
+                Picker("Media details", selection: $mediaInfoDisplay) {
+                    ForEach(MediaInfoDisplay.allCases, id: \.self) { display in
+                        Text(display.settingsTitle).tag(display)
+                    }
+                }
+                Text("Choose how much stream information appears in the player overlay.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Buffering") {
                 Stepper(
                     value: $bufferSeconds,
                     in: BufferSetting.range,
                     step: 1
                 ) {
                     HStack {
-                        Text("Minimum buffer")
+                        Text("Live buffer")
                         Spacer()
                         Text("\(bufferSeconds) s")
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text("How many seconds Buffer keeps ahead before playback. Higher values reduce stutter but add more live delay.")
+                Text("Higher values can smooth unstable streams, with a little more delay.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Stream Metadata") {
-                Toggle("Probe channels for codec, resolution, and FPS", isOn: $probeStreams)
+            Section("Channel Metadata") {
+                Toggle("Show stream technical details", isOn: $probeStreams)
                     .onChange(of: probeStreams) { _, newValue in
                         if !newValue {
                             StreamProbeService.shared.clearAll()
                         }
                     }
-                Text("When channels appear in the sidebar or grid Buffer briefly opens each stream with libavformat to read metadata. Adds extra connections to your provider, so leave it off if you're tight on session limits.")
+                Text("Opens streams briefly to read codec, resolution, and FPS. This can count against provider session limits.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                Button("Clear Metadata Cache") {
+                    StreamProbeService.shared.clearAll()
+                }
             }
 
             Section("External Player") {
-                Picker("Default player", selection: $selectedPlayer) {
+                Picker("Open channels with", selection: $selectedPlayer) {
                     ForEach(ExternalPlayerKind.allCases) { kind in
                         Text(kind.displayName).tag(kind)
                     }
@@ -1012,15 +1090,23 @@ private struct PlaybackSettingsTab: View {
             }
         }
         .formStyle(.grouped)
-        .scrollDisabled(true)
     }
 
     private var footerText: String {
         switch selectedPlayer {
         case .none:
-            return "Channels open in Buffer."
+            return "Channels play in Buffer."
         default:
-            return "Selecting a channel opens the stream in \(selectedPlayer.displayName)."
+            return "Channel selections open in \(selectedPlayer.displayName)."
+        }
+    }
+}
+
+private extension MediaInfoDisplay {
+    var settingsTitle: String {
+        switch self {
+        case .expanded: return "Expanded"
+        case .collapsed: return "Compact"
         }
     }
 }
@@ -1043,7 +1129,7 @@ private struct RecordingsSettingsTab: View {
                         .truncationMode(.middle)
                     Button("Choose…") { chooseDirectory() }
                 }
-                Text("Scheduled and realtime recordings are saved as .ts files grouped by channel name.")
+                Text("Recordings are saved as .ts files in folders by channel.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1073,23 +1159,22 @@ private struct RecordingsSettingsTab: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text("Small safety margins around each scheduled recording so stream start-up lag and program overruns don't clip the episode.")
+                Text("Adds time before and after scheduled recordings to avoid clipped starts or overruns.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Wake from sleep") {
+            Section("Wake") {
                 Toggle("Wake Mac for scheduled recordings", isOn: Binding(
                     get: { manager.wakeMacForRecordings },
                     set: { manager.wakeMacForRecordings = $0 }
                 ))
-                Text("Uses macOS power-event scheduling to wake the Mac about two minutes before each recording starts. Buffer still needs to be running in the background.")
+                Text("Wakes the Mac about two minutes before recording. Buffer must remain open.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .scrollDisabled(true)
     }
 
     private func chooseDirectory() {
@@ -1104,9 +1189,9 @@ private struct RecordingsSettingsTab: View {
     }
 }
 
-// MARK: - Sync
+// MARK: - Refresh
 
-private struct SyncSettingsTab: View {
+private struct RefreshSettingsTab: View {
     @Bindable var viewModel: EPGViewModel
     @AppStorage(SyncInterval.playlistStorageKey) private var playlistIntervalHours: Int = SyncInterval.playlistDefault.hours
     @AppStorage(SyncInterval.epgStorageKey) private var epgIntervalHours: Int = SyncInterval.epgDefault.hours
@@ -1114,28 +1199,28 @@ private struct SyncSettingsTab: View {
     var body: some View {
         Form {
             Section("Automatic Refresh") {
-                Picker("Refresh playlist every", selection: $playlistIntervalHours) {
+                Picker("Update channels", selection: $playlistIntervalHours) {
                     ForEach(SyncInterval.allCases) { interval in
                         Text(interval.title).tag(interval.hours)
                     }
                 }
-                Picker("Refresh guide every", selection: $epgIntervalHours) {
+                Picker("Update guide", selection: $epgIntervalHours) {
                     ForEach(SyncInterval.allCases) { interval in
                         Text(interval.title).tag(interval.hours)
                     }
                 }
-                Text("Refreshes in the background while Buffer is open. Set either option to Never to disable its automatic refresh, including launch refreshes.")
+                Text("Runs while Buffer is open. Choose Never to disable automatic and launch refreshes.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Manual") {
+            Section("Manual Refresh") {
                 HStack {
                     if let updated = viewModel.lastUpdated {
-                        Text("Last sync: \(updated.formatted(date: .abbreviated, time: .shortened))")
+                        Text("Updated \(updated.formatted(date: .abbreviated, time: .shortened))")
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("Never synced")
+                        Text("Not synced yet")
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -1145,9 +1230,24 @@ private struct SyncSettingsTab: View {
                     .disabled(viewModel.isRefreshing || viewModel.activePlaylist == nil)
                 }
             }
+
+            Section("Guide Organization") {
+                Button("Show Hidden Folders") {
+                    viewModel.showAllGroups()
+                }
+                .disabled(viewModel.hiddenGroups.isEmpty)
+
+                Button("Reset Folder Order") {
+                    viewModel.resetGroupOrder()
+                }
+                .disabled(viewModel.storedGroupOrder.isEmpty)
+
+                Text("Restores folders hidden from the sidebar and clears custom folder ordering.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-        .scrollDisabled(true)
         .onChange(of: playlistIntervalHours) { _, _ in
             viewModel.startSyncScheduler()
         }

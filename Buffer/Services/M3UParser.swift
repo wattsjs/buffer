@@ -80,14 +80,17 @@ nonisolated struct M3UParser {
     }
 
     static func parseContent(from url: URL) async throws -> PlaylistContent {
-        let data: Data
-        if url.isFileURL {
-            data = try Data(contentsOf: url)
-        } else {
-            let (fetched, _) = try await URLSession.shared.data(from: url)
-            data = fetched
-        }
-        return await Task.detached(priority: .userInitiated) {
+        // For local files, perform the (potentially large) read inside the
+        // detached task so we never block the main thread (Agent 03 Critical).
+        // Network still uses URLSession on the async path.
+        return try await Task.detached(priority: .userInitiated) {
+            let data: Data
+            if url.isFileURL {
+                data = try Data(contentsOf: url)
+            } else {
+                let (fetched, _) = try await URLSession.shared.data(from: url)
+                data = fetched
+            }
             guard let content = String(data: data, encoding: .utf8) else {
                 return PlaylistContent(channels: [], vodItems: [])
             }
@@ -95,10 +98,16 @@ nonisolated struct M3UParser {
         }.value
     }
 
+    // Precompiled once (Agent 03 critical perf fix). Creating a fresh
+    // NSRegularExpression on every #EXTINF line was dominating parse time
+    // for 5k–50k line M3U playlists.
+    private static let attrRegex: NSRegularExpression? = {
+        try? NSRegularExpression(pattern: #"([\w-]+)="([^"]*)""#)
+    }()
+
     private static func parseAttributes(_ line: String) -> [String: String] {
         var attrs: [String: String] = [:]
-        let pattern = #"([\w-]+)="([^"]*)""#
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return attrs }
+        guard let regex = attrRegex else { return attrs }
 
         let matches = regex.matches(in: line, range: NSRange(line.startIndex..., in: line))
         for match in matches {

@@ -19,30 +19,79 @@ enum SidebarSelection: Hashable {
     case group(String)
 }
 
+nonisolated struct VODResumeEntry: Identifiable, Hashable, Codable, Sendable {
+    let item: VODItem
+    var positionSeconds: Double
+    var durationSeconds: Double?
+    var updatedAt: Date
+
+    var id: String { item.id }
+
+    var progressFraction: Double? {
+        guard let durationSeconds, durationSeconds > 0, positionSeconds > 0 else { return nil }
+        return min(max(positionSeconds / durationSeconds, 0), 1)
+    }
+
+    var isInProgress: Bool {
+        guard positionSeconds >= 30 else { return false }
+        guard let progressFraction else { return true }
+        return progressFraction < 0.95
+    }
+}
+
 @MainActor
 @Observable
 class EPGViewModel {
     static let disableVODKey = "disableVOD"
 
-    var channels: [Channel] = []
-    var vodItems: [VODItem] = []
-    var vodSeries: [VODSeries] = []
+    var channels: [Channel] = [] {
+        didSet { rebuildChannelDerivedState() }
+    }
+    var vodItems: [VODItem] = [] {
+        didSet { rebuildVODDerivedState() }
+    }
+    var vodSeries: [VODSeries] = [] {
+        didSet { rebuildVODDerivedState() }
+    }
     var seriesEpisodes: [String: [VODItem]] = [:]
     var seriesEpisodeLoadErrors: [String: String] = [:]
     var loadingSeriesIDs: Set<String> = []
     var vodItemDetails: [String: VODItem] = [:]
     var vodItemDetailLoadErrors: [String: String] = [:]
     var loadingVODItemIDs: Set<String> = []
+    var vodResumeEntries: [VODResumeEntry] = []
     var programs: [String: [EPGProgram]] = [:] // keyed by channel epgID
-    var storedGroupOrder: [String] = []
-    var hiddenGroupNames: Set<String> = []
-    var selection: SidebarSelection = .home
+
+    /// Pre-bucketed programs by hour (unix hour since 1970) per channel.
+    /// Enables fast visible-range / timeline-window queries without scanning full per-channel program lists
+    /// (critical for 500-1000+ channel guides with catchup days of data). See Agent 02 / Master perf issue.
+    private var programHourBuckets: [String: [Int: [Int]]] = [:]
+
+    var storedGroupOrder: [String] = [] {
+        didSet { rebuildGroupOrder() }
+    }
+    var hiddenGroupNames: Set<String> = [] {
+        didSet { /* groups/hidden computed from it; direct observation in sidebar/sports */ }
+    }
+    var selection: SidebarSelection = .home {
+        didSet { rebuildFilteredCaches() }
+    }
     var revealChannelID: String?
-    var searchText: String = ""
-    var recentChannelIDs: [String] = []
-    var favoriteChannelIDs: Set<String> = []
-    var channelUsageCounts: [String: Int] = [:]
-    var groupUsageCounts: [String: Int] = [:]
+    var searchText: String = "" {
+        didSet { rebuildFilteredCaches() }
+    }
+    var recentChannelIDs: [String] = [] {
+        didSet { rebuildRecentFavoriteAndScores() }
+    }
+    var favoriteChannelIDs: Set<String> = [] {
+        didSet { rebuildRecentFavoriteAndScores() }
+    }
+    var channelUsageCounts: [String: Int] = [:] {
+        didSet { rebuildRecentFavoriteAndScores() }
+    }
+    var groupUsageCounts: [String: Int] = [:] {
+        didSet { rebuildRecentFavoriteAndScores() }
+    }
     var hasLoadedOnce = false
     var isRefreshing = false
     var loadingStage: String? = nil
@@ -51,6 +100,24 @@ class EPGViewModel {
     var activePlaylistID: UUID?
     var lastUpdated: Date? = nil
     var serverStatus: ServerAccountStatus?
+
+    // MARK: - Indexed/Cached Derived State (Playlist Indexed State + Incremental Filters - Agent 03)
+    // Real indexes and snapshots so hot getters (allGroups, filtered*, recent/favoriteChannels,
+    // *PreferenceScores) no longer do full O(n) scans on every access. Updated only on
+    // mutation of sources via didSet + targeted rebuilds.
+    private var channelByID: [String: Channel] = [:]
+    private var groupedChannels: [String: [Channel]] = [:]
+    private var allGroupsCached: [String] = []
+    private var recentChannelsCached: [Channel] = []
+    private var favoriteChannelsCached: [Channel] = []
+    private var groupPreferenceScoresCached: [String: Double] = [:]
+    private var channelPreferenceScoresCached: [String: Double] = [:]
+    private var filteredChannelsCached: [Channel] = []
+    private var movieItemsCached: [VODItem] = []
+    private var movieGroupsCached: [String] = []
+    private var seriesGroupsCached: [String] = []
+    private var filteredMovieItemsCached: [VODItem] = []
+    private var filteredSeriesCached: [VODSeries] = []
 
     /// The currently active playlist, if any. Most existing code treats this as
     /// "the server config"; new code should prefer the explicit name.
@@ -79,39 +146,31 @@ class EPGViewModel {
         if let config = serverConfig {
             StreamProbeService.shared.setActiveCacheKey(DataCache.cacheKey(for: config))
         }
+
+        // Seed caches from any prefs loaded in loadConfig (groups, etc.) + empty data.
+        rebuildChannelDerivedState()
+        rebuildVODDerivedState()
     }
 
     /// All known groups in user-preferred order. Stored order wins for known names;
     /// any newly-discovered groups are appended alphabetically at the end.
-    var allGroups: [String] {
-        let raw = Set(channels.map(\.group))
-        let ordered = storedGroupOrder.filter { raw.contains($0) }
-        let seen = Set(ordered)
-        let newOnes = raw.subtracting(seen).sorted()
-        return ordered + newOnes
-    }
+    var allGroups: [String] { allGroupsCached }
 
     /// Visible groups shown in the sidebar.
     var groups: [String] {
-        allGroups.filter { !hiddenGroupNames.contains($0) }
+        allGroupsCached.filter { !hiddenGroupNames.contains($0) }
     }
 
     /// Hidden groups, in the same relative order as `allGroups`.
     var hiddenGroups: [String] {
-        allGroups.filter { hiddenGroupNames.contains($0) }
+        allGroupsCached.filter { hiddenGroupNames.contains($0) }
     }
 
-    var movieGroups: [String] {
-        Set(movieItems.map(\.group)).sorted()
-    }
+    var movieGroups: [String] { movieGroupsCached }
 
-    var seriesGroups: [String] {
-        Set(vodSeries.map(\.group)).sorted()
-    }
+    var seriesGroups: [String] { seriesGroupsCached }
 
-    var movieItems: [VODItem] {
-        vodItems.filter { $0.kind != .seriesEpisode }
-    }
+    var movieItems: [VODItem] { movieItemsCached }
 
     var isVODDisabled: Bool {
         UserDefaults.standard.bool(forKey: Self.disableVODKey)
@@ -142,102 +201,58 @@ class EPGViewModel {
         saveGroupPreferences()
     }
 
-    var filteredChannels: [Channel] {
-        var result = channels
-
-        switch selection {
-        case .group(let group):
-            result = result.filter { $0.group == group }
-        case .favorites:
-            result = favoriteChannels
-        default:
-            break
-        }
-
-        if !searchText.isEmpty {
-            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-        }
-
-        return result
+    func showAllGroups() {
+        hiddenGroupNames.removeAll()
+        saveGroupPreferences()
     }
 
-    var filteredMovieItems: [VODItem] {
-        var result = movieItems
-
-        if case .movieGroup(let group) = selection {
-            result = result.filter { $0.group == group }
-        }
-
-        if !searchText.isEmpty {
-            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-        }
-
-        return result
+    func resetGroupOrder() {
+        storedGroupOrder = []
+        saveGroupPreferences()
     }
 
-    var filteredSeries: [VODSeries] {
-        var result = vodSeries
-
-        if case .seriesGroup(let group) = selection {
-            result = result.filter { $0.group == group }
-        }
-
-        if !searchText.isEmpty {
-            result = result.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-        }
-
-        return result
+    func clearRecentlyWatched() {
+        recentChannelIDs = []
+        saveRecents()
     }
 
-    var recentChannels: [Channel] {
-        let byID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return recentChannelIDs.compactMap { byID[$0] }
+    func resetRecommendations() {
+        recentChannelIDs = []
+        channelUsageCounts = [:]
+        groupUsageCounts = [:]
+        saveRecents()
+        saveChannelUsage()
+        saveGroupUsage()
     }
 
-    var favoriteChannels: [Channel] {
-        channels.filter { favoriteChannelIDs.contains($0.id) }
+    var filteredChannels: [Channel] { filteredChannelsCached }
+
+    var filteredMovieItems: [VODItem] { filteredMovieItemsCached }
+
+    var filteredSeries: [VODSeries] { filteredSeriesCached }
+
+    var recentChannels: [Channel] { recentChannelsCached }
+
+    var favoriteChannels: [Channel] { favoriteChannelsCached }
+
+    var inProgressVODEntries: [VODResumeEntry] {
+        vodResumeEntries
+            .filter(\.isInProgress)
+            .sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    var groupPreferenceScores: [String: Double] {
-        let byID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        var scores: [String: Double] = [:]
-
-        for (index, channelID) in recentChannelIDs.enumerated() {
-            guard let group = byID[channelID]?.group, !group.isEmpty else { continue }
-            scores[group, default: 0] += max(0.2, 1.0 - (Double(index) * 0.035))
-        }
-
-        for channelID in favoriteChannelIDs {
-            guard let group = byID[channelID]?.group, !group.isEmpty else { continue }
-            scores[group, default: 0] += 1.25
-        }
-
-        for (group, count) in groupUsageCounts where count > 0 {
-            scores[group, default: 0] += log1p(Double(count)) * 0.75
-        }
-
-        guard let maxScore = scores.values.max(), maxScore > 0 else { return [:] }
-        return scores.mapValues { min(1.0, $0 / maxScore) }
+    func resumeEntry(for item: VODItem) -> VODResumeEntry? {
+        vodResumeEntries.first { $0.id == item.id && $0.isInProgress }
     }
 
-    var channelPreferenceScores: [String: Double] {
-        var scores: [String: Double] = [:]
-
-        for (index, channelID) in recentChannelIDs.enumerated() {
-            scores[channelID, default: 0] += exp(-Double(index) / 8.0)
-        }
-
-        for channelID in favoriteChannelIDs {
-            scores[channelID, default: 0] += 1.5
-        }
-
-        for (channelID, count) in channelUsageCounts where count > 0 {
-            scores[channelID, default: 0] += log1p(Double(count)) * 0.75
-        }
-
-        guard let maxScore = scores.values.max(), maxScore > 0 else { return [:] }
-        return scores.mapValues { min(1.0, $0 / maxScore) }
+    func removeVODResumeEntry(id: String) {
+        vodResumeEntries.removeAll { $0.id == id }
+        saveVODResumeEntries()
     }
+
+    var groupPreferenceScores: [String: Double] { groupPreferenceScoresCached }
+
+    var channelPreferenceScores: [String: Double] { channelPreferenceScoresCached }
 
     func isFavorite(_ channel: Channel) -> Bool {
         favoriteChannelIDs.contains(channel.id)
@@ -271,6 +286,42 @@ class EPGViewModel {
         saveRecents()
     }
 
+    func noteVODOpened(_ item: VODItem) {
+        updateVODResumeEntry(for: item, positionSeconds: nil, durationSeconds: nil)
+    }
+
+    func updateVODPlaybackProgress(channelID: String, positionSeconds: Double, durationSeconds: Double?) {
+        guard channelID.hasPrefix("vod:") else { return }
+        let itemID = String(channelID.dropFirst(4))
+        guard let item = findVODItem(id: itemID) ?? vodResumeEntries.first(where: { $0.id == itemID })?.item else { return }
+        updateVODResumeEntry(for: item, positionSeconds: positionSeconds, durationSeconds: durationSeconds)
+    }
+
+    private func updateVODResumeEntry(for item: VODItem, positionSeconds: Double?, durationSeconds: Double?) {
+        var entries = vodResumeEntries.filter { $0.id != item.id }
+        let previous = vodResumeEntries.first { $0.id == item.id }
+        let nextPosition = positionSeconds ?? previous?.positionSeconds ?? 0
+        let entry = VODResumeEntry(
+            item: detailItem(for: item),
+            positionSeconds: nextPosition <= 0 && previous != nil ? previous?.positionSeconds ?? 0 : max(nextPosition, 0),
+            durationSeconds: durationSeconds.flatMap { $0 > 0 ? $0 : nil } ?? previous?.durationSeconds ?? item.durationSeconds.map(Double.init),
+            updatedAt: Date()
+        )
+        entries.insert(entry, at: 0)
+        vodResumeEntries = Array(entries.prefix(Self.vodResumeLimit))
+        saveVODResumeEntries()
+    }
+
+    private func findVODItem(id: String) -> VODItem? {
+        if let detailed = vodItemDetails[id] {
+            return detailed
+        }
+        if let item = vodItems.first(where: { $0.id == id }) {
+            return item
+        }
+        return seriesEpisodes.values.lazy.flatMap { $0 }.first { $0.id == id }
+    }
+
     func programsForChannel(_ channel: Channel) -> [EPGProgram] {
         guard let epgID = channel.epgChannelID else { return [] }
         return programs[epgID] ?? []
@@ -287,6 +338,120 @@ class EPGViewModel {
             }
         }
         return nil
+    }
+
+    // MARK: - Indexed State Rebuilders (Agent 03 - incremental, not per-access)
+
+    private func rebuildChannelDerivedState() {
+        channelByID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        groupedChannels = Dictionary(grouping: channels, by: \.group)
+        rebuildGroupOrder()
+        rebuildRecentAndFavoriteChannels()
+        rebuildScoreMaps()
+        rebuildFilteredCaches()
+    }
+
+    private func rebuildGroupOrder() {
+        let raw = Set(groupedChannels.keys)
+        let ordered = storedGroupOrder.filter { raw.contains($0) }
+        let seen = Set(ordered)
+        let newOnes = raw.subtracting(seen).sorted()
+        allGroupsCached = ordered + newOnes
+    }
+
+    private func rebuildVODDerivedState() {
+        movieItemsCached = vodItems.filter { $0.kind != .seriesEpisode }
+        movieGroupsCached = Array(Set(movieItemsCached.map(\.group))).sorted()
+        seriesGroupsCached = Array(Set(vodSeries.map(\.group))).sorted()
+        rebuildFilteredCaches()
+    }
+
+    private func rebuildRecentAndFavoriteChannels() {
+        recentChannelsCached = recentChannelIDs.compactMap { channelByID[$0] }
+        favoriteChannelsCached = favoriteChannelIDs.compactMap { channelByID[$0] }
+    }
+
+    private func rebuildRecentFavoriteAndScores() {
+        rebuildRecentAndFavoriteChannels()
+        rebuildScoreMaps()
+        rebuildFilteredCaches()
+    }
+
+    private func rebuildScoreMaps() {
+        // Group scores (preference for sidebar/home recommendations)
+        var gScores: [String: Double] = [:]
+        for (index, channelID) in recentChannelIDs.enumerated() {
+            guard let group = channelByID[channelID]?.group, !group.isEmpty else { continue }
+            gScores[group, default: 0] += max(0.2, 1.0 - (Double(index) * 0.035))
+        }
+        for channelID in favoriteChannelIDs {
+            guard let group = channelByID[channelID]?.group, !group.isEmpty else { continue }
+            gScores[group, default: 0] += 1.25
+        }
+        for (group, count) in groupUsageCounts where count > 0 {
+            gScores[group, default: 0] += log1p(Double(count)) * 0.75
+        }
+        if let maxScore = gScores.values.max(), maxScore > 0 {
+            gScores = gScores.mapValues { min(1.0, $0 / maxScore) }
+        } else {
+            gScores = [:]
+        }
+        groupPreferenceScoresCached = gScores
+
+        // Channel scores
+        var cScores: [String: Double] = [:]
+        for (index, channelID) in recentChannelIDs.enumerated() {
+            cScores[channelID, default: 0] += exp(-Double(index) / 8.0)
+        }
+        for channelID in favoriteChannelIDs {
+            cScores[channelID, default: 0] += 1.5
+        }
+        for (channelID, count) in channelUsageCounts where count > 0 {
+            cScores[channelID, default: 0] += log1p(Double(count)) * 0.75
+        }
+        if let maxScore = cScores.values.max(), maxScore > 0 {
+            cScores = cScores.mapValues { min(1.0, $0 / maxScore) }
+        } else {
+            cScores = [:]
+        }
+        channelPreferenceScoresCached = cScores
+    }
+
+    private func rebuildFilteredCaches() {
+        // Live channels: use groupedChannels for O(1) group case, cached lists for favs
+        var chResult: [Channel]
+        switch selection {
+        case .group(let group):
+            chResult = groupedChannels[group] ?? []
+        case .favorites:
+            chResult = favoriteChannelsCached
+        default:
+            chResult = channels
+        }
+        if !searchText.isEmpty {
+            chResult = chResult.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        }
+        filteredChannelsCached = chResult
+
+        // VOD movies
+        var mResult = movieItemsCached
+        if case .movieGroup(let group) = selection {
+            mResult = mResult.filter { $0.group == group }
+        }
+        if !searchText.isEmpty {
+            mResult = mResult.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        }
+        filteredMovieItemsCached = mResult
+
+        // VOD series
+        var sResult = vodSeries
+        if case .seriesGroup(let group) = selection {
+            sResult = sResult.filter { $0.group == group }
+        }
+        if !searchText.isEmpty {
+            sResult = sResult.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        }
+        filteredSeriesCached = sResult
     }
 
     // MARK: - Hydrate
@@ -338,6 +503,7 @@ class EPGViewModel {
         }.value
         if let programsCache {
             programs = programsCache.programs
+            rebuildProgramHourBuckets()
             rebuildSearchIndex()
         }
     }
@@ -455,6 +621,7 @@ class EPGViewModel {
                         Self.organize(allPrograms)
                     }.value
                     programs = organized
+                    rebuildProgramHourBuckets()
                     rebuildSearchIndex()
                     syncedStatus.guideStatus = "Reachable"
 
@@ -504,6 +671,14 @@ class EPGViewModel {
                         return
                     }
                     if Task.isCancelled { return }
+
+                    // Respect central lifecycle (Agent 09) — avoid heavy syncs while
+                    // the app is sleeping or in the background.
+                    if AppLifecycleCoordinator.shared.shouldPauseBackgroundWork {
+                        try? await Task.sleep(for: .seconds(30))
+                        continue
+                    }
+
                     self?.sync(silent: true, scope: .all)
                 }
             }
@@ -525,6 +700,12 @@ class EPGViewModel {
                         return
                     }
                     if Task.isCancelled { return }
+
+                    if AppLifecycleCoordinator.shared.shouldPauseBackgroundWork {
+                        try? await Task.sleep(for: .seconds(30))
+                        continue
+                    }
+
                     self?.sync(silent: true, scope: .epg)
                 }
             }
@@ -793,14 +974,16 @@ class EPGViewModel {
             for (epgID, progs) in programsSnapshot {
                 if Task.isCancelled { return }
                 guard let channel = channelsByEPGID[epgID] else { continue }
-                let channelNameLower = channel.name.lowercased()
-                for program in progs {
+                for (programIndex, program) in progs.enumerated() {
                     entries.append(
                         ProgramSearchEntry(
-                            program: program,
-                            channel: channel,
+                            id: program.id,
+                            epgID: epgID,
+                            programIndex: programIndex,
+                            channelID: channel.id,
                             titleLower: program.title.lowercased(),
-                            channelNameLower: channelNameLower
+                            start: program.start,
+                            end: program.end
                         )
                     )
                 }
@@ -815,6 +998,57 @@ class EPGViewModel {
                 self.searchIndexVersion &+= 1
             }
         }
+    }
+
+    // MARK: - Pre-bucketing for fast visible-range queries (Agent 02 / Master Issues)
+
+    private func rebuildProgramHourBuckets() {
+        programHourBuckets.removeAll(keepingCapacity: true)
+        for (epgID, progs) in programs {
+            var buckets: [Int: [Int]] = [:]
+            buckets.reserveCapacity(max(1, progs.count / 8))
+            for (programIndex, p) in progs.enumerated() {
+                // A program may span hour boundaries; place in all overlapping buckets so range queries are O(1-ish per hour).
+                let startH = Int(floor(p.start.timeIntervalSince1970 / 3600))
+                let endH = Int(floor((p.end.timeIntervalSince1970 - 0.001) / 3600))
+                for h in startH...max(startH, endH) {
+                    buckets[h, default: []].append(programIndex)
+                }
+            }
+            // Keep per-bucket lists sorted (inherited from parent channel sort)
+            programHourBuckets[epgID] = buckets
+        }
+    }
+
+    /// Returns programs for the channel that intersect [start, end).
+    /// Uses pre-buckets when available for O(relevant hours) instead of O(all programs for channel).
+    /// This makes the now-limited visible row computations (rowData + buildBlocks) fast even with long catchup histories.
+    func programsForChannel(_ channel: Channel, between start: Date, and end: Date) -> [EPGProgram] {
+        guard let epgID = channel.epgChannelID else { return [] }
+        guard let buckets = programHourBuckets[epgID], !buckets.isEmpty else {
+            // Fallback (no buckets yet or empty)
+            return programsForChannel(channel)
+                .filter { $0.end > start && $0.start < end }
+                .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
+        }
+        let allPrograms = programs[epgID] ?? []
+        let startH = Int(floor(start.timeIntervalSince1970 / 3600)) - 1
+        let endH = Int(ceil(end.timeIntervalSince1970 / 3600)) + 1
+        var candidates: [EPGProgram] = []
+        var seenIndices = Set<Int>()
+        for h in startH...endH {
+            if let list = buckets[h] {
+                for programIndex in list where seenIndices.insert(programIndex).inserted {
+                    guard allPrograms.indices.contains(programIndex) else { continue }
+                    let p = allPrograms[programIndex]
+                    if p.end > start && p.start < end {
+                        candidates.append(p)
+                    }
+                }
+            }
+        }
+        // Buckets are not globally sorted across hours, so sort the small result
+        return candidates.sorted { ($0.start, $0.end) < ($1.start, $1.end) }
     }
 
     nonisolated private static func organize(_ allPrograms: [EPGProgram]) -> [String: [EPGProgram]] {
@@ -920,16 +1154,11 @@ class EPGViewModel {
     /// groups/status), hydrates from disk cache, and triggers a sync if the
     /// cache was empty.
     private func swapInActivePlaylistState(previousKey: String?) {
-        channels = []
-        vodItems = []
-        vodSeries = []
-        seriesEpisodes = [:]
-        seriesEpisodeLoadErrors = [:]
-        loadingSeriesIDs = []
-        vodItemDetails = [:]
-        vodItemDetailLoadErrors = [:]
-        loadingVODItemIDs = []
-        programs = [:]
+        // Do NOT immediately clear channels/programs/vod — this caused a
+        // jarring empty flash while the new playlist hydrated (Agent 03).
+        // Instead, keep the previous data visible until the new hydrate
+        // completes and overwrites it. This gives a much smoother playlist
+        // switch experience, especially for large libraries.
         searchEntries = []
         searchIndexVersion &+= 1
         lastUpdated = nil
@@ -937,6 +1166,7 @@ class EPGViewModel {
         loadingStage = nil
         isRefreshing = false
         revealChannelID = nil
+
         // If the current selection references a group that won't exist in the
         // new playlist, fall back to All Channels. The group list repopulates
         // once channels hydrate.
@@ -954,6 +1184,7 @@ class EPGViewModel {
 
         loadServerStatus()
         loadRecents()
+        loadVODResumeEntries()
         loadFavorites()
         loadChannelUsage()
         loadGroupUsage()
@@ -962,8 +1193,6 @@ class EPGViewModel {
         hydrationTask?.cancel()
         hydrationTask = Task { [weak self] in
             await self?.hydrateFromDisk()
-            // If playlist auto-refresh is enabled, fetch fresh data when the
-            // cache is empty so the user sees channels immediately.
             guard let self else { return }
             self.syncAfterPlaylistSwapIfNeeded()
         }
@@ -984,6 +1213,7 @@ class EPGViewModel {
         vodItemDetailLoadErrors = [:]
         loadingVODItemIDs = []
         programs = [:]
+        programHourBuckets = [:]
         searchEntries = []
         searchIndexVersion &+= 1
         lastUpdated = nil
@@ -991,6 +1221,7 @@ class EPGViewModel {
         loadingStage = nil
         isRefreshing = false
         recentChannelIDs = []
+        vodResumeEntries = []
         favoriteChannelIDs = []
         channelUsageCounts = [:]
         groupUsageCounts = [:]
@@ -1006,6 +1237,7 @@ class EPGViewModel {
     private static let legacyConfigKey = "buffer_server_config"
     private static let legacyServerStatusKey = "buffer_server_status"
     private static let recentsLimit = 24
+    private static let vodResumeLimit = 24
     private static let channelUsageLimit = 500
     private static let groupUsageLimit = 100
 
@@ -1083,6 +1315,7 @@ class EPGViewModel {
 
         loadServerStatus()
         loadRecents()
+        loadVODResumeEntries()
         loadFavorites()
         loadGroupPreferences()
     }
@@ -1157,6 +1390,32 @@ class EPGViewModel {
             return
         }
         recentChannelIDs = (UserDefaults.standard.array(forKey: key) as? [String]) ?? []
+    }
+
+    // MARK: - VOD Resume
+
+    private func vodResumeKey() -> String? {
+        guard let config = serverConfig else { return nil }
+        return "buffer_vod_resume_\(DataCache.cacheKey(for: config))"
+    }
+
+    private func saveVODResumeEntries() {
+        guard let key = vodResumeKey(),
+              let data = try? JSONEncoder().encode(vodResumeEntries) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    private func loadVODResumeEntries() {
+        guard let key = vodResumeKey() else {
+            vodResumeEntries = []
+            return
+        }
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let entries = try? JSONDecoder().decode([VODResumeEntry].self, from: data) else {
+            vodResumeEntries = []
+            return
+        }
+        vodResumeEntries = Array(entries.sorted { $0.updatedAt > $1.updatedAt }.prefix(Self.vodResumeLimit))
     }
 
     // MARK: - Favorites

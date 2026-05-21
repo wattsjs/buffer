@@ -23,9 +23,7 @@ nonisolated struct ChannelSearchIndex: Sendable, Codable {
         let titleLower: ContiguousArray<UInt8>  // UTF-8 bytes for fast search
         let descLower: ContiguousArray<UInt8>   // description UTF-8 bytes
         let titleWords: ContiguousArray<String>
-        let descWords: ContiguousArray<String>
         let titleCompact: String
-        let descCompact: String
         let start: Date
         let end: Date
 
@@ -35,9 +33,7 @@ nonisolated struct ChannelSearchIndex: Sendable, Codable {
             case titleLower
             case descLower
             case titleWords
-            case descWords
             case titleCompact
-            case descCompact
             case start
             case end
         }
@@ -48,9 +44,7 @@ nonisolated struct ChannelSearchIndex: Sendable, Codable {
             titleLower: ContiguousArray<UInt8>,
             descLower: ContiguousArray<UInt8>,
             titleWords: ContiguousArray<String>,
-            descWords: ContiguousArray<String>,
             titleCompact: String,
-            descCompact: String,
             start: Date,
             end: Date
         ) {
@@ -59,9 +53,7 @@ nonisolated struct ChannelSearchIndex: Sendable, Codable {
             self.titleLower = titleLower
             self.descLower = descLower
             self.titleWords = titleWords
-            self.descWords = descWords
             self.titleCompact = titleCompact
-            self.descCompact = descCompact
             self.start = start
             self.end = end
         }
@@ -73,9 +65,7 @@ nonisolated struct ChannelSearchIndex: Sendable, Codable {
             titleLower = ContiguousArray(try container.decode(Data.self, forKey: .titleLower))
             descLower = ContiguousArray(try container.decode(Data.self, forKey: .descLower))
             titleWords = ContiguousArray(try container.decode([String].self, forKey: .titleWords))
-            descWords = ContiguousArray(try container.decode([String].self, forKey: .descWords))
             titleCompact = try container.decode(String.self, forKey: .titleCompact)
-            descCompact = try container.decode(String.self, forKey: .descCompact)
             start = try container.decode(Date.self, forKey: .start)
             end = try container.decode(Date.self, forKey: .end)
         }
@@ -87,9 +77,7 @@ nonisolated struct ChannelSearchIndex: Sendable, Codable {
             try container.encode(Data(titleLower), forKey: .titleLower)
             try container.encode(Data(descLower), forKey: .descLower)
             try container.encode(Array(titleWords), forKey: .titleWords)
-            try container.encode(Array(descWords), forKey: .descWords)
             try container.encode(titleCompact, forKey: .titleCompact)
-            try container.encode(descCompact, forKey: .descCompact)
             try container.encode(start, forKey: .start)
             try container.encode(end, forKey: .end)
         }
@@ -152,7 +140,11 @@ nonisolated enum StreamMatcher {
         let horizon = Date().addingTimeInterval(48 * 3600)
         let hiddenGroupPaths = hiddenGroups.map(splitGroupPath)
 
-        let entries = channels.compactMap { channel in
+        var entries: [ChannelSearchIndex] = []
+        entries.reserveCapacity(channels.count)
+        var tokenBuckets: [String: [Int]] = [:]
+
+        for channel in channels {
             let isHidden = isGroupHidden(
                 channel.group,
                 hiddenGroups: hiddenGroups,
@@ -166,6 +158,10 @@ nonisolated enum StreamMatcher {
             let isAudioOnlyGroup = groupLower.contains("radio") || nameLower.hasPrefix("radio:")
 
             var epgTitles = ContiguousArray<ChannelSearchIndex.EPGTitle>()
+            var indexTokens = Set<String>()
+            collectIndexTokens(nameWords, into: &indexTokens)
+            collectIndexToken(nameAcronym, into: &indexTokens)
+
             if let epgID = channel.epgChannelID {
                 for p in programs[epgID] ?? [] {
                     if p.end > cutoff && p.start < horizon {
@@ -178,15 +174,17 @@ nonisolated enum StreamMatcher {
                             : desc
                         let titleLower = normalise(p.title)
                         let descLower = normalise(descPrefix)
+                        let titleWords = ContiguousArray(tokenWords(in: titleLower))
+                        let descWords = ContiguousArray(tokenWords(in: descLower))
+                        collectIndexTokens(titleWords, into: &indexTokens)
+                        collectIndexTokens(descWords, into: &indexTokens)
                         epgTitles.append(.init(
                             title: p.title,
                             description: descPrefix,
                             titleLower: ContiguousArray(titleLower.utf8),
                             descLower: ContiguousArray(descLower.utf8),
-                            titleWords: ContiguousArray(tokenWords(in: titleLower)),
-                            descWords: ContiguousArray(tokenWords(in: descLower)),
+                            titleWords: titleWords,
                             titleCompact: compactKey(titleLower),
-                            descCompact: compactKey(descLower),
                             start: p.start,
                             end: p.end
                         ))
@@ -194,7 +192,8 @@ nonisolated enum StreamMatcher {
                 }
             }
 
-            return ChannelSearchIndex(
+            let entryIndex = entries.count
+            entries.append(ChannelSearchIndex(
                 channel: channel,
                 nameLower: nameLower,
                 nameWords: nameWords,
@@ -205,7 +204,11 @@ nonisolated enum StreamMatcher {
                 isAudioOnlyGroup: isAudioOnlyGroup,
                 isHidden: isHidden,
                 epgTitles: epgTitles
-            )
+            ))
+
+            for token in indexTokens {
+                tokenBuckets[token, default: []].append(entryIndex)
+            }
         }
 
         var epgTitleCount = 0
@@ -214,15 +217,12 @@ nonisolated enum StreamMatcher {
         for entry in entries {
             epgTitleCount += entry.epgTitles.count
             for epg in entry.epgTitles {
-                if earliestProgramStart == nil || epg.start < earliestProgramStart! {
-                    earliestProgramStart = epg.start
-                }
-                if latestProgramEnd == nil || epg.end > latestProgramEnd! {
-                    latestProgramEnd = epg.end
-                }
+                // Defensive min/max using ?? to avoid any force-unwrap on the optionals.
+                earliestProgramStart = min(earliestProgramStart ?? epg.start, epg.start)
+                latestProgramEnd = max(latestProgramEnd ?? epg.end, epg.end)
             }
         }
-        let inverted = buildInvertedIndex(for: entries)
+        let inverted = tokenBuckets.mapValues { ContiguousArray($0) }
         return StreamSearchIndex(
             entries: entries,
             tokenToEntryIndices: inverted,
@@ -235,29 +235,6 @@ nonisolated enum StreamMatcher {
             earliestProgramStart: earliestProgramStart,
             latestProgramEnd: latestProgramEnd
         )
-    }
-
-    private static func buildInvertedIndex(
-        for entries: [ChannelSearchIndex]
-    ) -> [String: ContiguousArray<Int>] {
-        var buckets: [String: [Int]] = [:]
-
-        for (idx, entry) in entries.enumerated() {
-            var tokens = Set<String>()
-            collectIndexTokens(entry.nameWords, into: &tokens)
-            collectIndexToken(entry.nameAcronym, into: &tokens)
-
-            for epg in entry.epgTitles {
-                collectIndexTokens(epg.titleWords, into: &tokens)
-                collectIndexTokens(epg.descWords, into: &tokens)
-            }
-
-            for token in tokens {
-                buckets[token, default: []].append(idx)
-            }
-        }
-
-        return buckets.mapValues { ContiguousArray($0) }
     }
 
     private static func buildInverseDocumentFrequency(
@@ -554,11 +531,7 @@ nonisolated enum StreamMatcher {
                         break
                     }
                     if q.tokens.count >= 2,
-                       let coverage = fuzzyTokenCoverage(
-                        query: q,
-                        words: epg.descWords,
-                        compactText: epg.descCompact
-                       ) {
+                       let coverage = descriptionFuzzyTokenCoverage(query: q, epg: epg) {
                         best.record(
                             q.score + 18 + (coverage * 14) + (timeBonus * 0.6),
                             groupLabel,
@@ -605,6 +578,19 @@ nonisolated enum StreamMatcher {
         }
 
         return best
+    }
+
+    private static func descriptionFuzzyTokenCoverage(
+        query: SearchQuery,
+        epg: ChannelSearchIndex.EPGTitle
+    ) -> Double? {
+        guard !epg.descLower.isEmpty else { return nil }
+        let descText = String(decoding: epg.descLower, as: UTF8.self)
+        return fuzzyTokenCoverage(
+            query: query,
+            words: ContiguousArray(tokenWords(in: descText)),
+            compactText: compactKey(descText)
+        )
     }
 
     private static func isWeakSingleTokenChannelQuery(
@@ -962,26 +948,84 @@ nonisolated enum StreamMatcher {
         minimumLength: Int = 3,
         stopWords: Set<String> = trivialWords
     ) -> [String] {
-        normalise(text)
-            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-            .map { $0.trimmingCharacters(in: .punctuationCharacters) }
-            .map { String($0) }
-            .map(normalise)
-            .filter {
-                let token = $0
-                return token.count >= minimumLength && !stopWords.contains(token)
-            }
+        tokenWords(in: normalise(text), minimumLength: minimumLength)
+            .filter { !stopWords.contains($0) }
     }
 
     private static func tokenWords(in normalisedText: String, minimumLength: Int = 2) -> [String] {
-        normalisedText
+        if let ascii = asciiTokenWords(in: normalisedText, minimumLength: minimumLength) {
+            return ascii
+        }
+
+        return normalisedText
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map(String.init)
             .filter { $0.count >= minimumLength }
     }
 
     private static func compactKey(_ normalisedText: String) -> String {
-        normalisedText.filter { $0.isLetter || $0.isNumber }
+        if let ascii = asciiCompactKey(normalisedText) {
+            return ascii
+        }
+
+        return normalisedText.filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func asciiTokenWords(in text: String, minimumLength: Int) -> [String]? {
+        var words: [String] = []
+        words.reserveCapacity(8)
+
+        let bytes = text.utf8
+        var tokenStart: String.UTF8View.Index?
+        var tokenLength = 0
+
+        func appendToken(endingAt end: String.UTF8View.Index) {
+            guard let start = tokenStart, tokenLength >= minimumLength else { return }
+            words.append(String(decoding: bytes[start..<end], as: UTF8.self))
+        }
+
+        var index = bytes.startIndex
+        while index != bytes.endIndex {
+            let byte = bytes[index]
+            guard byte < 128 else { return nil }
+
+            if isASCIIAlphaNumeric(byte) {
+                if tokenStart == nil {
+                    tokenStart = index
+                    tokenLength = 0
+                }
+                tokenLength += 1
+            } else {
+                appendToken(endingAt: index)
+                tokenStart = nil
+                tokenLength = 0
+            }
+
+            index = bytes.index(after: index)
+        }
+
+        appendToken(endingAt: bytes.endIndex)
+        return words
+    }
+
+    private static func asciiCompactKey(_ text: String) -> String? {
+        var compact: [UInt8] = []
+        compact.reserveCapacity(text.utf8.count)
+
+        for byte in text.utf8 {
+            guard byte < 128 else { return nil }
+            if isASCIIAlphaNumeric(byte) {
+                compact.append(byte)
+            }
+        }
+
+        return String(decoding: compact, as: UTF8.self)
+    }
+
+    private static func isASCIIAlphaNumeric(_ byte: UInt8) -> Bool {
+        (byte >= 48 && byte <= 57)
+            || (byte >= 65 && byte <= 90)
+            || (byte >= 97 && byte <= 122)
     }
 
     private static func acronym(for words: ContiguousArray<String>) -> String {

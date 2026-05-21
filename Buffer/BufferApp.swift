@@ -176,6 +176,10 @@ struct BufferApp: App {
         // Actual permission + reconciliation happens in `.task` below.
         _ = NotificationManager.shared
         RecordingManager.shared.bootstrap()
+
+        // Ensure the central lifecycle coordinator is initialized early so it
+        // can register sleep/wake/terminate observers (Agent 09 stability work).
+        _ = AppLifecycleCoordinator.shared
     }
 
     var body: some Scene {
@@ -195,6 +199,13 @@ struct BufferApp: App {
                     appDelegate.checkForUpdates()
                 }
                 .disabled(!appDelegate.canCheckForUpdates)
+            }
+
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    openWindow(id: "settings")
+                }
+                .keyboardShortcut(",", modifiers: .command)
             }
 
             CommandGroup(after: .help) {
@@ -227,9 +238,13 @@ struct BufferApp: App {
         .defaultSize(width: 854, height: 480)
         .restorationBehavior(.disabled)
 
-        Settings {
+        Window("Settings", id: "settings") {
             SettingsView(viewModel: viewModel)
         }
+        .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultSize(width: 920, height: 640)
+        .restorationBehavior(.disabled)
 
         Window("Keyboard Shortcuts", id: "keyboard-shortcuts") {
             KeyboardShortcutsView()

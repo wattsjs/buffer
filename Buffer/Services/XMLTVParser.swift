@@ -7,15 +7,17 @@ import SwiftLibxml2
 /// the entire parse loop in Swift eliminates that overhead.
 nonisolated struct XMLTVParser {
     static func parse(from url: URL) async throws -> [EPGProgram] {
-        let data: Data
-        if url.isFileURL {
-            data = try Data(contentsOf: url)
-        } else {
-            let (fetched, _) = try await URLSession.shared.data(from: url)
-            data = fetched
-        }
-        return await Task.detached(priority: .userInitiated) {
-            parse(data: data)
+        // Perform local file reads inside the detached task (Agent 03) so
+        // large XMLTV guides never block the main thread on import/switch.
+        return try await Task.detached(priority: .userInitiated) {
+            let data: Data
+            if url.isFileURL {
+                data = try Data(contentsOf: url)
+            } else {
+                let (fetched, _) = try await URLSession.shared.data(from: url)
+                data = fetched
+            }
+            return parse(data: data)
         }.value
     }
 

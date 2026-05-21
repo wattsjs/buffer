@@ -3,12 +3,35 @@ import SwiftUI
 struct HomeView: View {
     let recentChannels: [Channel]
     let favoriteChannels: [Channel]
+    let inProgressVOD: [VODResumeEntry]
     let currentProgram: (Channel) -> EPGProgram?
     let onChannelSelected: (Channel) -> Void
+    let onVODSelected: (VODResumeEntry) -> Void
+    let onVODRemoved: (VODResumeEntry) -> Void
     let sportsViewModel: SportsViewModel
     @AppStorage("hideSport") private var hideSport = false
 
     private let columns = [GridItem(.adaptive(minimum: 220, maximum: 280), spacing: 16)]
+
+    init(
+        recentChannels: [Channel],
+        favoriteChannels: [Channel],
+        inProgressVOD: [VODResumeEntry],
+        currentProgram: @escaping (Channel) -> EPGProgram?,
+        onChannelSelected: @escaping (Channel) -> Void,
+        onVODSelected: @escaping (VODResumeEntry) -> Void,
+        onVODRemoved: @escaping (VODResumeEntry) -> Void,
+        sportsViewModel: SportsViewModel
+    ) {
+        self.recentChannels = recentChannels
+        self.favoriteChannels = favoriteChannels
+        self.inProgressVOD = inProgressVOD
+        self.currentProgram = currentProgram
+        self.onChannelSelected = onChannelSelected
+        self.onVODSelected = onVODSelected
+        self.onVODRemoved = onVODRemoved
+        self.sportsViewModel = sportsViewModel
+    }
 
     private var liveEvents: [SportEvent] {
         guard !hideSport else { return [] }
@@ -19,6 +42,10 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                if !inProgressVOD.isEmpty {
+                    continueWatchingSection
+                }
+
                 if !hideSport {
                     if !liveEvents.isEmpty {
                         liveSportsSection
@@ -43,6 +70,36 @@ struct HomeView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    // MARK: - Continue Watching
+
+    private var continueWatchingSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "play.rectangle.on.rectangle")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text("Continue Watching")
+                    .font(.system(size: 18, weight: .semibold))
+                Text("\(inProgressVOD.count)")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 14) {
+                    ForEach(inProgressVOD) { entry in
+                        HomeVODProgressCard(entry: entry) {
+                            onVODSelected(entry)
+                        } onRemove: {
+                            onVODRemoved(entry)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Live Sport
@@ -147,6 +204,112 @@ struct HomeView: View {
                 }
             }
         }
+    }
+}
+
+private struct HomeVODProgressCard: View {
+    let entry: VODResumeEntry
+    let onTap: () -> Void
+    let onRemove: () -> Void
+
+    @State private var isHovering = false
+
+    private var subtitle: String {
+        let kind = entry.item.kind == .seriesEpisode ? "Episode" : "Movie"
+        if let progress = entry.progressFraction {
+            return "\(kind) · \(Int(progress * 100))% watched"
+        }
+        return kind
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            poster
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text(entry.item.name)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Text(subtitle)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                ProgressView(value: entry.progressFraction ?? 0)
+                    .progressViewStyle(.linear)
+                    .tint(.accentColor)
+                    .controlSize(.small)
+
+                if !entry.item.group.isEmpty {
+                    Text(entry.item.genre ?? entry.item.group)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(width: 170, alignment: .leading)
+        }
+        .padding(10)
+        .frame(width: 300, height: 128, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(isHovering ? 0.9 : 0.65))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(isHovering ? 0.22 : 0.08), lineWidth: 1)
+        )
+        .overlay(alignment: .topTrailing) {
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .background(.thinMaterial, in: Circle())
+            .foregroundStyle(.secondary)
+            .padding(7)
+            .help("Remove from Continue Watching")
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onTapGesture(perform: onTap)
+        .help("Play \(entry.item.name)")
+        .onHover { isHovering = $0 }
+        .contextMenu {
+            Button(action: onRemove) {
+                Label("Remove from Continue Watching", systemImage: "xmark.circle")
+            }
+        }
+    }
+
+    private var poster: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
+
+            RemoteArtworkView(
+                url: entry.item.posterURL,
+                fallbackSystemImage: entry.item.kind == .seriesEpisode ? "play.rectangle" : "film",
+                width: 72,
+                height: 108
+            )
+        }
+        .frame(width: 72, height: 108)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private var fallbackIcon: some View {
+        Image(systemName: entry.item.kind == .seriesEpisode ? "play.rectangle" : "film")
+            .font(.system(size: 24))
+            .foregroundStyle(.tertiary)
     }
 }
 
@@ -335,16 +498,13 @@ private struct HomeLiveEventCard: View {
 
     private func teamRow(_ team: TeamInfo) -> some View {
         HStack(spacing: 8) {
-            if let url = team.logoURL {
-                AsyncImage(url: url) { image in
-                    image.resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                } placeholder: {
-                    Color.clear
-                }
-                .frame(width: 22, height: 22)
-            }
+            RemoteArtworkView(
+                url: team.logoURL,
+                fallbackSystemImage: "sportscourt",
+                width: 22,
+                height: 22,
+                scaledToFill: false
+            )
 
             Text(team.displayName)
                 .font(.system(size: 13, weight: .semibold))

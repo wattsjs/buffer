@@ -330,17 +330,11 @@ actor XtreamClient {
     }
 
     func fetchAccountInfo() async throws -> XtreamAccountInfo {
-        guard let apiURL = config.xtreamAPIURL else {
-            throw XtreamError.invalidURL
-        }
-
-        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
-        ]
-
-        let data = try await fetchData(from: components.url!)
+        ])
+        let data = try await fetchData(from: target)
         let envelope = try JSONDecoder().decode(XtreamAuthEnvelope.self, from: data)
         guard let userInfo = envelope.userInfo else {
             throw XtreamError.decodingFailed
@@ -365,20 +359,15 @@ actor XtreamClient {
     // MARK: - Fetch Channels
 
     func fetchChannels() async throws -> [Channel] {
-        guard let apiURL = config.xtreamAPIURL else {
-            throw XtreamError.invalidURL
-        }
-
-        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
             URLQueryItem(name: "action", value: "get_live_streams")
-        ]
+        ])
 
         let categoriesMap = try await fetchCategories()
 
-        let data = try await fetchData(from: components.url!)
+        let data = try await fetchData(from: target)
         let streams = try JSONDecoder().decode([XtreamStream].self, from: data)
 
         return streams.compactMap { stream in
@@ -399,19 +388,14 @@ actor XtreamClient {
     }
 
     func fetchVODItems() async throws -> [VODItem] {
-        guard let apiURL = config.xtreamAPIURL else {
-            throw XtreamError.invalidURL
-        }
-
-        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
             URLQueryItem(name: "action", value: "get_vod_streams")
-        ]
+        ])
 
         let categoriesMap = (try? await fetchCategories(action: "get_vod_categories")) ?? [:]
-        let data = try await fetchData(from: components.url!)
+        let data = try await fetchData(from: target)
         let streams = try JSONDecoder().decode([XtreamVODStream].self, from: data)
 
         return streams.compactMap { stream in
@@ -442,19 +426,14 @@ actor XtreamClient {
     }
 
     func fetchVODItemDetails(item: VODItem) async throws -> VODItem {
-        guard let apiURL = config.xtreamAPIURL else {
-            throw XtreamError.invalidURL
-        }
-
-        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
             URLQueryItem(name: "action", value: "get_vod_info"),
             URLQueryItem(name: "vod_id", value: item.id)
-        ]
+        ])
 
-        let data = try await fetchData(from: components.url!)
+        let data = try await fetchData(from: target)
         let envelope = try JSONDecoder().decode(XtreamVODInfoEnvelope.self, from: data)
         guard envelope.info != nil || envelope.movieData != nil else {
             return item
@@ -486,19 +465,14 @@ actor XtreamClient {
     }
 
     func fetchSeries() async throws -> [VODSeries] {
-        guard let apiURL = config.xtreamAPIURL else {
-            throw XtreamError.invalidURL
-        }
-
-        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
             URLQueryItem(name: "action", value: "get_series")
-        ]
+        ])
 
         let categoriesMap = (try? await fetchCategories(action: "get_series_categories")) ?? [:]
-        let data = try await fetchData(from: components.url!)
+        let data = try await fetchData(from: target)
         let series = try JSONDecoder().decode([XtreamSeries].self, from: data)
 
         return series.map { entry in
@@ -518,19 +492,14 @@ actor XtreamClient {
     }
 
     func fetchSeriesEpisodes(series: VODSeries) async throws -> [VODItem] {
-        guard let apiURL = config.xtreamAPIURL else {
-            throw XtreamError.invalidURL
-        }
-
-        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
             URLQueryItem(name: "action", value: "get_series_info"),
             URLQueryItem(name: "series_id", value: series.id)
-        ]
+        ])
 
-        let data = try await fetchData(from: components.url!)
+        let data = try await fetchData(from: target)
         let envelope = try JSONDecoder().decode(XtreamSeriesInfoEnvelope.self, from: data)
         let seriesName = envelope.info?.name ?? series.name
         let posterURL = envelope.info?.cover.flatMap { URL(string: $0) } ?? series.posterURL
@@ -598,18 +567,13 @@ actor XtreamClient {
     }
 
     private func fetchCategories(action: String) async throws -> [String: String] {
-        guard let apiURL = config.xtreamAPIURL else {
-            throw XtreamError.invalidURL
-        }
-
-        var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
             URLQueryItem(name: "action", value: action)
-        ]
+        ])
 
-        let data = try await fetchData(from: components.url!)
+        let data = try await fetchData(from: target)
         let categories = try JSONDecoder().decode([XtreamCategory].self, from: data)
 
         var map: [String: String] = [:]
@@ -675,6 +639,20 @@ actor XtreamClient {
             return nil
         }
         return Self.shortDateFormatter.string(from: Date(timeIntervalSince1970: seconds))
+    }
+
+    /// Builds a properly guarded Xtream API URL from the configured base + query items.
+    /// Replaces all previous force-unwraps on URLComponents(url:)! and .url! (defensive cleanup).
+    private func xtreamURL(with queryItems: [URLQueryItem]) throws -> URL {
+        guard let apiURL = config.xtreamAPIURL,
+              var components = URLComponents(url: apiURL, resolvingAgainstBaseURL: false) else {
+            throw XtreamError.invalidURL
+        }
+        components.queryItems = queryItems
+        guard let finalURL = components.url else {
+            throw XtreamError.invalidURL
+        }
+        return finalURL
     }
 
     private func fetchData(from url: URL) async throws -> Data {

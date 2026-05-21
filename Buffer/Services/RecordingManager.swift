@@ -746,7 +746,7 @@ final class RecordingManager {
 
     /// Reconcile registered wake events with current settings. Called when
     /// the user flips the wake toggle.
-    private func reconcileWakeEvents() {
+    func reconcileWakeEvents() {
         for index in recordings.indices where recordings[index].status == .scheduled {
             if wakeMacForRecordings {
                 scheduleWakeIfNeeded(for: recordings[index])
@@ -821,6 +821,17 @@ final class RecordingManager {
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+
+        // Disk space guard (Agent 05 recommendation). Prevent starting a long
+        // recording that will silently truncate or fail mid-capture.
+        if let values = try? fileURL.resourceValues(forKeys: [.volumeAvailableCapacityKey]),
+           let available = values.volumeAvailableCapacity {
+            let minHeadroom: Int64 = 512 * 1024 * 1024 // 512 MiB conservative floor
+            if available < minHeadroom {
+                return nil
+            }
+        }
+
         if !FileManager.default.fileExists(atPath: fileURL.path) {
             FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }

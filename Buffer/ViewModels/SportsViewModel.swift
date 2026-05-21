@@ -37,6 +37,7 @@ final class SportsViewModel {
     private let espn = ESPNClient()
     private var refreshTask: Task<Void, Never>?
     private var autoRefreshTask: Task<Void, Never>?
+    private var indexRebuildTask: Task<Void, Never>?
     private var indexBuildGeneration = 0
 
     // External data for stream matching — set by the view
@@ -48,6 +49,7 @@ final class SportsViewModel {
     var hiddenGroups: Set<String> = []
 
     /// Pre-built search index for on-demand matching.
+    @ObservationIgnored
     private var searchIndex = StreamSearchIndex.empty
 
     var isStreamIndexReady: Bool {
@@ -78,7 +80,7 @@ final class SportsViewModel {
         self.channelPreferenceScores = channelPreferenceScores
         self.groupPreferenceScores = groupPreferenceScores
         self.hiddenGroups = hiddenGroups
-        rebuildIndexInBackground()
+        scheduleIndexRebuild()
     }
 
     func updateStreamMatchingPreferences(
@@ -96,12 +98,21 @@ final class SportsViewModel {
     /// Build the sports stream search index in the background.
     /// The index is built purely in-memory from channels + EPG programs;
     /// it is not persisted to disk. EPG is the durable source of truth.
-    private func rebuildIndexInBackground() {
+    private func scheduleIndexRebuild() {
+        indexBuildGeneration &+= 1
+        let generation = indexBuildGeneration
+        indexRebuildTask?.cancel()
+        indexRebuildTask = Task { [weak self, generation] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, let self else { return }
+            self.rebuildIndexInBackground(generation: generation)
+        }
+    }
+
+    private func rebuildIndexInBackground(generation: Int) {
         let ch = channels
         let pr = programs
         let hidden = hiddenGroups
-        indexBuildGeneration &+= 1
-        let generation = indexBuildGeneration
 
         if ch.isEmpty {
             searchIndex = .empty
@@ -124,7 +135,16 @@ final class SportsViewModel {
         AppLog.sports.info("Sports stream index build started generation=\(generation, privacy: .public) channels=\(ch.count, privacy: .public) programKeys=\(pr.count, privacy: .public)")
 
         Task.detached(priority: .userInitiated) { [ch, pr, hidden, generation] in
+            let signpostID = AppLog.sportsSignposter.makeSignpostID()
+            let signpostState = AppLog.sportsSignposter.beginInterval(
+                "SportsStreamIndexBuild",
+                id: signpostID,
+                "generation=\(generation, privacy: .public) channels=\(ch.count, privacy: .public) programKeys=\(pr.count, privacy: .public)"
+            )
             let start = ContinuousClock.now
+            defer {
+                AppLog.sportsSignposter.endInterval("SportsStreamIndexBuild", signpostState)
+            }
             let index = StreamMatcher.buildIndex(channels: ch, programs: pr, hiddenGroups: hidden)
 
             await MainActor.run { [weak self] in
@@ -221,10 +241,17 @@ final class SportsViewModel {
         }
 
         return await Task.detached(priority: .userInitiated) {
+            let signpostID = AppLog.sportsSignposter.makeSignpostID()
+            let signpostState = AppLog.sportsSignposter.beginInterval(
+                "SportsStreamMatch",
+                id: signpostID,
+                "event=\(event.displayTitle, privacy: .public) entries=\(index.entries.count, privacy: .public)"
+            )
             let start = ContinuousClock.now
+            defer {
+                AppLog.sportsSignposter.endInterval("SportsStreamMatch", signpostState)
+            }
             var matches = StreamMatcher.findMatches(for: event, index: index)
-            // Semantic score remains primary. User preference is a bounded
-            // tie-breaker from favorite channels, channel usage, and folder usage.
             matches.sort { lhs, rhs in
                 let lScore = Self.preferenceAdjustedScore(
                     match: lhs,

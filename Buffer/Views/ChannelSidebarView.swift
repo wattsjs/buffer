@@ -4,7 +4,7 @@ struct ChannelSidebarView: View {
     @Bindable var viewModel: EPGViewModel
     @State private var notificationManager = NotificationManager.shared
     @State private var recordingManager = RecordingManager.shared
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
     @AppStorage("hideSport") private var hideSport = false
     @AppStorage(EPGViewModel.disableVODKey) private var disableVOD = false
     @AppStorage("sidebarLiveExpanded") private var liveExpanded = true
@@ -44,16 +44,16 @@ struct ChannelSidebarView: View {
                     }
                 }
                 Divider()
-                Button("Manage Playlists…") { openSettings() }
+                Button("Manage Sources…") { openWindow(id: "settings") }
             } label: {
                 PlaylistPickerLabel(
-                    name: active.name.isEmpty ? "Playlist" : active.name
+                    name: active.name.isEmpty ? "Source" : active.name
                 )
             }
             .menuStyle(.button)
             .menuIndicator(.hidden)
             .buttonStyle(.plain)
-            .help("Switch playlist")
+            .help("Switch source")
         }
     }
 

@@ -1,4 +1,6 @@
 import SwiftUI
+import Nuke
+import NukeUI
 
 private enum VODSortOrder: String, CaseIterable, Identifiable {
     case title = "Title"
@@ -12,7 +14,7 @@ private enum VODPosterMetrics {
     static let height: CGFloat = 234
     static let titleHeight: CGFloat = 36
     static let subtitleHeight: CGFloat = 16
-    static let cardHeight: CGFloat = 297
+    static let cardHeight: CGFloat = 313
     static let cornerRadius: CGFloat = 8
 }
 
@@ -21,9 +23,10 @@ struct VODLibraryView: View {
     let itemProvider: (VODItem) -> VODItem
     let isItemLoading: (VODItem) -> Bool
     let itemLoadError: (VODItem) -> String?
+    let resumeProvider: (VODItem) -> VODResumeEntry?
     let hasLoadedOnce: Bool
     let onItemFocused: (VODItem) -> Void
-    let onItemSelected: (VODItem) -> Void
+    let onItemSelected: (VODItem, Double?) -> Void
 
     @State private var selectedGenre = "All"
     @State private var sortOrder: VODSortOrder = .title
@@ -61,9 +64,12 @@ struct VODLibraryView: View {
                     item: itemProvider(selectedItem),
                     isLoadingMetadata: isItemLoading(selectedItem),
                     metadataLoadError: itemLoadError(selectedItem),
+                    resumeEntry: resumeProvider(itemProvider(selectedItem)),
                     backTitle: "Movies",
                     onBack: { self.selectedItem = nil },
-                    onPlay: { onItemSelected(itemProvider(selectedItem)) }
+                    onPlay: { resumePosition in
+                        onItemSelected(itemProvider(selectedItem), resumePosition)
+                    }
                 )
                 .task(id: selectedItem.id) {
                     onItemFocused(selectedItem)
@@ -92,6 +98,7 @@ struct VODLibraryView: View {
                                     posterURL: item.posterURL,
                                     fallbackSystemImage: "film",
                                     badge: item.containerExtension?.uppercased(),
+                                    resumeEntry: resumeProvider(item),
                                     onOpen: { selectedItem = item }
                                 )
                             }
@@ -119,9 +126,10 @@ struct SeriesLibraryView: View {
     let episodesProvider: (VODSeries) -> [VODItem]
     let isLoading: (VODSeries) -> Bool
     let loadError: (VODSeries) -> String?
+    let resumeProvider: (VODItem) -> VODResumeEntry?
     let hasLoadedOnce: Bool
     let onSeriesSelected: (VODSeries) -> Void
-    let onEpisodeSelected: (VODItem) -> Void
+    let onEpisodeSelected: (VODItem, Double?) -> Void
 
     @State private var selectedGenre = "All"
     @State private var sortOrder: VODSortOrder = .title
@@ -160,6 +168,7 @@ struct SeriesLibraryView: View {
                     episodes: episodesProvider(selectedSeries),
                     isLoading: isLoading(selectedSeries),
                     loadError: loadError(selectedSeries),
+                    resumeProvider: resumeProvider,
                     backTitle: "TV",
                     onBack: { self.selectedSeries = nil },
                     onEpisodeSelected: onEpisodeSelected
@@ -188,6 +197,7 @@ struct SeriesLibraryView: View {
                                     posterURL: item.posterURL,
                                     fallbackSystemImage: "rectangle.stack",
                                     badge: nil,
+                                    resumeEntry: nil,
                                     onOpen: {
                                         selectedSeries = item
                                         onSeriesSelected(item)
@@ -254,6 +264,7 @@ private struct VODPosterCard: View {
     let posterURL: URL?
     let fallbackSystemImage: String
     let badge: String?
+    let resumeEntry: VODResumeEntry?
     let onOpen: () -> Void
 
     @State private var isHovering = false
@@ -277,6 +288,15 @@ private struct VODPosterCard: View {
                                 .padding(8)
                         }
                     }
+                    .overlay(alignment: .bottom) {
+                        if let progress = resumeEntry?.progressFraction {
+                            ProgressView(value: progress)
+                                .progressViewStyle(.linear)
+                                .tint(.accentColor)
+                                .padding(.horizontal, 8)
+                                .padding(.bottom, 8)
+                        }
+                    }
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title)
@@ -290,6 +310,12 @@ private struct VODPosterCard: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .frame(height: VODPosterMetrics.subtitleHeight, alignment: .topLeading)
+                    if let resumeEntry {
+                        Text(resumeText(for: resumeEntry))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .lineLimit(1)
+                    }
                 }
             }
             .frame(width: VODPosterMetrics.width, height: VODPosterMetrics.cardHeight, alignment: .topLeading)
@@ -312,37 +338,27 @@ private struct VODPosterArtwork: View {
             RoundedRectangle(cornerRadius: VODPosterMetrics.cornerRadius, style: .continuous)
                 .fill(Color.primary.opacity(0.04))
 
-            if let url {
-                AsyncImage(url: url) { image in
-                    image
-                        .resizable()
-                        .interpolation(.high)
-                        .scaledToFill()
-                } placeholder: {
-                    fallbackIcon
-                }
-            } else {
-                fallbackIcon
-            }
+            RemoteArtworkView(
+                url: url,
+                fallbackSystemImage: fallbackSystemImage,
+                width: width,
+                height: height
+            )
         }
         .frame(width: width, height: height)
         .clipShape(RoundedRectangle(cornerRadius: VODPosterMetrics.cornerRadius, style: .continuous))
     }
 
-    private var fallbackIcon: some View {
-        Image(systemName: fallbackSystemImage)
-            .font(.system(size: 32, weight: .regular))
-            .foregroundStyle(.tertiary)
-    }
 }
 
 struct VODItemDetailPage: View {
     let item: VODItem
     var isLoadingMetadata = false
     var metadataLoadError: String? = nil
+    var resumeEntry: VODResumeEntry? = nil
     let backTitle: String
     let onBack: () -> Void
-    let onPlay: () -> Void
+    let onPlay: (Double?) -> Void
 
     var body: some View {
         ScrollView {
@@ -368,11 +384,20 @@ struct VODItemDetailPage: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    Button(action: onPlay) {
-                        Label("Play", systemImage: "play.fill")
+                    VStack(alignment: .leading, spacing: 8) {
+                        Button {
+                            onPlay(resumeEntry?.positionSeconds)
+                        } label: {
+                            Label(resumeEntry == nil ? "Play" : "Resume", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+
+                        if let resumeEntry {
+                            VODResumeProgress(entry: resumeEntry)
+                                .frame(maxWidth: 260)
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
 
                     VODMetadataGrid(rows: metadataRows(for: item))
 
@@ -421,9 +446,10 @@ struct SeriesDetailPage: View {
     let episodes: [VODItem]
     let isLoading: Bool
     let loadError: String?
+    let resumeProvider: (VODItem) -> VODResumeEntry?
     let backTitle: String
     let onBack: () -> Void
-    let onEpisodeSelected: (VODItem) -> Void
+    let onEpisodeSelected: (VODItem, Double?) -> Void
 
     var body: some View {
         ScrollView {
@@ -503,8 +529,8 @@ struct SeriesDetailPage: View {
                     } else {
                         LazyVStack(alignment: .leading, spacing: 8) {
                             ForEach(episodes) { episode in
-                                EpisodeRow(episode: episode) {
-                                    onEpisodeSelected(episode)
+                                EpisodeRow(episode: episode, resumeEntry: resumeProvider(episode)) { resumePosition in
+                                    onEpisodeSelected(episode, resumePosition)
                                 }
                             }
                         }
@@ -521,6 +547,27 @@ struct SeriesDetailPage: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+}
+
+private struct VODResumeProgress: View {
+    let entry: VODResumeEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 11, weight: .medium))
+                Text(resumeText(for: entry))
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(.secondary)
+
+            ProgressView(value: entry.progressFraction ?? 0)
+                .progressViewStyle(.linear)
+                .tint(.accentColor)
+        }
     }
 }
 
@@ -545,7 +592,8 @@ private struct VODHeaderBackButton: View {
 
 private struct EpisodeRow: View {
     let episode: VODItem
-    let onPlay: () -> Void
+    let resumeEntry: VODResumeEntry?
+    let onPlay: (Double?) -> Void
 
     @State private var isHovering = false
 
@@ -564,8 +612,10 @@ private struct EpisodeRow: View {
                         .font(.system(size: 14, weight: .semibold))
                         .lineLimit(2)
                     Spacer()
-                    Button(action: onPlay) {
-                        Label("Play", systemImage: "play.fill")
+                    Button {
+                        onPlay(resumeEntry?.positionSeconds)
+                    } label: {
+                        Label(resumeEntry == nil ? "Play" : "Resume", systemImage: "play.fill")
                             .labelStyle(.titleAndIcon)
                     }
                     .buttonStyle(.borderedProminent)
@@ -574,6 +624,11 @@ private struct EpisodeRow: View {
                 }
 
                 EpisodeMetadataStrip(episode: episode)
+
+                if let resumeEntry {
+                    VODResumeProgress(entry: resumeEntry)
+                        .frame(maxWidth: 240)
+                }
 
                 if let summary = episode.summary, !summary.isEmpty {
                     Text(summary)
@@ -586,7 +641,9 @@ private struct EpisodeRow: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .onTapGesture(perform: onPlay)
+        .onTapGesture {
+            onPlay(resumeEntry?.positionSeconds)
+        }
         .onHover { hovering in
             isHovering = hovering
             if hovering {
@@ -605,7 +662,7 @@ private struct EpisodeRow: View {
         )
         .animation(.easeOut(duration: 0.12), value: isHovering)
         .accessibilityAddTraits(.isButton)
-        .help("Play \(episode.name)")
+        .help("\(resumeEntry == nil ? "Play" : "Resume") \(episode.name)")
     }
 }
 
@@ -709,6 +766,24 @@ private func metadataRows(for item: VODItem) -> [(String, String)] {
         rows.append(("Cast", cast))
     }
     return rows
+}
+
+private func resumeText(for entry: VODResumeEntry) -> String {
+    let position = playbackTimeString(seconds: entry.positionSeconds)
+    guard let duration = entry.durationSeconds, duration > 0 else {
+        return "Resume \(position)"
+    }
+    return "Resume \(position) of \(playbackTimeString(seconds: duration))"
+}
+
+private func playbackTimeString(seconds: Double) -> String {
+    let totalSeconds = max(Int(seconds.rounded()), 0)
+    let hours = totalSeconds / 3600
+    let minutes = (totalSeconds % 3600) / 60
+    if hours > 0 {
+        return "\(hours)h \(minutes)m"
+    }
+    return "\(minutes)m"
 }
 
 private func episodeMetadataBadges(for item: VODItem) -> [String] {

@@ -2,6 +2,37 @@ import Foundation
 import Observation
 import OSLog
 
+/// Small, file-local reuse pool for MPVPlayer handles (Agent 01/04).
+/// Keeps 1–3 warm instances (mpv handle + observers + timers + GL setup)
+/// alive when PlayerSlots are removed, so the next addChannel / window open
+/// can skip the expensive mpv_create + 30+ option + observer setup.
+private final class MPVPlayerPool {
+    static let shared = MPVPlayerPool()
+    private var idle: [MPVPlayer] = []
+    private let maxIdle = 3
+
+    private init() {}
+
+    @MainActor
+    func acquire() -> MPVPlayer {
+        if !idle.isEmpty {
+            let p = idle.removeLast()
+            p.prepareForReuse()
+            return p
+        }
+        return MPVPlayer()
+    }
+
+    @MainActor
+    func release(_ p: MPVPlayer) {
+        p.prepareForReuse()
+        if idle.count < maxIdle {
+            idle.append(p)
+        }
+        // else: drop the reference; MPVPlayer.deinit will call destroy()
+    }
+}
+
 enum MultiViewLayout: String, CaseIterable, Identifiable {
     case single
     case oneTwo
@@ -65,13 +96,18 @@ final class PlayerSlot: Identifiable {
     var currentProgram: EPGProgram?
     private(set) var playbackStreamHealth = StreamHealth()
 
-    // MPVPlayer is created lazily on first access. SwiftUI re-invokes view
-    // inits on every parent re-render; a discarded slot must not spawn an
-    // mpv instance just to be torn down a moment later.
-    @ObservationIgnored private var _player: MPVPlayer?
+    // MPVPlayer is created lazily on first access (or acquired from the
+    // warm reuse pool). SwiftUI re-invokes view inits on every parent
+    // re-render; a discarded slot must not spawn an mpv instance just to
+    // be torn down a moment later. Removed slots return their handle to
+    // the pool (up to 3) for fast reuse on the next addChannel/zap.
+    @ObservationIgnored fileprivate var _player: MPVPlayer?
     @ObservationIgnored var player: MPVPlayer {
         if let existing = _player { return existing }
-        let new = MPVPlayer()
+        // Prefer a warm pooled handle (avoids mpv_create + full option/observer
+        // setup + render init). The pool is populated on removeSlot / session
+        // teardown.
+        let new = MPVPlayerPool.shared.acquire()
         new.onPlaybackEnded = { [weak self] reason in
             self?.handlePlaybackEnded(reason)
         }
@@ -121,6 +157,12 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var lastPlaybackProgressAt: Date?
     @ObservationIgnored private var expectedStoppedEndFiles: Int = 0
     @ObservationIgnored private var lastReconnectAt: Date?
+    @ObservationIgnored private var pendingOnDemandSeekSeconds: Double?
+
+    /// Tracks whether we have explicitly paused recovery Tasks + player for
+    /// system sleep via AppLifecycleCoordinator. Prevents duplicate work on
+    /// rapid sleep/wake and ensures clean Task cancellation.
+    @ObservationIgnored private var isBackgroundPaused = false
 
     /// After this long of continuous reconnect failures without a single
     /// successful `FILE_LOADED`, surface an error to the user. The reconnect
@@ -184,6 +226,10 @@ final class PlayerSlot: Identifiable {
         lastObservedTimePos = player.timePos
         lastPlaybackProgressAt = Date()
         player.clearReconnectingErrorMessage()
+        if playbackMode == .onDemand, let seekSeconds = pendingOnDemandSeekSeconds {
+            pendingOnDemandSeekSeconds = nil
+            player.seek(to: seekSeconds)
+        }
     }
 
     private func handleStreamIssue(_ issue: MPVStreamIssue) {
@@ -363,6 +409,17 @@ final class PlayerSlot: Identifiable {
                 guard !Task.isCancelled, let self else { return }
                 guard self.playbackMode == .live else { return }
 
+                // Background thumbnail guard (post-pool multi-view robustness):
+                // Throttled slots (focusedScaling=false) have vid disabled and
+                // should not drive 1 Hz stall detection or cause spurious
+                // reconnects while the pane is tiny. Promotion re-arms via
+                // applySlotPolicies. This + suspendBackgroundRecovery cuts
+                // active watchdogs from 9 to 1 in full grid.
+                if !self.player.focusedScaling {
+                    try? await Task.sleep(for: .seconds(4))
+                    continue
+                }
+
                 let currentTimePos = self.player.timePos
                 if currentTimePos - self.lastObservedTimePos >= self.playbackProgressEpsilon {
                     self.lastObservedTimePos = currentTimePos
@@ -410,6 +467,34 @@ final class PlayerSlot: Identifiable {
         armStallWatchdog()
     }
 
+    /// Suspends the per-slot stall/healthy watchdogs (but leaves any
+    /// in-flight reconnectTask). Called for non-focused multi-view
+    /// thumbnails so we don't have N× 1 Hz Tasks + spurious reconnects
+    /// while the player is intentionally throttled (vid=no, paused).
+    /// On focus promotion we selectively re-arm only the active pane.
+    /// This + focusedScaling guard inside the loops tames the "timers
+    /// exploding in multi-view" problem after pool work.
+    func suspendBackgroundRecovery() {
+        playbackWatchdog?.cancel()
+        playbackWatchdog = nil
+        stallWatchdog?.cancel()
+        stallWatchdog = nil
+        lastPlaybackProgressAt = nil
+        // Intentionally do *not* cancel reconnectTask here; a pending
+        // silent recovery for a thumbnail can complete and keep the slot
+        // "warm" for later promotion. Full stop only via cancelReconnect.
+    }
+
+    /// Re-arms recovery only for the now-focused live slot (idempotent).
+    func ensureRecoveryWatchdogsArmedForFocus() {
+        guard playbackMode == .live else { return }
+        // Only (re)arm if we don't already have active ones; avoids
+        // duplicate Tasks on rapid focus toggles.
+        if stallWatchdog == nil {
+            armRecoveryWatchdogs()
+        }
+    }
+
     private func stopRecoveryTasks(resetFailureWindow: Bool) {
         reconnectTask?.cancel()
         reconnectTask = nil
@@ -436,6 +521,59 @@ final class PlayerSlot: Identifiable {
 
     func cancelReconnect() {
         stopRecoveryTasks(resetFailureWindow: true)
+    }
+
+    // MARK: - AppLifecycleCoordinator integration (Agent 09)
+    //
+    // These are invoked by PlayerSessionRegistry (which is notified by the
+    // central coordinator on macOS sleep/wake). They ensure watchdogs,
+    // reconnect Tasks, and the MPV cache timer are fully stopped during sleep
+    // (preventing accumulation, stale Date() math, and reconnect floods on
+    // wake) and cleanly restarted afterwards. Rapid sleep/wake + 9-view is
+    // the exact scenario that used to leak Tasks and freeze the app.
+
+    func pauseBackgroundWork() {
+        guard !isBackgroundPaused else { return }
+        isBackgroundPaused = true
+
+        AppLog.playback.info("Pausing player background work channel=\(self.channel.name, privacy: .public)")
+
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        pendingReconnectIs509 = false
+        playbackWatchdog?.cancel()
+        playbackWatchdog = nil
+        stallWatchdog?.cancel()
+        stallWatchdog = nil
+        lastPlaybackProgressAt = nil
+
+        player.pause()
+        player.pauseBackgroundActivity()
+    }
+
+    func resumeBackgroundWork() {
+        guard isBackgroundPaused else { return }
+        isBackgroundPaused = false
+
+        AppLog.playback.info("Resuming player background work channel=\(self.channel.name, privacy: .public)")
+
+        player.resumeBackgroundActivity()
+
+        guard playbackMode == .live else {
+            // Catchup / on-demand: just unpause from where we left off.
+            player.play()
+            return
+        }
+
+        // Live: safest to do a fresh load after sleep to re-establish
+        // network paths, HLS playlists, etc. Then re-arm the stall/reconnect
+        // watchdogs exactly as a normal load does.
+        stopRecoveryTasks(resetFailureWindow: false)
+        player.clearReconnectingErrorMessage()
+        noteExpectedStopIfReplacingCurrentItem()
+        player.loadURL(channel.streamURL, autoplay: true)
+        armRecoveryWatchdogs()
+        StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
     }
 
     init(channel: Channel, currentProgram: EPGProgram?) {
@@ -488,6 +626,11 @@ final class PlayerSlot: Identifiable {
         player.loadURL(url, autoplay: true)
     }
 
+    func seekOnNextOnDemandLoad(to seconds: Double) {
+        guard channel.isOnDemand, seconds > 0 else { return }
+        pendingOnDemandSeekSeconds = seconds
+    }
+
     private func loadOnDemand() {
         playbackMode = .onDemand
         playbackStreamHealth = StreamHealth()
@@ -523,12 +666,21 @@ final class PlayerSession {
         guard !started else { return }
         started = true
         guard !skipInitialLoad else { return }
-        let first = slots[0]
+        guard let first = slots.first else {
+            // Defensive: should never be empty (init always seeds, remove guards >1).
+            assertionFailure("PlayerSession.start with zero slots")
+            return
+        }
         first.loadInitialLive()
     }
 
     var focusedSlot: PlayerSlot {
-        slots.first { $0.id == focusedSlotID } ?? slots[0]
+        if let match = slots.first(where: { $0.id == focusedSlotID }) { return match }
+        guard let first = slots.first else {
+            // Defensive: prevents crash on slots[0] or implicit [0] if ever empty (was force path).
+            preconditionFailure("PlayerSession.focusedSlot with zero slots")
+        }
+        return first
     }
 
     var isMulti: Bool { slots.count > 1 }
@@ -565,6 +717,14 @@ final class PlayerSession {
         removed.player.pause()
         removed.unregisterFromRegistry()
 
+        // Return the MPVPlayer to the warm pool (if room) instead of letting
+        // its deinit destroy the expensive handle. The layer teardown has
+        // already reset the render context.
+        if let p = removed._player {
+            removed._player = nil
+            MPVPlayerPool.shared.release(p)
+        }
+
         slots.remove(at: index)
 
         if focusedSlotID == id, let first = slots.first {
@@ -590,6 +750,11 @@ final class PlayerSession {
         for slot in slots {
             let focused = slot.id == focusedSlotID
             slot.player.configureResources(multiView: multi, focused: focused)
+            if focused {
+                slot.ensureRecoveryWatchdogsArmedForFocus()
+            } else {
+                slot.suspendBackgroundRecovery()
+            }
         }
     }
 
@@ -605,6 +770,36 @@ final class PlayerSession {
             layout = .single
         } else if layout.capacity > slots.count * 2 && layout != .focusedThumbnails {
             layout = MultiViewLayout.smallestFitting(slots.count)
+        }
+    }
+
+    // MARK: - AppLifecycleCoordinator integration (Agent 09)
+
+    func pauseAllBackgroundWork() {
+        for slot in slots {
+            slot.pauseBackgroundWork()
+        }
+    }
+
+    func resumeAllBackgroundWork() {
+        for slot in slots {
+            slot.resumeBackgroundWork()
+        }
+        // Re-apply multi-view resource policies (mute, vid track, scaling)
+        // after the resume loads may have reset player state.
+        applySlotPolicies()
+    }
+
+    /// Called on window close / session teardown (and by PlayerView onDisappear)
+    /// to return all remaining MPVPlayer handles to the warm pool instead of
+    /// destroying them in deinit. This keeps 1–3 ready for the next player
+    /// window or addChannel.
+    func recycleAllPlayers() {
+        for slot in slots {
+            if let p = slot._player {
+                slot._player = nil
+                MPVPlayerPool.shared.release(p)
+            }
         }
     }
 }

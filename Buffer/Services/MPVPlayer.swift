@@ -93,9 +93,12 @@ struct MPVPlaybackStats: Equatable, Sendable {
 @Observable
 final class MPVPlayer {
     private enum Tuning {
-        static let stateEpsilon = 0.01
-        static let timePosEpsilon = 0.05
-        static let cacheEpsilon = 0.25
+        // Raised to reduce @Observable update frequency (and therefore SwiftUI
+        // redraws + CPU) for non-critical stats in multi-view. Focused playback
+        // still feels responsive; background/thumbnail slots benefit hugely.
+        static let stateEpsilon = 0.05
+        static let timePosEpsilon = 0.25
+        static let cacheEpsilon = 0.5
         static let demuxerLavfProbeSize = 4_194_304
         // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
         // AVOption surface.
@@ -302,7 +305,10 @@ final class MPVPlayer {
     @ObservationIgnored private var activeCachePauseFloorSeconds: Double = Tuning.cachePauseFloorSeconds(for: BufferSetting.read())
     @ObservationIgnored private var activeCachePauseResumeSeconds: Double = Tuning.cachePauseResumeSeconds(for: BufferSetting.read())
     @ObservationIgnored private var autoPausedForCacheFloor = false
-    @ObservationIgnored private var focusedScaling: Bool = true
+    @ObservationIgnored var focusedScaling: Bool = true   // internal: read by PlayerSlot watchdog guards for multi-view throttling decisions
+    /// Set when we deliberately disabled the video track for a background
+    /// thumbnail slot in multi-view. We restore it ("auto") on promotion.
+    @ObservationIgnored private(set) var videoDisabledForBackground = false
     private var defaultsObserver: NSObjectProtocol?
     private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
     @ObservationIgnored private var lastHTTPStatusCode: Int = 0
@@ -335,6 +341,7 @@ final class MPVPlayer {
 
     func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false) {
         guard let handle else { return }
+
         AppLog.playback.info("mpv load url=\(url.absoluteString, privacy: .private(mask: .hash)) autoplay=\(autoplay, privacy: .public) fastProbe=\(fastProbe, privacy: .public)")
         errorMessage = nil
         resetMediaTrackState()
@@ -344,6 +351,7 @@ final class MPVPlayer {
         cacheSeconds = 0
         isBuffering = false
         autoPausedForCacheFloor = false
+        videoDisabledForBackground = false
         refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
         setFlag("pause", !autoplay)
         playbackRequested = autoplay
@@ -425,6 +433,70 @@ final class MPVPlayer {
         isPlaying ? pause() : play()
     }
 
+    /// Pauses the lightweight cache-floor timer. Called by PlayerSlot during
+    /// system sleep to avoid unnecessary work while suspended.
+    func pauseBackgroundActivity() {
+        statePollTimer?.cancel()
+        statePollTimer = nil
+    }
+
+    /// Restarts the cache-floor timer if the player is still alive. Safe to
+    /// call on wake even if we did not explicitly pause it.
+    func resumeBackgroundActivity() {
+        if statePollTimer == nil, handle != nil {
+            startCacheFloorTimer()
+        }
+    }
+
+    /// Prepares a warm MPVPlayer (from the reuse pool) for assignment to a
+    /// new PlayerSlot. Clears owner callbacks and transient state, stops any
+    /// prior stream, resets render context if needed. The expensive mpv handle,
+    /// event pump, observers, and timers are retained for fast reuse.
+    func prepareForReuse() {
+        // Detach from any previous owner to prevent stale callbacks or
+        // recovery logic firing on an idle pooled instance.
+        onPlaybackEnded = nil
+        onFileLoaded = nil
+        onStreamIssue = nil
+        onMediaInfoChanged = nil
+
+        // Halt playback without tearing down the mpv instance.
+        stop()
+
+        // Full state reset mirroring the pre-load cleanup in loadURL.
+        errorMessage = nil
+        resetMediaTrackState()
+        timePos = 0
+        duration = 0
+        isSeekable = false
+        cacheSeconds = 0
+        isBuffering = false
+        isLoading = false
+        autoPausedForCacheFloor = false
+        videoDisabledForBackground = false
+        playbackRequested = false
+        currentURL = nil
+        isPlaying = false
+        isMuted = false
+        // volume left at last value; loadURL or UI will set as needed
+        mediaInfo = MPVMediaInfo()
+        playbackStats = MPVPlaybackStats()
+        containerFps = 0
+        estimatedFps = 0
+        lastHTTPStatusCode = 0
+        mpvLogSuppression = [:]
+        focusedScaling = true
+
+        releaseDisplayPowerAssertion()
+        resetRenderContext()
+
+        // Restore sensible defaults for next user; configureResources will
+        // further tune per focus/multi-view state on first attach.
+        activeCachePauseFloorSeconds = Tuning.cachePauseFloorSeconds(for: bufferSeconds)
+        activeCachePauseResumeSeconds = Tuning.cachePauseResumeSeconds(for: bufferSeconds)
+        refreshPlaybackTuningStats(renderProfile: "focused")
+    }
+
     func setVolume(_ percent: Double) {
         setDouble("volume", percent.clamped(to: 0...130))
     }
@@ -471,6 +543,13 @@ final class MPVPlayer {
             scaleFilter = "spline36"
             cscaleFilter = "spline36"
             focusedScaling = true
+            if videoDisabledForBackground {
+                setRuntimeProperty(handle, "vid", "auto")
+                videoDisabledForBackground = false
+            }
+            // When (re)becoming the focused pane in multi-view, ensure it is playing
+            // (we may have auto-paused it when it was a background thumbnail).
+            setFlag("pause", false)
         } else if focused {
             maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true)
             maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true)
@@ -478,6 +557,11 @@ final class MPVPlayer {
             scaleFilter = "spline36"
             cscaleFilter = "spline36"
             focusedScaling = true
+            if videoDisabledForBackground {
+                setRuntimeProperty(handle, "vid", "auto")
+                videoDisabledForBackground = false
+            }
+            setFlag("pause", false)
         } else {
             maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: false)
             maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: false)
@@ -485,6 +569,15 @@ final class MPVPlayer {
             scaleFilter = "bilinear"
             cscaleFilter = "bilinear"
             focusedScaling = false
+
+            // Strong background throttling for multi-view thumbnails (Agents 01/04/09).
+            // Pause + drop buffers + disable video track so the decoder does
+            // essentially zero work for off-screen slots. The render layer stays
+            // attached; on promotion we re-enable video + unpause.
+            setFlag("pause", true)
+            command(handle, ["drop-buffers"])
+            setRuntimeProperty(handle, "vid", "no")
+            videoDisabledForBackground = true
         }
 
         activeCachePauseFloorSeconds = Tuning.cachePauseFloorSeconds(for: cacheFloorSecs)
@@ -535,8 +628,10 @@ final class MPVPlayer {
             return apiType.withUnsafeMutableBufferPointer { apiBuf -> Int32 in
                 var advancedControl: Int32 = 1
                 return withUnsafeMutablePointer(to: &advancedControl) { advPtr -> Int32 in
+                    // baseAddress is always non-nil for a non-empty utf8CString buffer; defensive guard prevents !
+                    let apiData: UnsafeMutableRawPointer = apiBuf.baseAddress.map { UnsafeMutableRawPointer($0) } ?? .init(bitPattern: 0)!
                     var params = [
-                        mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE, data: UnsafeMutableRawPointer(apiBuf.baseAddress!)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE, data: apiData),
                         mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: UnsafeMutableRawPointer(glPtr)),
                         mpv_render_param(type: MPV_RENDER_PARAM_ADVANCED_CONTROL, data: UnsafeMutableRawPointer(advPtr)),
                         mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
@@ -586,6 +681,10 @@ final class MPVPlayer {
         // which avoids a CPU-side frame copy per decoded picture.
         setOption(newHandle, "hwdec", "videotoolbox")
         setOption(newHandle, "hwdec-codecs", "all")
+        // Xtream catchup TS seeks can start on damaged/incomplete GOPs. Fall
+        // back to software decoding on the first failed hardware frame instead
+        // of waiting through repeated VideoToolbox errors and cache stalls.
+        setOption(newHandle, "hwdec-software-fallback", "yes")
         setOption(newHandle, "vd-lavc-dr", "yes")
         setOption(newHandle, "vd-lavc-show-all", "no")
 
@@ -749,6 +848,7 @@ final class MPVPlayer {
     }
 
     private func destroy() {
+        videoDisabledForBackground = false
         releaseDisplayPowerAssertion()
         if let observer = defaultsObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -963,14 +1063,18 @@ final class MPVPlayer {
 
     /// Extracts an HTTP status code from an mpv log message. Matches patterns
     /// like "HTTP error 509", "Server returned 5XX", "HTTP 429".
-    private static func extractHTTPStatusCode(_ message: String) -> Int? {
-        // ffmpeg formats: "HTTP error 509 Not Found" or "Server returned 5XX ..."
-        let patterns = [
+    private static let httpStatusRegexes: [NSRegularExpression] = {
+        // Hardcoded patterns; try! is appropriate here (build-time failure on malformed regex).
+        [
             try! NSRegularExpression(pattern: #"HTTP error (\d{3})"#, options: .caseInsensitive),
             try! NSRegularExpression(pattern: #"Server returned (\d{3})"#, options: .caseInsensitive),
             try! NSRegularExpression(pattern: #"HTTP (\d{3})"#, options: .caseInsensitive),
         ]
-        for pattern in patterns {
+    }()
+
+    private static func extractHTTPStatusCode(_ message: String) -> Int? {
+        // ffmpeg formats: "HTTP error 509 Not Found" or "Server returned 5XX ..."
+        for pattern in httpStatusRegexes {
             if let match = pattern.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
                match.numberOfRanges > 1,
                let range = Range(match.range(at: 1), in: message),
@@ -1062,8 +1166,14 @@ final class MPVPlayer {
     }
 
     private func checkCacheFloor() {
-        guard let cache = readDoubleProperty("demuxer-cache-duration") else { return }
-        maintainLiveCacheFloor(cacheSeconds: cache)
+        // Do not call mpv_get_property from the main queue here. During TS
+        // catchup startup/seek, mpv can hold its dispatch lock while the
+        // decoder is reconfiguring; synchronously reading a property from this
+        // timer then blocks AppKit's event loop and produces a beach ball.
+        // The property observer path updates `cacheSeconds` and calls
+        // maintainLiveCacheFloor with the fresh value; this timer only provides
+        // a cheap safety pass over the last observed cache value.
+        maintainLiveCacheFloor(cacheSeconds: cacheSeconds)
     }
     private enum PropID: UInt64 {
         case pause = 1
@@ -1256,12 +1366,8 @@ final class MPVPlayer {
             nextMediaInfo.liveLatencySeconds = nil
         }
 
-        var nextContainerFps = pending.containerFps ?? containerFps
-        var nextEstimatedFps = pending.estimatedFps ?? estimatedFps
-        if nextContainerFps <= 0, nextEstimatedFps <= 0, pending.timePos != nil {
-            nextContainerFps = readDoubleProperty("container-fps") ?? nextContainerFps
-            nextEstimatedFps = readDoubleProperty("estimated-vf-fps") ?? nextEstimatedFps
-        }
+        let nextContainerFps = pending.containerFps ?? containerFps
+        let nextEstimatedFps = pending.estimatedFps ?? estimatedFps
         if abs(containerFps - nextContainerFps) >= Tuning.stateEpsilon {
             containerFps = nextContainerFps
         }

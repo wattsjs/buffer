@@ -249,6 +249,20 @@ final class MPVPlayerLayer: CAOpenGLLayer {
                 // into one draw pass anyway.
                 layer.displayScheduled = false
                 guard !layer.torn else { return }
+
+                // Thumbnail rendering guard for multi-view (post-pool robustness).
+                // Background thumbnails have vid=no + pause + drop-buffers via
+                // configureResources; we drop mpv update callbacks here to avoid
+                // waking the GL render path and main-thread setNeeds for 8 tiny
+                // layers. Promotion (focus) re-enables vid + unpauses, mpv resumes
+                // emitting frames, and callbacks flow again. Prevents CPU/GPU
+                // thrash in 9-view (addresses Agent 04 #2/6 + Master Tier 0 #2).
+                if let p = layer.player,
+                   p.videoDisabledForBackground,
+                   layer.bounds.height < 140 {
+                    return
+                }
+
                 layer.setNeedsDisplay()
             }
         }, context: ptr)
@@ -263,7 +277,13 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         forLayerTime t: CFTimeInterval,
         displayTime ts: UnsafePointer<CVTimeStamp>?
     ) -> Bool {
-        return renderReady && !torn
+        guard renderReady && !torn else { return false }
+        // Extra guard: never draw for disabled bg thumbnails even if a
+        // stale setNeedsDisplay sneaks through during rapid layout changes.
+        if let p = player, p.videoDisabledForBackground, bounds.height < 140 {
+            return false
+        }
+        return true
     }
 
     @available(macOS, deprecated: 10.14)
@@ -274,6 +294,12 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         displayTime ts: UnsafePointer<CVTimeStamp>?
     ) {
         guard renderReady, !torn, let renderCtx = player?.renderContextHandle else {
+            glClearColor(0, 0, 0, 1)
+            glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
+            return
+        }
+        // Thumbnail guard (defense-in-depth for layout-change races / pooled reuse).
+        if let p = player, p.videoDisabledForBackground, bounds.height < 140 {
             glClearColor(0, 0, 0, 1)
             glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
             return

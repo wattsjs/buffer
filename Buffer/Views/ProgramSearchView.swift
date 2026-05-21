@@ -1,10 +1,13 @@
 import SwiftUI
 
 nonisolated struct ProgramSearchEntry: Sendable {
-    let program: EPGProgram
-    let channel: Channel
+    let id: String
+    let epgID: String
+    let programIndex: Int
+    let channelID: String
     let titleLower: String
-    let channelNameLower: String
+    let start: Date
+    let end: Date
 }
 
 nonisolated struct ChannelSearchEntry: Sendable {
@@ -56,7 +59,9 @@ final class ProgramSearchController {
     var isSearching: Bool = false
 
     private var programEntries: [ProgramSearchEntry] = []
+    private var programStore: [String: [EPGProgram]] = [:]
     private var channelEntries: [ChannelSearchEntry] = []
+    private var channelByID: [String: Channel] = [:]
     private var vodEntries: [VODSearchEntry] = []
     private var currentTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
@@ -69,8 +74,16 @@ final class ProgramSearchController {
         programResults.count + channelResults.count + vodResults.count
     }
 
-    func updateIndex(programs: [ProgramSearchEntry], channels: [Channel], vodItems: [VODItem], vodSeries: [VODSeries]) {
+    func updateIndex(
+        programs: [ProgramSearchEntry],
+        programStore: [String: [EPGProgram]],
+        channels: [Channel],
+        vodItems: [VODItem],
+        vodSeries: [VODSeries]
+    ) {
         self.programEntries = programs
+        self.programStore = programStore
+        self.channelByID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         self.channelEntries = channels.map {
             ChannelSearchEntry(channel: $0, nameLower: $0.name.lowercased())
         }
@@ -137,11 +150,13 @@ final class ProgramSearchController {
         }
 
         let programSnapshot = programEntries
+        let programStoreSnapshot = programStore
         let channelSnapshot = channelEntries
+        let channelByIDSnapshot = channelByID
         let vodSnapshot = vodEntries
         let now = Date()
 
-        currentTask = Task.detached(priority: .userInitiated) { [trimmed, programSnapshot, channelSnapshot, vodSnapshot, now] in
+        currentTask = Task.detached(priority: .userInitiated) { [trimmed, programSnapshot, programStoreSnapshot, channelSnapshot, channelByIDSnapshot, vodSnapshot, now] in
             let tokens = trimmed
                 .split(whereSeparator: { $0 == " " || $0 == "\t" })
                 .map(String.init)
@@ -174,11 +189,13 @@ final class ProgramSearchController {
                     score += 10
                 }
 
-                let p = entry.program
-                if p.start <= now && p.end > now {
+                let start = entry.start
+                let end = entry.end
+                guard let channel = channelByIDSnapshot[entry.channelID] else { continue }
+                if start <= now && end > now {
                     score += 80
-                } else if p.start > now {
-                    let minutes = p.start.timeIntervalSince(now) / 60
+                } else if start > now {
+                    let minutes = start.timeIntervalSince(now) / 60
                     if minutes < 24 * 60 {
                         score += 40 - (minutes / (24 * 60)) * 40
                     } else if minutes < 7 * 24 * 60 {
@@ -188,7 +205,8 @@ final class ProgramSearchController {
                     score -= 40
                 }
 
-                programHits.append(ProgramSearchResult(program: p, channel: entry.channel, score: score))
+                guard let p = Self.program(for: entry, in: programStoreSnapshot) else { continue }
+                programHits.append(ProgramSearchResult(program: p, channel: channel, score: score))
             }
 
             if Task.isCancelled { return }
@@ -286,6 +304,18 @@ final class ProgramSearchController {
                 self.isSearching = false
             }
         }
+    }
+
+    nonisolated private static func program(
+        for entry: ProgramSearchEntry,
+        in store: [String: [EPGProgram]]
+    ) -> EPGProgram? {
+        guard let programs = store[entry.epgID] else { return nil }
+        if programs.indices.contains(entry.programIndex) {
+            let candidate = programs[entry.programIndex]
+            if candidate.id == entry.id { return candidate }
+        }
+        return programs.first { $0.id == entry.id }
     }
 }
 
@@ -788,18 +818,12 @@ private struct VODSearchPoster: View {
             RoundedRectangle(cornerRadius: 7, style: .continuous)
                 .fill(Color.primary.opacity(0.05))
 
-            if let url {
-                AsyncImage(url: url) { image in
-                    image
-                        .resizable()
-                        .interpolation(.high)
-                        .scaledToFill()
-                } placeholder: {
-                    fallbackIcon
-                }
-            } else {
-                fallbackIcon
-            }
+            RemoteArtworkView(
+                url: url,
+                fallbackSystemImage: fallbackSystemImage,
+                width: 54,
+                height: 81
+            )
         }
         .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         .overlay(
@@ -890,7 +914,11 @@ private struct ProgramResultRow: View {
                 onPlay: {
                     showPopover = false
                     if canPlayFromCatchup {
-                        PendingCatchup.set(channelID: result.channel.id, start: result.program.start)
+                        PendingCatchup.set(
+                            channelID: result.channel.id,
+                            start: result.program.start,
+                            duration: result.program.duration
+                        )
                     }
                     onSelect()
                 }

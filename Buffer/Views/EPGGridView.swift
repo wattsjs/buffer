@@ -5,35 +5,128 @@ struct EPGGridView: View {
     let hasLoadedOnce: Bool
     var revealChannelID: String? = nil
     let programsProvider: (Channel) -> [EPGProgram]
+    /// Optional ranged provider backed by pre-buckets in VM. When present, rowData + ProgramRow receive
+    /// only programs intersecting the current timeline window (makes buildRowData/buildBlocks allocation-free for the window).
+    var rangedProgramsProvider: ((Channel, Date, Date) -> [EPGProgram])? = nil
     let isFavorite: (Channel) -> Bool
     let onToggleFavorite: (Channel) -> Void
     let onChannelSelected: (Channel) -> Void
 
     @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
 
+    @State private var loadedCatchupPastHours = 6
+    @State private var prependAdjustmentID = 0
+    @State private var prependAdjustmentPixels: CGFloat = 0
+
+    // Lightweight "now" ticker (Agent 02 + 09). Updates every 20 s so the red
+    // live line and "LIVE" badges stay accurate without relying
+    // on incidental re-renders from syncs or user actions.
+    @State private var now = Date()
+    @State private var nowTicker: Task<Void, Never>? = nil
+
     private let channelColumnWidth: CGFloat = 120
     private let rowHeight: CGFloat = 64
     private let pixelsPerMinute: CGFloat = 4
     private let headerHeight: CGFloat = 32
-    private let timelineHours = 12
+    private let minimumPastTimelineHours = 1
+    private let initialCatchupPastTimelineHours = 6
+    private let catchupPastLoadStepHours = 6
+    private let futureTimelineHours = 11
 
-    private var timelineWidth: CGFloat {
-        CGFloat(timelineHours * 60) * pixelsPerMinute
+    private func timelineHours(timelineStart: Date, timelineEnd: Date) -> Int {
+        max(1, Int(ceil(timelineEnd.timeIntervalSince(timelineStart) / 3600)))
     }
 
-    private func makeTimelineStart(from now: Date) -> Date {
+    private func timelineWidth(hours: Int) -> CGFloat {
+        CGFloat(hours * 60) * pixelsPerMinute
+    }
+
+    private func pastTimelineHours(for channels: [Channel]) -> Int {
+        guard channels.contains(where: \.supportsRewind) else { return minimumPastTimelineHours }
+        return min(max(loadedCatchupPastHours, initialCatchupPastTimelineHours), maxPastTimelineHours(for: channels, now: now))
+    }
+
+    private func maxPastTimelineHours(for channels: [Channel], now: Date) -> Int {
+        let earliest = earliestCatchupTimelineStart(for: channels, now: now)
+        guard let earliest else { return minimumPastTimelineHours }
+        let hours = Int(ceil(now.timeIntervalSince(earliest) / 3600))
+        return max(minimumPastTimelineHours, hours)
+    }
+
+    private func earliestCatchupTimelineStart(for channels: [Channel], now: Date) -> Date? {
+        channels
+            .compactMap { channel -> Date? in
+                guard let days = channel.catchup?.days, days > 0 else { return nil }
+                let catchupStart = now.addingTimeInterval(-Double(days) * 86400)
+                return programsProvider(channel)
+                    .lazy
+                    .filter { $0.start < now && $0.end > catchupStart }
+                    .map { max($0.start, catchupStart) }
+                    .min()
+            }
+            .min()
+            .map { floorToHalfHour($0) }
+    }
+
+    // MARK: - Live "now" ticker (Agent 02/09)
+
+    private func startNowTicker() {
+        guard nowTicker == nil else { return }
+        now = Date()
+        nowTicker = Task { @MainActor in
+            while !Task.isCancelled {
+                if AppLifecycleCoordinator.shared.shouldPauseBackgroundWork {
+                    try? await Task.sleep(for: .seconds(30))
+                    continue
+                }
+                try? await Task.sleep(for: .seconds(20))
+                now = Date()
+            }
+        }
+    }
+
+    private func stopNowTicker() {
+        nowTicker?.cancel()
+        nowTicker = nil
+    }
+
+    private func initialTimelineOffset(timelineStart: Date, now: Date) -> CGFloat {
+        let target = now.addingTimeInterval(-Double(minimumPastTimelineHours) * 3600)
+        return CGFloat(max(0, target.timeIntervalSince(timelineStart) / 60)) * pixelsPerMinute
+    }
+
+    private func timelineIdentity(for channels: [Channel], maxPastHours: Int) -> AnyHashable {
+        AnyHashable("\(channels.map(\.id).joined(separator: "\u{1F}"))|\(maxPastHours)")
+    }
+
+    private func makeTimelineStart(from now: Date, pastHours: Int, channels: [Channel]) -> Date {
         let cal = Calendar.current
-        let hour = cal.component(.hour, from: now) - 1
-        return cal.date(bySettingHour: hour, minute: 0, second: 0, of: now) ?? now
+        let currentHour = cal.dateInterval(of: .hour, for: now)?.start ?? now
+        let requested = currentHour.addingTimeInterval(-Double(pastHours) * 60 * 60)
+        guard let earliest = earliestCatchupTimelineStart(for: channels, now: now) else { return requested }
+        return max(requested, earliest)
     }
 
-    private func makeNowX(now: Date, timelineStart: Date) -> CGFloat? {
+    private func makeTimelineEnd(from now: Date) -> Date {
+        let cal = Calendar.current
+        let currentHour = cal.dateInterval(of: .hour, for: now)?.start ?? now
+        return currentHour.addingTimeInterval(Double(futureTimelineHours) * 3600)
+    }
+
+    private func floorToHalfHour(_ date: Date) -> Date {
+        let cal = Calendar.current
+        let hourStart = cal.dateInterval(of: .hour, for: date)?.start ?? date
+        let minute = cal.component(.minute, from: date)
+        return hourStart.addingTimeInterval(minute >= 30 ? 30 * 60 : 0)
+    }
+
+    private func makeNowX(now: Date, timelineStart: Date, timelineWidth: CGFloat) -> CGFloat? {
         let offset = now.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute)
         guard offset > 0, offset < Double(timelineWidth) else { return nil }
         return CGFloat(offset)
     }
 
-    private func timeSlots(from timelineStart: Date) -> [Date] {
+    private func timeSlots(from timelineStart: Date, timelineHours: Int) -> [Date] {
         (0..<(timelineHours * 2)).map { i in
             timelineStart.addingTimeInterval(Double(i) * 30 * 60)
         }
@@ -45,6 +138,13 @@ struct EPGGridView: View {
             .lowercased()
     }
 
+    private static func headerTime(_ date: Date, relativeTo now: Date) -> String {
+        if Calendar.current.isDate(date, inSameDayAs: now) {
+            return date.formatted(date: .omitted, time: .shortened)
+        }
+        return date.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+    }
+
     var body: some View {
         if channels.isEmpty && hasLoadedOnce {
             ContentUnavailableView(
@@ -53,14 +153,18 @@ struct EPGGridView: View {
                 description: Text("Add a server in Settings to load channels.")
             )
         } else if !channels.isEmpty {
-            // Snapshot once so the red line and every row's aired shading
-            // resolve against the exact same `now` — otherwise the Canvas's
-            // nowX and the NSView line can be computed from separate Date()
-            // reads and drift apart visually.
-            let now = Date()
-            let timelineStart = makeTimelineStart(from: now)
-            let nowX = makeNowX(now: now, timelineStart: timelineStart)
-            let width = timelineWidth
+            // Use the ticker-driven `now` (updated every ~20 s) instead of a fresh
+            // Date() on every body evaluation. This makes the live line and badges
+            // accurate and smooth while avoiding full grid rebuilds on every tick.
+            let now = self.now
+            let pastHours = pastTimelineHours(for: channels)
+            let timelineStart = makeTimelineStart(from: now, pastHours: pastHours, channels: channels)
+            let timelineEnd = makeTimelineEnd(from: now)
+            let timelineHours = timelineHours(timelineStart: timelineStart, timelineEnd: timelineEnd)
+            let width = timelineWidth(hours: timelineHours)
+            let nowX = makeNowX(now: now, timelineStart: timelineStart, timelineWidth: width)
+            let maxPastHours = maxPastTimelineHours(for: channels, now: now)
+            let canLoadMorePast = channels.contains(where: \.supportsRewind) && pastHours < maxPastHours
 
             EPGScrollGrid(
                 items: channels,
@@ -69,11 +173,18 @@ struct EPGGridView: View {
                 programRowWidth: width,
                 headerHeight: headerHeight,
                 nowLineX: nowX,
+                initialHorizontalOffset: initialTimelineOffset(timelineStart: timelineStart, now: now),
+                horizontalPrependAdjustment: HorizontalPrependAdjustment(
+                    id: prependAdjustmentID,
+                    pixels: prependAdjustmentPixels
+                ),
+                timelineIdentity: timelineIdentity(for: channels, maxPastHours: maxPastHours),
                 channelNameProvider: { $0.name },
-                rowDataProvider: { [programsProvider, timelineStart, pixelsPerMinute, timelineHours] channel in
-                    Self.buildRowData(
+                rowDataProvider: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd = timelineEnd, pixelsPerMinute, timelineHours] channel in
+                    let progs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
+                    return Self.buildRowData(
                         channel: channel,
-                        programs: programsProvider(channel),
+                        programs: progs,
                         timelineStart: timelineStart,
                         pixelsPerMinute: pixelsPerMinute,
                         timelineHours: timelineHours,
@@ -93,16 +204,16 @@ struct EPGGridView: View {
                     .id(channel.id)
                     .fadeIfStreamDead(channelID: channel.id)
                 },
-                programContent: { channel in
-                    ProgramRow(
+                programContent: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd = timelineEnd] channel in
+                    let progs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
+                    return ProgramRow(
                         channel: channel,
-                        programs: programsProvider(channel),
+                        programs: progs,
                         fallbackTitle: channel.name,
                         timelineStart: timelineStart,
                         timelineWidth: width,
                         pixelsPerMinute: pixelsPerMinute,
                         rowHeight: rowHeight,
-                        nowX: nowX,
                         onPlay: { onChannelSelected(channel) },
                         playlistID: activePlaylistID
                     )
@@ -112,10 +223,31 @@ struct EPGGridView: View {
                     }
                     .fadeIfStreamDead(channelID: channel.id)
                 },
-                headerContent: { timeStrip(timelineStart: timelineStart) },
-                cornerContent: { cornerLabel }
+                headerContent: { timeStrip(timelineStart: timelineStart, timelineHours: timelineHours, now: now) },
+                cornerContent: { cornerLabel },
+                onNearLeadingEdge: {
+                    guard canLoadMorePast else { return }
+                    let currentNow = Date()
+                    let currentMaxPastHours = maxPastTimelineHours(for: channels, now: currentNow)
+                    let currentTimelineStart = makeTimelineStart(from: currentNow, pastHours: pastHours, channels: channels)
+                    let next = min(pastHours + catchupPastLoadStepHours, currentMaxPastHours)
+                    let nextStart = makeTimelineStart(from: currentNow, pastHours: next, channels: channels)
+                    let deltaPixels = CGFloat(max(0, currentTimelineStart.timeIntervalSince(nextStart) / 60)) * pixelsPerMinute
+                    guard deltaPixels > 1 else { return }
+                    self.now = currentNow
+                    loadedCatchupPastHours = next
+                    prependAdjustmentPixels = deltaPixels
+                    prependAdjustmentID += 1
+                }
             )
             .background(Color(nsColor: .textBackgroundColor))
+            .onChange(of: channels.map(\.id)) { _, _ in
+                loadedCatchupPastHours = initialCatchupPastTimelineHours
+                prependAdjustmentID = 0
+                prependAdjustmentPixels = 0
+            }
+            .onAppear { startNowTicker() }
+            .onDisappear { stopNowTicker() }
         }
     }
 
@@ -161,17 +293,18 @@ struct EPGGridView: View {
         return ChannelLabelRowData(channelName: channel.name, blocks: blocks)
     }
 
-    private func timeStrip(timelineStart: Date) -> some View {
+    private func timeStrip(timelineStart: Date, timelineHours: Int, now: Date) -> some View {
         HStack(spacing: 0) {
-            ForEach(timeSlots(from: timelineStart), id: \.self) { time in
-                Text(time, format: .dateTime.hour().minute())
+            ForEach(timeSlots(from: timelineStart, timelineHours: timelineHours), id: \.self) { time in
+                Text(Self.headerTime(time, relativeTo: now))
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
                     .frame(width: 30 * pixelsPerMinute, alignment: .leading)
                     .padding(.leading, 6)
             }
         }
-        .frame(width: timelineWidth, height: headerHeight, alignment: .leading)
+        .frame(width: timelineWidth(hours: timelineHours), height: headerHeight, alignment: .leading)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
     }
@@ -293,7 +426,6 @@ private struct ProgramRow: View {
     let timelineWidth: CGFloat
     let pixelsPerMinute: CGFloat
     let rowHeight: CGFloat
-    let nowX: CGFloat?
     let onPlay: () -> Void
 
     @State private var selectedProgram: EPGProgram?
@@ -320,7 +452,6 @@ private struct ProgramRow: View {
             timelineWidth: timelineWidth,
             pixelsPerMinute: pixelsPerMinute,
             rowHeight: rowHeight,
-            nowX: nowX,
             reminderProgramIDs: reminderProgramIDs,
             onProgramTap: { program, rect in
                 selectedRect = rect
@@ -372,7 +503,6 @@ private struct ProgramCanvasLayer: View, Equatable {
     let timelineWidth: CGFloat
     let pixelsPerMinute: CGFloat
     let rowHeight: CGFloat
-    let nowX: CGFloat?
     let reminderProgramIDs: Set<String>
     let onProgramTap: (EPGProgram, CGRect) -> Void
     let onEmptyTap: () -> Void
@@ -383,7 +513,6 @@ private struct ProgramCanvasLayer: View, Equatable {
               lhs.timelineWidth == rhs.timelineWidth,
               lhs.pixelsPerMinute == rhs.pixelsPerMinute,
               lhs.rowHeight == rhs.rowHeight,
-              lhs.nowX == rhs.nowX,
               lhs.fallbackTitle == rhs.fallbackTitle,
               lhs.reminderProgramIDs == rhs.reminderProgramIDs,
               lhs.programs.count == rhs.programs.count else { return false }
@@ -462,7 +591,6 @@ private struct ProgramCanvasLayer: View, Equatable {
     var body: some View {
         let blocks = buildBlocks()
         let fill = Color(nsColor: .quaternaryLabelColor).opacity(0.5)
-        let nowFill = Color(nsColor: .tertiaryLabelColor).opacity(0.55)
         let border = Color(nsColor: .separatorColor)
         let textPrimary = Color.primary
         let textSecondary = Color.secondary
@@ -472,17 +600,6 @@ private struct ProgramCanvasLayer: View, Equatable {
                 let inset = block.rect.insetBy(dx: 1, dy: 0)
                 let path = Path(roundedRect: inset, cornerRadius: 3)
                 context.fill(path, with: .color(fill))
-                if !block.isFallback,
-                   let nowX,
-                   nowX > inset.minX,
-                   nowX < inset.maxX {
-                    let airedWidth = nowX - inset.minX
-                    let airedRect = CGRect(x: inset.minX, y: inset.minY, width: airedWidth, height: inset.height)
-                    context.drawLayer { layer in
-                        layer.clip(to: path)
-                        layer.fill(Path(airedRect), with: .color(nowFill))
-                    }
-                }
                 context.stroke(path, with: .color(border), lineWidth: 0.5)
 
                 let textRect = inset.insetBy(dx: 8, dy: 6)
@@ -650,7 +767,11 @@ struct ProgramDetailPopover: View {
             HStack(spacing: 8) {
                 if canPlayFromCatchup {
                     Button {
-                        PendingCatchup.set(channelID: channel.id, start: program.start)
+                        PendingCatchup.set(
+                            channelID: channel.id,
+                            start: program.start,
+                            duration: program.duration
+                        )
                         onPlay()
                     } label: {
                         Label("Play from start", systemImage: "play.fill")

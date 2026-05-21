@@ -11,15 +11,39 @@ final class PlayerSessionRegistry {
 
     private(set) var activeSession: PlayerSession?
 
+    /// All currently live player sessions (across any number of player
+    /// windows). Used by AppLifecycleCoordinator to pause/resume watchdogs
+    /// on every open PlayerSlot during sleep/wake. Sessions are added on
+    /// setActive and removed on explicit unregister (from onDisappear).
+    private(set) var allSessions: [PlayerSession] = []
+
     private init() {}
 
     func setActive(_ session: PlayerSession) {
         activeSession = session
+        if !allSessions.contains(where: { $0 === session }) {
+            allSessions.append(session)
+        }
     }
 
     func unregister(_ session: PlayerSession) {
         if activeSession === session {
             activeSession = nil
+        }
+        allSessions.removeAll { $0 === session }
+    }
+
+    // MARK: - Lifecycle passthrough (Agent 09)
+
+    func pauseAllBackgroundWork() {
+        for session in allSessions {
+            session.pauseAllBackgroundWork()
+        }
+    }
+
+    func resumeAllBackgroundWork() {
+        for session in allSessions {
+            session.resumeAllBackgroundWork()
         }
     }
 }

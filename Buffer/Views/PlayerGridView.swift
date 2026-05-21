@@ -13,9 +13,15 @@ struct PlayerGridView: View {
 
     private let gap: CGFloat = 4
 
+    // Memoized layout rects (Agent 04). Avoids repeated dict allocation +
+    // frame math on every SwiftUI body evaluation when only non-layout state
+    // (e.g. hover, volume, stats) changed.
+    @State private var cachedRects: [UUID: CGRect] = [:]
+    @State private var cachedKey: String = ""
+
     var body: some View {
         GeometryReader { proxy in
-            let rects = computeRects(in: proxy.size)
+            let rects = rectsForCurrentState(in: proxy.size)
             ZStack(alignment: .topLeading) {
                 ForEach(session.slots, id: \.id) { slot in
                     let rect = rects[slot.id] ?? .zero
@@ -29,20 +35,43 @@ struct PlayerGridView: View {
                     )
                     .frame(width: max(rect.width, 1), height: max(rect.height, 1))
                     .offset(x: rect.origin.x, y: rect.origin.y)
+                    // Smooth position/size transitions on focus, add/remove, layout switch.
+                    // Eliminates the "teleport" / snap that occurred on rect recompute
+                    // after pool/reuse work (addresses Agent 04 P0 + Master Tier 0 #5).
+                    .animation(.spring(response: 0.28, dampingFraction: 0.82), value: rect)
                 }
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
+        .onChange(of: session.layout) { _, _ in invalidateLayoutCache() }
+        .onChange(of: session.slots.map(\.id)) { _, _ in invalidateLayoutCache() }
+        .onChange(of: session.focusedSlotID) { _, _ in invalidateLayoutCache() }
     }
 
-    // MARK: - Layout math
+    // MARK: - Layout math (memoized)
 
-    private func computeRects(in size: CGSize) -> [UUID: CGRect] {
+    private func rectsForCurrentState(in size: CGSize) -> [UUID: CGRect] {
+        let key = layoutCacheKey(for: size)
+        if key == cachedKey, !cachedRects.isEmpty {
+            return cachedRects
+        }
         var result: [UUID: CGRect] = [:]
         for (index, slot) in session.slots.enumerated() {
             result[slot.id] = frame(at: index, slotID: slot.id, in: size)
         }
+        cachedRects = result
+        cachedKey = key
         return result
+    }
+
+    private func layoutCacheKey(for size: CGSize) -> String {
+        let slotIDs = session.slots.map { $0.id.uuidString }.joined(separator: ",")
+        return "\(session.layout.rawValue)|\(Int(size.width))x\(Int(size.height))|\(slotIDs)|\(session.focusedSlotID.uuidString)"
+    }
+
+    private func invalidateLayoutCache() {
+        cachedKey = ""
+        cachedRects = [:]
     }
 
     private func frame(at index: Int, slotID: UUID, in size: CGSize) -> CGRect {
