@@ -40,17 +40,33 @@ struct ContentView: View {
     }
 
     private func openVODItem(_ item: VODItem, resumePosition: Double? = nil) {
-        let channel = item.playbackChannel
-        viewModel.noteVODOpened(item)
-        if selectedPlayer != .none {
-            AppLog.playback.info("Opening VOD externally name=\(item.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
-            ExternalPlayer.launch(streamURL: item.streamURL, using: selectedPlayer)
-        } else {
-            if let resumePosition, resumePosition > 0 {
-                PendingVODResume.set(channelID: channel.id, positionSeconds: resumePosition)
+        Task {
+            do {
+                let playableItem = try await viewModel.resolveVODItemForPlayback(item)
+                let channel = playableItem.playbackChannel
+                viewModel.noteVODOpened(playableItem)
+                if selectedPlayer != .none {
+                    AppLog.playback.info("Opening VOD externally name=\(playableItem.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
+                    ExternalPlayer.launch(streamURL: playableItem.streamURL, using: selectedPlayer)
+                } else {
+                    if let resumePosition, resumePosition > 0 {
+                        PendingVODResume.set(channelID: channel.id, positionSeconds: resumePosition)
+                    }
+                    AppLog.playback.info("Opening VOD in Buffer name=\(playableItem.name, privacy: .public)")
+                    openWindow(value: channel)
+                }
+            } catch {
+                AppLog.playback.error("Failed to resolve VOD playback URL error=\(error.localizedDescription, privacy: .public)")
+                appFeedback.show(
+                    AppFeedbackMessage(
+                        title: "Couldn’t start video",
+                        message: error.localizedDescription,
+                        symbol: "exclamationmark.triangle.fill",
+                        tone: .warning,
+                        showsActivity: false
+                    )
+                )
             }
-            AppLog.playback.info("Opening VOD in Buffer name=\(item.name, privacy: .public)")
-            openWindow(value: channel)
         }
     }
 
@@ -370,7 +386,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                Text("Xtream Codes and M3U supported")
+                Text("Xtream Codes, Stalker/MAG, and M3U supported")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

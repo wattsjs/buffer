@@ -43,4 +43,15 @@ struct ServerAccountStatus: Codable, Equatable {
         isAuthenticated = info.isAuthenticated
         lastChecked = .now
     }
+
+    mutating func apply(_ info: StalkerAccountInfo) {
+        accountStatus = info.statusLabel
+        expiryDate = info.expiryDate
+        activeConnections = nil
+        maxConnections = nil
+        username = info.macAddress
+        isTrial = nil
+        isAuthenticated = info.isAuthenticated
+        lastChecked = .now
+    }
 }

@@ -65,6 +65,8 @@ nonisolated enum DataCache {
         switch config.type {
         case .xtream:
             raw = "xtream|\(config.xtreamBaseURL)|\(config.username)"
+        case .stalker:
+            raw = "stalker|\(config.stalkerRootBaseURL)|\(config.stalkerMACAddress)"
         case .m3u:
             let m3uKey = cacheInput(for: config.m3uSourceURL, fallback: config.m3uURL)
             let epgKey = cacheInput(for: config.epgSourceURL, fallback: config.epgURL)

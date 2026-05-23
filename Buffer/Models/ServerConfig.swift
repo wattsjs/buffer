@@ -2,6 +2,7 @@ import Foundation
 
 enum ServerType: String, Codable, CaseIterable {
     case xtream = "Xtream Codes"
+    case stalker = "Stalker / MAG"
     case m3u = "M3U Playlist"
 }
 
@@ -10,7 +11,8 @@ struct ServerConfig: Identifiable, Codable, Sendable {
     var name: String
     var type: ServerType
 
-    // Xtream fields
+    // Xtream and Stalker/MAG fields. For Stalker/MAG, `username` stores the
+    // device MAC address and `password` is reserved for portals that require it.
     var serverURL: String
     var username: String
     var password: String
@@ -46,6 +48,26 @@ struct ServerConfig: Identifiable, Codable, Sendable {
 
     nonisolated var xtreamEPGURL: URL? {
         URL(string: "\(xtreamBaseURL)/xmltv.php?username=\(username)&password=\(password)")
+    }
+
+    nonisolated var stalkerRootBaseURL: String {
+        var trimmed = xtreamBaseURL
+        if trimmed.hasSuffix("/c") {
+            trimmed.removeLast(2)
+        }
+        return trimmed
+    }
+
+    nonisolated var stalkerPortalURL: URL? {
+        URL(string: "\(stalkerRootBaseURL)/c/")
+    }
+
+    nonisolated var stalkerAPIURL: URL? {
+        URL(string: "\(stalkerRootBaseURL)/server/load.php")
+    }
+
+    nonisolated var stalkerMACAddress: String {
+        username.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
     }
 
     nonisolated var m3uSourceURL: URL? {

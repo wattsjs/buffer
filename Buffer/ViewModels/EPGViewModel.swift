@@ -577,23 +577,21 @@ class EPGViewModel {
 
         do {
             if scope == .all {
-                if config.type == .xtream,
-                   let accountInfo = try? await XtreamClient(config: config).fetchAccountInfo() {
-                    syncedStatus.apply(accountInfo)
+                switch config.type {
+                case .xtream:
+                    if let accountInfo = try? await XtreamClient(config: config).fetchAccountInfo() {
+                        syncedStatus.apply(accountInfo)
+                    }
+                case .stalker:
+                    if let accountInfo = try? await StalkerClient(config: config).fetchAccountInfo() {
+                        syncedStatus.apply(accountInfo)
+                    }
+                case .m3u:
+                    break
                 }
 
                 let freshChannels = try await fetchChannels(config: config)
                 syncedStatus.channelCount = freshChannels.count
-                let freshVODItems: [VODItem]
-                let freshSeries: [VODSeries]
-                if isVODDisabled {
-                    freshVODItems = []
-                    freshSeries = []
-                } else {
-                    freshVODItems = try await fetchVODItems(config: config)
-                    freshSeries = try await fetchSeries(config: config, vodItems: freshVODItems)
-                }
-
                 if !freshChannels.isEmpty {
                     channels = freshChannels
                     rebuildSearchIndex()
@@ -602,6 +600,18 @@ class EPGViewModel {
                         DataCache.saveChannels(freshChannels, key: cacheKey)
                     }
                 }
+                let freshVODItems: [VODItem]
+                let freshSeries: [VODSeries]
+                if isVODDisabled {
+                    freshVODItems = []
+                    freshSeries = []
+                } else {
+                    if !silent { loadingStage = "Loading movies…" }
+                    freshVODItems = try await fetchVODItems(config: config)
+                    if !silent { loadingStage = "Loading series…" }
+                    freshSeries = try await fetchSeries(config: config, vodItems: freshVODItems)
+                }
+
                 vodItems = freshVODItems
                 vodSeries = freshSeries
                 vodItemDetails = [:]
@@ -619,7 +629,30 @@ class EPGViewModel {
                 syncedStatus.channelCount = channels.count
             }
 
-            if let epgURL = epgURL(for: config) {
+            if config.type == .stalker {
+                if !silent { loadingStage = "Loading guide…" }
+                do {
+                    let allPrograms = try await StalkerClient(config: config).fetchEPG()
+                    if !silent { loadingStage = "Organizing guide…" }
+                    let organized = await Task.detached(priority: .userInitiated) {
+                        Self.organize(allPrograms)
+                    }.value
+                    programs = organized
+                    rebuildProgramHourBuckets()
+                    rebuildSearchIndex()
+                    syncedStatus.guideStatus = "Reachable"
+
+                    Task.detached(priority: .utility) {
+                        DataCache.savePrograms(organized, key: cacheKey)
+                    }
+                } catch {
+                    AppLog.sync.error("Stalker EPG fetch failed error=\(error.localizedDescription, privacy: .public)")
+                    syncedStatus.guideStatus = "Unavailable"
+                    if !silent, programs.isEmpty {
+                        errorMessage = "Guide unavailable: \(error.localizedDescription)"
+                    }
+                }
+            } else if let epgURL = epgURL(for: config) {
                 if !silent { loadingStage = "Loading guide…" }
                 do {
                     let allPrograms = try await XMLTVParser.parse(from: epgURL)
@@ -768,11 +801,17 @@ class EPGViewModel {
             ? (serverStatus ?? ServerAccountStatus.initial(for: config, cacheKey: statusKey))
             : ServerAccountStatus.initial(for: config, cacheKey: statusKey)
         refreshed.channelCount = channels.count
-        refreshed.guideStatus = epgURL(for: config) == nil ? "Not configured" : refreshed.guideStatus
+        if config.type == .m3u, epgURL(for: config) == nil {
+            refreshed.guideStatus = "Not configured"
+        }
 
         switch config.type {
         case .xtream:
             if let info = try? await XtreamClient(config: config).fetchAccountInfo() {
+                refreshed.apply(info)
+            }
+        case .stalker:
+            if let info = try? await StalkerClient(config: config).fetchAccountInfo() {
                 refreshed.apply(info)
             }
         case .m3u:
@@ -787,6 +826,8 @@ class EPGViewModel {
         case .xtream:
             let client = XtreamClient(config: config)
             return try await client.fetchChannels()
+        case .stalker:
+            return try await StalkerClient(config: config).fetchChannels()
         case .m3u:
             guard let url = config.m3uSourceURL else {
                 throw XtreamError.invalidURL
@@ -800,6 +841,8 @@ class EPGViewModel {
         case .xtream:
             let client = XtreamClient(config: config)
             return (try? await client.fetchVODItems()) ?? []
+        case .stalker:
+            return (try? await StalkerClient(config: config).fetchVODItems()) ?? []
         case .m3u:
             guard let url = config.m3uSourceURL else {
                 throw XtreamError.invalidURL
@@ -812,6 +855,8 @@ class EPGViewModel {
         switch config.type {
         case .xtream:
             return (try? await XtreamClient(config: config).fetchSeries()) ?? []
+        case .stalker:
+            return (try? await StalkerClient(config: config).fetchSeries()) ?? []
         case .m3u:
             return seriesFromM3UEpisodes(vodItems)
         }
@@ -874,14 +919,22 @@ class EPGViewModel {
             return
         }
 
-        guard let config = serverConfig, config.type == .xtream else {
+        guard let config = serverConfig, config.type == .xtream || config.type == .stalker else {
             seriesEpisodes[series.id] = []
             seriesEpisodeLoadErrors[series.id] = nil
             return
         }
 
         do {
-            let episodes = try await XtreamClient(config: config).fetchSeriesEpisodes(series: series)
+            let episodes: [VODItem]
+            switch config.type {
+            case .xtream:
+                episodes = try await XtreamClient(config: config).fetchSeriesEpisodes(series: series)
+            case .stalker:
+                episodes = try await StalkerClient(config: config).fetchSeriesEpisodes(series: series)
+            case .m3u:
+                episodes = []
+            }
             seriesEpisodes[series.id] = episodes
             seriesEpisodeLoadErrors[series.id] = nil
             searchIndexVersion &+= 1
@@ -955,9 +1008,40 @@ class EPGViewModel {
         switch config.type {
         case .xtream:
             return config.xtreamEPGURL
+        case .stalker:
+            return nil
         case .m3u:
             return config.epgSourceURL
         }
+    }
+
+    func resolveVODItemForPlayback(_ item: VODItem) async throws -> VODItem {
+        guard let config = serverConfig,
+              config.type == .stalker,
+              StalkerClient.isPlaceholderURL(item.streamURL) else {
+            return item
+        }
+
+        let resolvedURL = try await StalkerClient(config: config).resolvePlaybackURL(for: item)
+        return VODItem(
+            id: item.id,
+            name: item.name,
+            posterURL: item.posterURL,
+            group: item.group,
+            streamURL: resolvedURL,
+            kind: item.kind,
+            genre: item.genre,
+            durationSeconds: item.durationSeconds,
+            rating: item.rating,
+            releaseDate: item.releaseDate,
+            containerExtension: item.containerExtension,
+            summary: item.summary,
+            director: item.director,
+            cast: item.cast,
+            country: item.country,
+            seasonNumber: item.seasonNumber,
+            episodeNumber: item.episodeNumber
+        )
     }
 
     // MARK: - Search index

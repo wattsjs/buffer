@@ -138,7 +138,7 @@ private struct SourcesSettingsTab: View {
                 .foregroundStyle(.secondary)
             Text("Add a source")
                 .font(.title3.weight(.semibold))
-            Text("Connect an Xtream Codes account or M3U playlist.")
+            Text("Connect an Xtream Codes account, Stalker/MAG portal, or M3U playlist.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 360)
@@ -397,6 +397,12 @@ private struct PlaylistEditor: View {
                     TextField("Username", text: $draft.username)
                     SecureField("Password", text: $draft.password)
                 }
+            case .stalker:
+                Section("Stalker / MAG") {
+                    TextField("Portal URL", text: $draft.serverURL, prompt: Text("http://example.com/c/"))
+                    TextField("MAC Address", text: $draft.username, prompt: Text("00:1A:79:AA:BB:CC"))
+                    SecureField("Portal Password", text: $draft.password)
+                }
             case .m3u:
                 Section("M3U Playlist") {
                     TextField("Playlist URL", text: $draft.m3uURL, prompt: Text("https://example.com/playlist.m3u"))
@@ -552,6 +558,8 @@ private struct PlaylistEditor: View {
         switch draft.type {
         case .xtream:
             return !draft.serverURL.isEmpty && !draft.username.isEmpty && !draft.password.isEmpty
+        case .stalker:
+            return !draft.serverURL.isEmpty && !draft.username.isEmpty
         case .m3u:
             return !draft.m3uURL.isEmpty
         }
@@ -586,7 +594,7 @@ private struct PlaylistEditor: View {
     private var shouldRefreshStoredStatus: Bool {
         guard isActive,
               let current = viewModel.activePlaylist,
-              current.type == .xtream,
+              current.type == .xtream || current.type == .stalker,
               DataCache.preferenceKey(for: current) == DataCache.preferenceKey(for: draft),
               statusPreview == nil,
               viewModel.serverStatus == nil,
@@ -723,6 +731,8 @@ private enum ServerConnectionTester {
         switch config.type {
         case .xtream:
             return try await testXtream(config)
+        case .stalker:
+            return try await testStalker(config)
         case .m3u:
             return try await testM3U(config)
         }
@@ -781,6 +791,30 @@ private enum ServerConnectionTester {
         status.lastChecked = .now
         return Result(
             message: "Playlist loaded. Found \(channels.count) channels, \(movieCount) movies, and \(seriesCount) series. \(epg.message).",
+            status: status
+        )
+    }
+
+    private static func testStalker(_ config: ServerConfig) async throws -> Result {
+        guard config.stalkerAPIURL != nil else {
+            throw Error.invalidServerURL("portal URL")
+        }
+
+        let client = StalkerClient(config: config)
+        let accountInfo = try await client.fetchAccountInfo()
+        let channels = try await client.fetchChannels(sampleOnly: true)
+        let vodItems = (try? await client.fetchVODItems(sampleOnly: true)) ?? []
+        let series = (try? await client.fetchSeries(sampleOnly: true)) ?? []
+        if channels.isEmpty && vodItems.isEmpty && series.isEmpty {
+            throw Error.noChannelsFound
+        }
+
+        var status = ServerAccountStatus.initial(for: config, cacheKey: DataCache.preferenceKey(for: config))
+        status.channelCount = channels.count
+        status.guideStatus = "Configured"
+        status.apply(accountInfo)
+        return Result(
+            message: "Connected to Stalker/MAG. Sample loaded \(channels.count) channels, \(vodItems.count) movies, and \(series.count) series.",
             status: status
         )
     }
@@ -857,13 +891,24 @@ private struct AccountStatusCard: View {
 
     private var expiryText: String {
         guard let status else { return "—" }
-        guard status.serverType == .xtream else { return "n/a" }
+        guard status.serverType == .xtream || status.serverType == .stalker else { return "n/a" }
         guard let expiryDate = status.expiryDate else { return "—" }
         return expiryDate.formatted(date: .abbreviated, time: .omitted)
     }
 
     private var statusLabel: String {
-        status?.accountStatus ?? (config?.type == .m3u ? "M3U Source" : "Unknown")
+        status?.accountStatus ?? fallbackStatusLabel
+    }
+
+    private var fallbackStatusLabel: String {
+        switch config?.type {
+        case .m3u:
+            return "M3U Source"
+        case .stalker:
+            return "Stalker/MAG Source"
+        case .xtream, .none:
+            return "Unknown"
+        }
     }
 
     private var lastUpdatedText: String {
