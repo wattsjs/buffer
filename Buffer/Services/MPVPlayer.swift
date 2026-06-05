@@ -155,6 +155,13 @@ final class MPVPlayer {
             cacheCapacitySeconds(for: bufferSeconds)
         }
 
+        /// Startup readahead: smaller window for faster first-frame time.
+        /// The full readahead is applied after the first frame renders, so
+        /// stall protection ramps up quickly without delaying startup.
+        static func startupReadAheadSeconds(for bufferSeconds: Int) -> Double {
+            min(Double(bufferSeconds), 8)
+        }
+
         /// Size the packet queue from the time budget. Fixed 16-64 MiB caps
         /// are too small for high-bitrate live sport, which means the player
         /// can hit the byte ceiling before it has actually built the seconds
@@ -441,6 +448,8 @@ final class MPVPlayer {
                 self.currentURL = resolvedURL
             }
             let path = resolvedURL.absoluteString
+            // Use a smaller readahead for faster startup; increased after first frame.
+            setRuntimeProperty(handle, "demuxer-readahead-secs", "\(Tuning.startupReadAheadSeconds(for: self.bufferSeconds))")
             command(handle, ["loadfile", path, "replace"])
             setFlag("pause", !autoplay)
         }
@@ -455,6 +464,10 @@ final class MPVPlayer {
             updateDisplayPowerAssertion()
         }
         AppLog.playback.info("mpv first-frame generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public) size=\(width, privacy: .public)x\(height, privacy: .public)")
+        // Upgrade readahead to full value now that playback is established.
+        if let handle {
+            setRuntimeProperty(handle, "demuxer-readahead-secs", "\(Tuning.demuxerReadAheadSeconds(for: bufferSeconds))")
+        }
         onFirstFrame?()
     }
 
