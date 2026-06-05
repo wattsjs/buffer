@@ -109,7 +109,7 @@ actor XtreamClient {
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            category_id = try c.flexInt(forKey: .category_id)
+            category_id = try c.flexString(forKey: .category_id)
             category_name = try c.decodeIfPresent(String.self, forKey: .category_name)
         }
     }
@@ -133,7 +133,7 @@ actor XtreamClient {
             name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
             stream_icon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
             epg_channel_id = try c.decodeIfPresent(String.self, forKey: .epg_channel_id)
-            category_id = try c.flexIntIfPresent(forKey: .category_id)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
             tv_archive = try c.flexIntIfPresent(forKey: .tv_archive)
             tv_archive_duration = try c.flexIntIfPresent(forKey: .tv_archive_duration)
         }
@@ -168,7 +168,7 @@ actor XtreamClient {
             stream_id = try c.flexInt(forKey: .stream_id)
             name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
             stream_icon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
-            category_id = try c.flexIntIfPresent(forKey: .category_id)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
             container_extension = try c.decodeIfPresent(String.self, forKey: .container_extension)
             rating = try c.flexStringIfPresent(forKey: .rating)
             rating_5based = try c.flexStringIfPresent(forKey: .rating_5based)
@@ -246,7 +246,7 @@ actor XtreamClient {
             series_id = try c.flexInt(forKey: .series_id)
             name = try c.decodeIfPresent(String.self, forKey: .name)
             cover = try c.decodeIfPresent(String.self, forKey: .cover)
-            category_id = try c.flexIntIfPresent(forKey: .category_id)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
             plot = try c.decodeIfPresent(String.self, forKey: .plot)
             cast = try c.decodeIfPresent(String.self, forKey: .cast)
             director = try c.decodeIfPresent(String.self, forKey: .director)
