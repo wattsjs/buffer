@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
 
-// Benchmark: Xtream feed JSON parsing
+// Benchmark: Xtream feed JSON parsing — high iteration count for stability
 
 import Foundation
 
@@ -41,15 +41,23 @@ func gen(count: Int) -> Data {
     return try! JSONSerialization.data(withJSONObject: arr)
 }
 
-let count = 5000; let iters = 100
+let count = 5000; let iters = 200
 var catMap: [String:String] = [:]; for i in 1...20 { catMap[String(i)] = "Category \(i)" }
 let sb = URL(string: "http://x.com/live/u/p")!
 let data = gen(count: count)
 
-_ = parse(data: data, catMap: catMap, sb: sb); usleep(100000)
+// Extended warmup
+for _ in 0..<10 { _ = parse(data: data, catMap: catMap, sb: sb) }
+usleep(200000)
+
 var total: Double = 0
-for _ in 0..<iters { let t = CFAbsoluteTimeGetCurrent(); _ = parse(data: data, catMap: catMap, sb: sb).count; total += CFAbsoluteTimeGetCurrent() - t }
+for _ in 0..<iters {
+    let t = CFAbsoluteTimeGetCurrent()
+    _ = parse(data: data, catMap: catMap, sb: sb).count
+    total += CFAbsoluteTimeGetCurrent() - t
+}
 let avg = Int(total / Double(iters) * 1_000_000)
-print("count=\(count) iters=\(iters) result=\(parse(data:data,catMap:catMap,sb:sb).count)")
+let result = parse(data: data, catMap: catMap, sb: sb)
+print("count=\(count) iters=\(iters) result=\(result.count)")
 print("parse_µs: \(avg)")
 print("METRIC parse_µs=\(avg)")
