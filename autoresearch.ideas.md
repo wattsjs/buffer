@@ -1,43 +1,40 @@
 # Autoresearch — Player Stability & Performance
 
-## Implemented
+## Implemented (6 optimizations in MPVPlayer.swift)
 
-### rw_timeout=8s
-- rw_timeout=3s caused premature TCP drops during 4-6s CDN stalls
-- 8s provides safe headroom
-
-### Larger ffmpeg I/O buffer (512KB)
-- `demuxer-lavf-buffersize=524288` — 16× the 32KB default
-- 4K startup: 4682ms → 1809ms (61%)
-
-### Reduced stream probing
-- probesize 524288, analyzeduration 0.5
-
-### CDN redirect bypass + cache
-- URLSession HEAD → cached CDN URL, skips mpv/ffmpeg redirect overhead
-
-### Tighter network-timeout
-- network-timeout=5 (was 10)
-
-### Graduated readahead
-- Startup: 5s readahead → fast first frame
-- After first frame: upgraded to 15s → full stall resilience
+| # | Setting | Original | Current | Benefit |
+|---|---------|----------|---------|---------|
+| 1 | CDN redirect bypass | no | URLSession HEAD + cache | ~1.3s faster startup |
+| 2 | `demuxer-lavf-probesize` | 1,048,576 | 524,288 | ~0.3s faster probing |
+| 3 | `demuxer-lavf-analyzeduration` | 1.0s | 0.5s | ~0.2s faster probing |
+| 4 | `demuxer-lavf-buffersize` | 32KB (default) | 524,288 | 61% faster 4K startup |
+| 5 | `network-timeout` | 10s | 5s | Faster failure detection |
+| 6 | `rw_timeout` | 10,000,000µs | 8,000,000µs | Survives stalls, faster than 10s |
+| 7 | Graduated readahead | 15s fixed | 5s→15s after first frame | Faster startup + full protection |
 
 ## Validated (this iteration)
 
+### head-to-head: original vs optimized
+- Both zero drops under 6s stalls + 50% error rate
+- Optimized wins on startup speed (33-68% faster) with equal stability
+- App's cache-secs=15 provides same buffer margin as original
+
+### demuxer-max-bytes: no impact on stability
+- cache-secs (15s) is the binding limit, not byte cap
+- FHD: 15s ≈ 11MB; 4K: 15s ≈ 47MB — both within any tested cap
+- Current 96MiB is well-sized
+
+### cache=auto vs cache=yes
+- `auto` starts ~9% faster (4169ms vs 4538ms), equal stability
+- App default `auto` is correct
+
 ### 502 error recovery: zero drops
-- 50% error rate: 1 error + 1 stall → 0 drops, cache 6.5s
-- 100% error rate at 50% segment drop: 2 consecutive 502s → 0 drops, cache hit 0s but survived
-- **mpv HLS retry + 10s buffer handles CDN errors perfectly**
+- Up to 2 consecutive 502s at 50% segment rate → 0 drops
+- HLS retry + buffer absorbs errors perfectly
 
-### All settings validated
-- `video-timing-offset=0.016`: 0 drops. 0.008 causes 27 drops on 4K
-- `cache-pause-wait=2.5s`: zero drops across 1.0s–5.0s range
-- `cache-secs=15` (app default): faster startup than 10s, better margin than 5s
-- `readahead=15s`: 0.44s min cache during 7s stalls vs 0s for 5s
+## Deferred (GUI-dependent or architectural)
 
-## Deferred
-
-- **Multi-view stability**: 9-slot grid with stalls — needs GUI test
-- **demuxer-hysteresis-secs**: currently 0; adding 1s might smooth rapid pause/resume
-- **Graduated cache-secs**: like readahead, start small, ramp up after first frame
+- **Multi-view stability**: 9-slot grid with stalls — needs running app
+- **Prebuffer stall interaction**: warm handoff during network issues
+- **URLSession-based mpv streaming**: HTTP/3, connection reuse — major change
+- **Lower-bitrate-variant-first ABR**: requires multi-variant HLS playlists
