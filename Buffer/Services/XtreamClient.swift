@@ -175,7 +175,7 @@ actor XtreamClient {
             plot = try c.decodeIfPresent(String.self, forKey: .plot)
             year = try c.flexIntIfPresent(forKey: .year)
             releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
-            added = try c.flexIntIfPresent(forKey: .added)
+            added = try c.flexStringIfPresent(forKey: .added)
             director = try c.decodeIfPresent(String.self, forKey: .director)
             cast = try c.decodeIfPresent(String.self, forKey: .cast)
             country = try c.decodeIfPresent(String.self, forKey: .country)

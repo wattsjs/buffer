@@ -103,6 +103,10 @@ final class MPVPlayer {
         // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
         // AVOption surface.
         static let demuxerLavfAnalyzeDuration = 0.5
+        // ffmpeg I/O buffer for reading stream data. 512 KB cuts system-call
+        // overhead by 16× vs the 32 KB default, which matters a lot for 4 K
+        // HEVC segments that are 4–8 MB each.
+        static let demuxerLavfBufferSize = 524_288
         static let fastProbeSize = 65_536
         static let fastAnalyzeDuration = 0.1
         static let liveLatencyEpsilon = 0.5
@@ -870,6 +874,7 @@ final class MPVPlayer {
         setOption(newHandle, "demuxer-lavf-o", "fflags=+discardcorrupt")
         setOption(newHandle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
         setOption(newHandle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
+        setOption(newHandle, "demuxer-lavf-buffersize", "\(Tuning.demuxerLavfBufferSize)")
 
         // Network timeouts. 5 s is enough for any healthy CDN; the app's
         // reconnect policy handles longer outages faster than mpv's timeout.
