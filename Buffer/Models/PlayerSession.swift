@@ -753,6 +753,7 @@ final class PlayerSlot: Identifiable {
         cancelReconnect()
         player.clearReconnectingErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
+        player.setMute(false)
         player.loadURL(url, autoplay: true)
     }
 

@@ -551,7 +551,7 @@ actor XtreamClient {
         guard isArchived else { return nil }
 
         let providerDays = Int(archive.tv_archive_duration?.value ?? "") ?? 0
-        let days = max(providerDays, 3)
+        let days = max(providerDays, 1)
 
         let base = config.xtreamBaseURL
         let user = config.username
