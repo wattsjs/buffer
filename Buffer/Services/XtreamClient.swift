@@ -56,6 +56,26 @@ private struct FlexibleBool: Decodable {
     }
 }
 
+// MARK: - Flexible string decoding helpers
+// Avoids the per-field struct allocation of FlexibleString by decoding
+// directly in the keyed container. Xtream APIs return numbers inconsistently
+// as either String or Int; these helpers handle both.
+
+extension KeyedDecodingContainer {
+    func flexString(forKey key: Key) throws -> String {
+        if let s = try? decode(String.self, forKey: key) { return s }
+        if let i = try? decode(Int.self, forKey: key) { return String(i) }
+        return ""
+    }
+    func flexStringIfPresent(forKey key: Key) throws -> String? {
+        if contains(key) {
+            if let s = try? decode(String.self, forKey: key) { return s }
+            if let i = try? decode(Int.self, forKey: key) { return String(i) }
+        }
+        return nil
+    }
+}
+
 actor XtreamClient {
     private let config: ServerConfig
 
@@ -66,38 +86,42 @@ actor XtreamClient {
     // MARK: - API Response Types
 
     private struct XtreamCategory: Decodable {
-        let category_id: FlexibleString
+        let category_id: String
         let category_name: String?
 
         enum CodingKeys: String, CodingKey {
             case category_id, category_name
         }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            category_id = try c.flexString(forKey: .category_id)
+            category_name = try c.decodeIfPresent(String.self, forKey: .category_name)
+        }
     }
 
     private struct XtreamStream: Decodable {
-        let num: FlexibleString?
-        let name: String?
-        let stream_id: FlexibleString
+        let name: String
+        let stream_id: String
         let stream_icon: String?
         let epg_channel_id: String?
-        let category_id: FlexibleString?
-        let tv_archive: FlexibleString?
-        let tv_archive_duration: FlexibleString?
+        let category_id: String?
+        let tv_archive: String?
+        let tv_archive_duration: String?
 
         enum CodingKeys: String, CodingKey {
-            case num, name, stream_id, stream_icon, epg_channel_id, category_id, tv_archive, tv_archive_duration
+            case name, stream_id, stream_icon, epg_channel_id, category_id, tv_archive, tv_archive_duration
         }
 
         init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            num = try container.decodeIfPresent(FlexibleString.self, forKey: .num)
-            name = try container.decodeIfPresent(String.self, forKey: .name)
-            stream_id = try container.decode(FlexibleString.self, forKey: .stream_id)
-            stream_icon = try container.decodeIfPresent(String.self, forKey: .stream_icon)
-            epg_channel_id = try container.decodeIfPresent(String.self, forKey: .epg_channel_id)
-            category_id = try container.decodeIfPresent(FlexibleString.self, forKey: .category_id)
-            tv_archive = try container.decodeIfPresent(FlexibleString.self, forKey: .tv_archive)
-            tv_archive_duration = try container.decodeIfPresent(FlexibleString.self, forKey: .tv_archive_duration)
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            stream_id = try c.flexString(forKey: .stream_id)
+            name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
+            stream_icon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
+            epg_channel_id = try c.decodeIfPresent(String.self, forKey: .epg_channel_id)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
+            tv_archive = try c.flexStringIfPresent(forKey: .tv_archive)
+            tv_archive_duration = try c.flexStringIfPresent(forKey: .tv_archive_duration)
         }
     }
 
@@ -370,21 +394,24 @@ actor XtreamClient {
         let data = try await fetchData(from: target)
         let streams = try JSONDecoder().decode([XtreamStream].self, from: data)
 
-        return streams.compactMap { stream in
+        var channels: [Channel] = []
+        channels.reserveCapacity(streams.count)
+        for stream in streams {
             guard let baseURL = config.xtreamStreamBase else { return nil }
             let streamURL = baseURL.appendingPathComponent("\(stream.stream_id.value).m3u8")
-            let categoryName = stream.category_id.flatMap { categoriesMap[$0.value] } ?? "Uncategorized"
+            let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
 
-            return Channel(
-                id: stream.stream_id.value,
-                name: stream.name ?? "Unknown",
+            channels.append(Channel(
+                id: stream.stream_id,
+                name: stream.name,
                 logoURL: stream.stream_icon.flatMap { URL(string: $0) },
                 group: categoryName,
                 streamURL: streamURL,
                 epgChannelID: stream.epg_channel_id,
-                catchup: makeXtreamCatchup(streamID: stream.stream_id.value, archive: stream)
-            )
+                catchup: makeXtreamCatchup(streamID: stream.stream_id, archive: stream)
+            ))
         }
+        return channels
     }
 
     func fetchVODItems() async throws -> [VODItem] {
@@ -547,10 +574,10 @@ actor XtreamClient {
     }
 
     private func makeXtreamCatchup(streamID: String, archive: XtreamStream) -> CatchupInfo? {
-        let isArchived = (Int(archive.tv_archive?.value ?? "") ?? 0) > 0
+        let isArchived = (Int(archive.tv_archive ?? "") ?? 0) > 0
         guard isArchived else { return nil }
 
-        let providerDays = Int(archive.tv_archive_duration?.value ?? "") ?? 0
+        let providerDays = Int(archive.tv_archive_duration ?? "") ?? 0
         let days = max(providerDays, 1)
 
         let base = config.xtreamBaseURL
@@ -579,8 +606,9 @@ actor XtreamClient {
         let categories = try JSONDecoder().decode([XtreamCategory].self, from: data)
 
         var map: [String: String] = [:]
+        map.reserveCapacity(categories.count)
         for cat in categories {
-            map[cat.category_id.value] = cat.category_name ?? "Unknown"
+            map[cat.category_id] = cat.category_name ?? "Unknown"
         }
         return map
     }

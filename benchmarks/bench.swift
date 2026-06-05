@@ -25,58 +25,8 @@ struct Channel: Identifiable, Hashable, Codable {
     }
 }
 
-// MARK: - FlexibleString (current approach)
+// MARK: - Flexible string decoding helpers (matches deployed XtreamClient code)
 
-struct FlexibleString: Decodable {
-    let value: String
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if container.decodeNil() { value = ""; return }
-        if let str = try? container.decode(String.self) { value = str; return }
-        if let int = try? container.decode(Int.self) { value = String(int); return }
-        if let double = try? container.decode(Double.self) { value = String(Int(double)); return }
-        value = ""
-    }
-}
-
-// MARK: - Approach A: Current (FlexibleString + compactMap)
-
-struct StreamA: Decodable {
-    let num: FlexibleString?; let name: String?; let stream_id: FlexibleString
-    let stream_icon: String?; let epg_channel_id: String?
-    let category_id: FlexibleString?; let tv_archive: FlexibleString?
-    let tv_archive_duration: FlexibleString?
-    enum CodingKeys: String, CodingKey {
-        case num, name, stream_id, stream_icon, epg_channel_id, category_id, tv_archive, tv_archive_duration
-    }
-}
-
-func parseApproachA(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
-    let streams = try! JSONDecoder().decode([StreamA].self, from: data)
-    var channels: [Channel] = []
-    channels.reserveCapacity(streams.count)
-    for stream in streams {
-        let streamURL = streamBase.appendingPathComponent("\(stream.stream_id.value).m3u8")
-        let categoryName = stream.category_id.flatMap { categoriesMap[$0.value] } ?? "Uncategorized"
-        channels.append(Channel(
-            id: stream.stream_id.value, name: stream.name ?? "Unknown",
-            logoURL: stream.stream_icon.flatMap { URL(string: $0) },
-            group: categoryName, streamURL: streamURL,
-            epgChannelID: stream.epg_channel_id,
-            catchup: makeCatchupA(stream: stream)
-        ))
-    }
-    return channels
-}
-
-func makeCatchupA(stream: StreamA) -> CatchupInfo? {
-    guard (Int(stream.tv_archive?.value ?? "") ?? 0) > 0 else { return nil }
-    return CatchupInfo(kind: .xc, days: max(Int(stream.tv_archive_duration?.value ?? "") ?? 0, 1), source: nil)
-}
-
-// MARK: - Approach B: Direct flex decode, no FlexibleString struct
-
-/// Helper: decode a value that could be String or Int, always returning String
 extension KeyedDecodingContainer {
     func flexString(forKey key: Key) throws -> String {
         if let s = try? decode(String.self, forKey: key) { return s }
@@ -92,10 +42,16 @@ extension KeyedDecodingContainer {
     }
 }
 
-struct StreamB: Decodable {
-    let streamID: String; let name: String; let streamIcon: String?
-    let categoryID: String?; let epgChannelID: String?
-    let tvArchive: String?; let tvArchiveDuration: String?
+// MARK: - Optimized stream (matches deployed XtreamClient.XtreamStream)
+
+struct XtreamStream: Decodable {
+    let name: String
+    let stream_id: String
+    let stream_icon: String?
+    let epg_channel_id: String?
+    let category_id: String?
+    let tv_archive: String?
+    let tv_archive_duration: String?
 
     enum CodingKeys: String, CodingKey {
         case name, stream_id, stream_icon, epg_channel_id, category_id, tv_archive, tv_archive_duration
@@ -103,90 +59,80 @@ struct StreamB: Decodable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        streamID = try c.flexString(forKey: .stream_id)
+        stream_id = try c.flexString(forKey: .stream_id)
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
-        streamIcon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
-        epgChannelID = try c.decodeIfPresent(String.self, forKey: .epg_channel_id)
-        categoryID = try c.flexStringIfPresent(forKey: .category_id)
-        tvArchive = try c.flexStringIfPresent(forKey: .tv_archive)
-        tvArchiveDuration = try c.flexStringIfPresent(forKey: .tv_archive_duration)
+        stream_icon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
+        epg_channel_id = try c.decodeIfPresent(String.self, forKey: .epg_channel_id)
+        category_id = try c.flexStringIfPresent(forKey: .category_id)
+        tv_archive = try c.flexStringIfPresent(forKey: .tv_archive)
+        tv_archive_duration = try c.flexStringIfPresent(forKey: .tv_archive_duration)
     }
 }
 
-func parseApproachB(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
-    let streams = try! JSONDecoder().decode([StreamB].self, from: data)
+func parseChannels(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
+    let streams = try! JSONDecoder().decode([XtreamStream].self, from: data)
     var channels: [Channel] = []
     channels.reserveCapacity(streams.count)
     for stream in streams {
-        let streamURL = streamBase.appendingPathComponent("\(stream.streamID).m3u8")
-        let categoryName = stream.categoryID.flatMap { categoriesMap[$0] } ?? "Uncategorized"
+        let streamURL = streamBase.appendingPathComponent("\(stream.stream_id).m3u8")
+        let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
         channels.append(Channel(
-            id: stream.streamID, name: stream.name,
-            logoURL: stream.streamIcon.flatMap { URL(string: $0) },
+            id: stream.stream_id, name: stream.name,
+            logoURL: stream.stream_icon.flatMap { URL(string: $0) },
             group: categoryName, streamURL: streamURL,
-            epgChannelID: stream.epgChannelID,
-            catchup: makeCatchupB(stream: stream)
+            epgChannelID: stream.epg_channel_id,
+            catchup: makeCatchup(stream: stream)
         ))
     }
     return channels
 }
 
-func makeCatchupB(stream: StreamB) -> CatchupInfo? {
-    guard let tvArchive = stream.tvArchive, (Int(tvArchive) ?? 0) > 0 else { return nil }
-    return CatchupInfo(kind: .xc, days: max(Int(stream.tvArchiveDuration ?? "") ?? 0, 1), source: nil)
+func makeCatchup(stream: XtreamStream) -> CatchupInfo? {
+    guard let tvArchive = stream.tv_archive, (Int(tvArchive) ?? 0) > 0 else { return nil }
+    return CatchupInfo(kind: .xc, days: max(Int(stream.tv_archive_duration ?? "") ?? 0, 1), source: nil)
 }
 
-// MARK: - Approach C: Skip intermediate struct, decode flat
+// MARK: - Category decoding (matches deployed)
 
-struct StreamC: Decodable {
-    let id: String; let name: String; let logoURL: URL?; let group: String
-    let streamURL: URL; let epgChannelID: String?
-    let catchup: CatchupInfo?
-
-    enum CodingKeys: String, CodingKey {
-        case stream_id, name, stream_icon, category_id, epg_channel_id, tv_archive, tv_archive_duration
-    }
-
+struct XtreamCategory: Decodable {
+    let category_id: String
+    let category_name: String?
+    enum CodingKeys: String, CodingKey { case category_id, category_name }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let streamID = try c.flexString(forKey: .stream_id)
-        id = streamID
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
-        logoURL = try c.decodeIfPresent(String.self, forKey: .stream_icon).flatMap(URL.init(string:))
-        let catID = try c.flexStringIfPresent(forKey: .category_id)
-        let categoriesMap = decoder.userInfo[.catMapKey] as! [String: String]
-        group = catID.flatMap { categoriesMap[$0] } ?? "Uncategorized"
-        let base = decoder.userInfo[.streamBaseKey] as! URL
-        streamURL = base.appendingPathComponent("\(streamID).m3u8")
-        epgChannelID = try c.decodeIfPresent(String.self, forKey: .epg_channel_id)
-
-        let tvArchive = try c.flexStringIfPresent(forKey: .tv_archive)
-        if let tvArchive, (Int(tvArchive) ?? 0) > 0 {
-            let dur = try c.flexStringIfPresent(forKey: .tv_archive_duration)
-            catchup = CatchupInfo(kind: .xc, days: max(Int(dur ?? "") ?? 0, 1), source: nil)
-        } else {
-            catchup = nil
-        }
+        category_id = try c.flexString(forKey: .category_id)
+        category_name = try c.decodeIfPresent(String.self, forKey: .category_name)
     }
 }
 
-extension CodingUserInfoKey {
-    static let catMapKey = CodingUserInfoKey(rawValue: "catMap")!
-    static let streamBaseKey = CodingUserInfoKey(rawValue: "streamBase")!
+// MARK: - Full fetchChannels simulation (includes category fetch + stream parse)
+
+func fetchChannelsSim(data: Data, categoriesData: Data, streamBase: URL) -> [Channel] {
+    let categories = try! JSONDecoder().decode([XtreamCategory].self, from: categoriesData)
+    var categoriesMap: [String: String] = [:]
+    categoriesMap.reserveCapacity(categories.count)
+    for cat in categories { categoriesMap[cat.category_id] = cat.category_name ?? "Unknown" }
+
+    let streams = try! JSONDecoder().decode([XtreamStream].self, from: data)
+    var channels: [Channel] = []
+    channels.reserveCapacity(streams.count)
+    for stream in streams {
+        let streamURL = streamBase.appendingPathComponent("\(stream.stream_id).m3u8")
+        let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
+        channels.append(Channel(
+            id: stream.stream_id, name: stream.name,
+            logoURL: stream.stream_icon.flatMap { URL(string: $0) },
+            group: categoryName, streamURL: streamURL,
+            epgChannelID: stream.epg_channel_id,
+            catchup: makeCatchup(stream: stream)
+        ))
+    }
+    return channels
 }
 
-func parseApproachC(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
-    let decoder = JSONDecoder()
-    decoder.userInfo[.catMapKey] = categoriesMap
-    decoder.userInfo[.streamBaseKey] = streamBase
-    let channels = try! decoder.decode([StreamC].self, from: data)
-    return channels.map { Channel(id: $0.id, name: $0.name, logoURL: $0.logoURL, group: $0.group,
-                                  streamURL: $0.streamURL, epgChannelID: $0.epgChannelID, catchup: $0.catchup) }
-}
+// MARK: - Generate test data (JSON strings for IDs like real Xtream)
 
-// MARK: - Generate test data
-
-func generateSampleJSON(count: Int) -> Data {
+func generateSampleJSON(count: Int) -> (streams: Data, categories: Data) {
     var streams: [[String: Any]] = []
     for i in 0..<count {
         let archive = i % 3 == 0
@@ -201,56 +147,52 @@ func generateSampleJSON(count: Int) -> Data {
             "tv_archive_duration": archive ? "7" : "0"
         ])
     }
-    return try! JSONSerialization.data(withJSONObject: streams, options: [])
+    var cats: [[String: Any]] = []
+    for i in 1...20 {
+        cats.append(["category_id": String(i), "category_name": "Category \(i)"])
+    }
+    return (
+        try! JSONSerialization.data(withJSONObject: streams, options: []),
+        try! JSONSerialization.data(withJSONObject: cats, options: [])
+    )
 }
 
 // MARK: - Benchmark
 
 let count = 5000
-let iterations = 20
+let iterations = 30
 
+let streamBase = URL(string: "http://example.com/live/user/pass")!
+let (streamsData, categoriesData) = generateSampleJSON(count: count)
 var categoriesMap: [String: String] = [:]
 for i in 1...20 { categoriesMap[String(i)] = "Category \(i)" }
-let streamBase = URL(string: "http://example.com/live/user/pass")!
-
-let data = generateSampleJSON(count: count)
 
 // Warmup
-_ = parseApproachA(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-_ = parseApproachB(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-_ = parseApproachC(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
+_ = parseChannels(data: streamsData, categoriesMap: categoriesMap, streamBase: streamBase)
+_ = fetchChannelsSim(data: streamsData, categoriesData: categoriesData, streamBase: streamBase)
 usleep(100000)
 
-// Benchmark all three
-struct Result { var a: Double = 0; var b: Double = 0; var c: Double = 0 }
-var results = Result()
+var totalStreams: Double = 0
+var totalFull: Double = 0
 
 for _ in 0..<iterations {
     let t0 = CFAbsoluteTimeGetCurrent()
-    let ra = parseApproachA(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-    results.a += CFAbsoluteTimeGetCurrent() - t0
-    _ = ra.count
+    let r1 = parseChannels(data: streamsData, categoriesMap: categoriesMap, streamBase: streamBase)
+    totalStreams += CFAbsoluteTimeGetCurrent() - t0
+    _ = r1.count
 
     let t1 = CFAbsoluteTimeGetCurrent()
-    let rb = parseApproachB(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-    results.b += CFAbsoluteTimeGetCurrent() - t1
-    _ = rb.count
-
-    let t2 = CFAbsoluteTimeGetCurrent()
-    let rc = parseApproachC(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-    results.c += CFAbsoluteTimeGetCurrent() - t2
-    _ = rc.count
+    let r2 = fetchChannelsSim(data: streamsData, categoriesData: categoriesData, streamBase: streamBase)
+    totalFull += CFAbsoluteTimeGetCurrent() - t1
+    _ = r2.count
 }
 
-let avgA = results.a / Double(iterations) * 1_000_000
-let avgB = results.b / Double(iterations) * 1_000_000
-let avgC = results.c / Double(iterations) * 1_000_000
+let avgStreams = totalStreams / Double(iterations) * 1_000_000
+let avgFull = totalFull / Double(iterations) * 1_000_000
 
-print("size=\(count) iterations=\(iterations)")
-print("A (current FlexibleString):  \(Int(avgA)) µs")
-print("B (direct flex decode):      \(Int(avgB)) µs")
-print("C (decode to final struct):  \(Int(avgC)) µs")
+print("count=\(count) iterations=\(iterations)")
+print("stream_parse_only: \(Int(avgStreams)) µs")
+print("full_fetch_channels: \(Int(avgFull)) µs")
 print("")
-print("METRIC parse_µs=\(Int(avgA))")
-print("METRIC approachB_µs=\(Int(avgB))")
-print("METRIC approachC_µs=\(Int(avgC))")
+print("METRIC parse_µs=\(Int(avgStreams))")
+print("METRIC full_fetch_channels_µs=\(Int(avgFull))")
