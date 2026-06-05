@@ -397,8 +397,9 @@ actor XtreamClient {
         var channels: [Channel] = []
         channels.reserveCapacity(streams.count)
         guard let baseURL = config.xtreamStreamBase else { return [] }
+        let baseStr = baseURL.absoluteString
         for stream in streams {
-            let streamURL = baseURL.appendingPathComponent("\(stream.stream_id).m3u8")
+            guard let streamURL = URL(string: "\(baseStr)/\(stream.stream_id).m3u8") else { continue }
             let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
 
             channels.append(Channel(
@@ -574,11 +575,15 @@ actor XtreamClient {
     }
 
     private func makeXtreamCatchup(streamID: String, archive: XtreamStream) -> CatchupInfo? {
-        let isArchived = (Int(archive.tv_archive ?? "") ?? 0) > 0
-        guard isArchived else { return nil }
+        // Fast path: tv_archive is "0" or "1" in Xtream responses
+        guard let tvArchive = archive.tv_archive, tvArchive == "1" else { return nil }
 
-        let providerDays = Int(archive.tv_archive_duration ?? "") ?? 0
-        let days = max(providerDays, 1)
+        let days: Int
+        if let dur = archive.tv_archive_duration, let d = Int(dur), d > 0 {
+            days = d
+        } else {
+            days = 1
+        }
 
         let base = config.xtreamBaseURL
         let user = config.username
