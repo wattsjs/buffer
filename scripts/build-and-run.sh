@@ -30,7 +30,7 @@ fi
   -destination 'platform=macOS' \
   build
 
-APP_PATH="$DERIVED_DATA/Build/Products/$CONFIGURATION/$APP_NAME.app"
+APP_PATH="$PWD/$DERIVED_DATA/Build/Products/$CONFIGURATION/$APP_NAME.app"
 
 if [[ "$mode" == "debug" ]]; then
   exec /usr/bin/lldb "$APP_PATH/Contents/MacOS/$APP_NAME"
@@ -40,7 +40,8 @@ fi
 
 if [[ "$mode" == "verify" ]]; then
   sleep 2
-  /usr/bin/pgrep -x "$APP_NAME" >/dev/null
+  pid="$(/usr/bin/pgrep -x "$APP_NAME" | /usr/bin/head -n 1)"
+  /bin/ps -o pid=,command= -p "$pid"
   echo "$APP_NAME is running"
 elif [[ "$mode" == "logs" ]]; then
   exec /usr/bin/log stream --info --style compact --predicate "$LOG_PREDICATE"

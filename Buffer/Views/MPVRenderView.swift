@@ -3,6 +3,7 @@ import Cocoa
 import OpenGL.GL
 import OpenGL.GL3
 import Libmpv
+import OSLog
 
 // MARK: - CAOpenGLLayer render view (IINA pattern)
 //
@@ -27,7 +28,14 @@ struct MPVLayerView: NSViewRepresentable {
 
     @available(macOS, deprecated: 10.14)
     func makeNSView(context: Context) -> MPVLayerHostView {
-        MPVLayerHostView(player: player)
+        if let reusable = MPVLayerHostReuseRegistry.shared.takeHost(for: player) {
+            AppLog.playback.info("mpv layer host reused for player")
+            return reusable
+        }
+        let host = MPVLayerHostView(player: player)
+        MPVLayerHostReuseRegistry.shared.register(host, for: player)
+        AppLog.playback.info("mpv layer host created for player")
+        return host
     }
 
     @available(macOS, deprecated: 10.14)
@@ -35,7 +43,42 @@ struct MPVLayerView: NSViewRepresentable {
 
     @available(macOS, deprecated: 10.14)
     static func dismantleNSView(_ nsView: MPVLayerHostView, coordinator: ()) {
+        if MPVLayerHostReuseRegistry.shared.consumeTransfer(for: nsView) {
+            return
+        }
+        MPVLayerHostReuseRegistry.shared.unregister(nsView)
         nsView.teardown()
+    }
+}
+
+@available(macOS, deprecated: 10.14)
+private final class MPVLayerHostReuseRegistry {
+    static let shared = MPVLayerHostReuseRegistry()
+
+    private var hostsByPlayer: [ObjectIdentifier: MPVLayerHostView] = [:]
+    private var transferredHosts: Set<ObjectIdentifier> = []
+
+    private init() {}
+
+    func register(_ host: MPVLayerHostView, for player: MPVPlayer) {
+        hostsByPlayer[ObjectIdentifier(player)] = host
+    }
+
+    func takeHost(for player: MPVPlayer) -> MPVLayerHostView? {
+        let playerID = ObjectIdentifier(player)
+        guard let host = hostsByPlayer.removeValue(forKey: playerID) else { return nil }
+        transferredHosts.insert(ObjectIdentifier(host))
+        return host
+    }
+
+    func consumeTransfer(for host: MPVLayerHostView) -> Bool {
+        transferredHosts.remove(ObjectIdentifier(host)) != nil
+    }
+
+    func unregister(_ host: MPVLayerHostView) {
+        let hostID = ObjectIdentifier(host)
+        hostsByPlayer = hostsByPlayer.filter { ObjectIdentifier($0.value) != hostID }
+        transferredHosts.remove(hostID)
     }
 }
 
@@ -101,6 +144,7 @@ final class MPVPlayerLayer: CAOpenGLLayer {
     private var player: MPVPlayer?
     private var ownedCGL: CGLContextObj?
     private var renderReady = false
+    private var hasRenderedFrame = false
     private var callbackBoxPtr: UnsafeMutableRawPointer?
     private var torn = false
 
@@ -133,6 +177,7 @@ final class MPVPlayerLayer: CAOpenGLLayer {
 
     func attach(player: MPVPlayer) {
         self.player = player
+        hasRenderedFrame = false
         setNeedsDisplay()
     }
 
@@ -140,6 +185,7 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         guard !torn else { return }
         torn = true
         renderReady = false
+        hasRenderedFrame = false
 
         if let ctx = player?.renderContextHandle {
             mpv_render_context_set_update_callback(ctx, nil, nil)
@@ -266,6 +312,7 @@ final class MPVPlayerLayer: CAOpenGLLayer {
                 layer.setNeedsDisplay()
             }
         }, context: ptr)
+        player.nudgeVideoOutputAfterRenderContextAttach()
     }
 
     // MARK: - Drawing
@@ -324,11 +371,12 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         // window move), skip the expensive render pass.
         let flags = mpv_render_context_update(renderCtx)
         let hasFrame = (flags & 1) != 0  // MPV_RENDER_UPDATE_FRAME
+        let shouldRender = hasFrame || !hasRenderedFrame
 
         var fboParam = mpv_opengl_fbo(fbo: fbo, w: w, h: h, internal_format: 0)
         var flip: Int32 = 1
         var depth: Int32 = 8
-        var skip: Int32 = hasFrame ? 0 : 1
+        var skip: Int32 = shouldRender ? 0 : 1
 
         withUnsafeMutablePointer(to: &fboParam) { fboPtr in
             withUnsafeMutablePointer(to: &flip) { flipPtr in
@@ -348,7 +396,15 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         }
 
         // Only flush and report swap when we actually rendered.
-        if hasFrame {
+        if shouldRender {
+            hasRenderedFrame = true
+            if hasFrame {
+                let frameWidth = Int(w)
+                let frameHeight = Int(h)
+                Task { @MainActor [weak player] in
+                    player?.noteRenderedFrame(width: frameWidth, height: frameHeight)
+                }
+            }
             glFlush()
             mpv_render_context_report_swap(renderCtx)
         }

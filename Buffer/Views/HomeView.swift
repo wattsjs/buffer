@@ -8,6 +8,7 @@ struct HomeView: View {
     let onChannelSelected: (Channel) -> Void
     let onVODSelected: (VODResumeEntry) -> Void
     let onVODRemoved: (VODResumeEntry) -> Void
+    let onPrebufferCandidate: (Channel) -> Void
     let sportsViewModel: SportsViewModel
     @AppStorage("hideSport") private var hideSport = false
 
@@ -21,6 +22,7 @@ struct HomeView: View {
         onChannelSelected: @escaping (Channel) -> Void,
         onVODSelected: @escaping (VODResumeEntry) -> Void,
         onVODRemoved: @escaping (VODResumeEntry) -> Void,
+        onPrebufferCandidate: @escaping (Channel) -> Void,
         sportsViewModel: SportsViewModel
     ) {
         self.recentChannels = recentChannels
@@ -30,6 +32,7 @@ struct HomeView: View {
         self.onChannelSelected = onChannelSelected
         self.onVODSelected = onVODSelected
         self.onVODRemoved = onVODRemoved
+        self.onPrebufferCandidate = onPrebufferCandidate
         self.sportsViewModel = sportsViewModel
     }
 
@@ -37,6 +40,11 @@ struct HomeView: View {
         guard !hideSport else { return [] }
         return sportsViewModel.sections
             .first(where: { $0.group == .live })?.events ?? []
+    }
+
+    private var prebufferCandidate: Channel? {
+        let liveRecents = recentChannels.filter { !$0.isOnDemand }
+        return liveRecents.first(where: isHighQualityChannel) ?? liveRecents.first
     }
 
     var body: some View {
@@ -70,6 +78,22 @@ struct HomeView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .onAppear {
+            requestPrebufferForCurrentCandidate()
+        }
+        .onChange(of: recentChannels.map(\.id)) { _, _ in
+            requestPrebufferForCurrentCandidate()
+        }
+    }
+
+    private func requestPrebufferForCurrentCandidate() {
+        guard let prebufferCandidate else { return }
+        onPrebufferCandidate(prebufferCandidate)
+    }
+
+    private func isHighQualityChannel(_ channel: Channel) -> Bool {
+        let text = "\(channel.name) \(channel.group)".localizedLowercase
+        return text.contains("4k") || text.contains("uhd")
     }
 
     // MARK: - Continue Watching

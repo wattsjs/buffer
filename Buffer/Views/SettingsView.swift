@@ -1021,9 +1021,28 @@ private struct ContentSettingsTab: View {
     @Bindable var viewModel: EPGViewModel
     @AppStorage("hideSport") private var hideSport = false
     @AppStorage(EPGViewModel.disableVODKey) private var disableVOD = false
+    @AppStorage(CatchupLookbackSetting.appStorageKey) private var catchupLookbackRawValue = CatchupLookbackSetting.default.rawValue
+
+    private var catchupLookbackBinding: Binding<Int> {
+        Binding(
+            get: { CatchupLookbackSetting.stored(rawValue: catchupLookbackRawValue).rawValue },
+            set: { catchupLookbackRawValue = $0 }
+        )
+    }
 
     var body: some View {
         Form {
+            Section("Guide") {
+                Picker("Catchup lookback", selection: catchupLookbackBinding) {
+                    ForEach(CatchupLookbackSetting.allCases) { setting in
+                        Text(setting.title).tag(setting.rawValue)
+                    }
+                }
+                Text("Controls how far back archive-capable channels appear in the guide. Channels without catchup are unchanged.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Library") {
                 Toggle("Show Live Sports", isOn: Binding(
                     get: { !hideSport },

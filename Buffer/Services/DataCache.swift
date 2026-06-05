@@ -41,8 +41,8 @@ nonisolated enum DataCache {
 
     // Bumped when Channel/EPGProgram layouts change so old on-disk caches
     // don't silently hide newly-parsed fields (e.g. catchup support).
-    private static let schemaVersion = "v6"
-    private static let legacySchemaVersions = ["v5", "v4", "v3", "v2", "v1"]
+    private static let schemaVersion = "v7"
+    private static let legacySchemaVersions = ["v6", "v5", "v4", "v3", "v2", "v1"]
 
     nonisolated static func cacheKey(for config: ServerConfig) -> String {
         cacheKey(for: config, schemaVersion: schemaVersion)

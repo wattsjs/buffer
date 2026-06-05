@@ -9,6 +9,7 @@ import OSLog
 private final class MPVPlayerPool {
     static let shared = MPVPlayerPool()
     private var idle: [MPVPlayer] = []
+    private var prebuffered: [String: MPVPlayer] = [:]
     private let maxIdle = 3
 
     private init() {}
@@ -30,6 +31,95 @@ private final class MPVPlayerPool {
             idle.append(p)
         }
         // else: drop the reference; MPVPlayer.deinit will call destroy()
+    }
+
+    @MainActor
+    func prewarmFocusedHandle() {
+        guard idle.isEmpty, prebuffered.isEmpty else { return }
+        let p = MPVPlayer()
+        p.prepareForReuse()
+        idle.append(p)
+        AppLog.playback.info("Prewarmed mpv player handle idle=\(self.idle.count, privacy: .public)")
+    }
+
+    @MainActor
+    func prebuffer(channel: Channel) -> MPVPlayer? {
+        guard !channel.isOnDemand else { return nil }
+        if let existing = prebuffered[channel.id], existing.currentURL == channel.streamURL {
+            return existing
+        }
+
+        for (_, player) in prebuffered {
+            release(player)
+        }
+        prebuffered.removeAll()
+
+        let player: MPVPlayer
+        if idle.isEmpty {
+            player = MPVPlayer()
+        } else {
+            player = idle.removeLast()
+            player.prepareForReuse()
+        }
+
+        player.onPlaybackEnded = nil
+        player.onFileLoaded = nil
+        player.onFirstFrame = { [weak self, weak player] in
+            guard
+                let self,
+                let player,
+                self.prebuffered[channel.id] === player,
+                player.currentURL == channel.streamURL
+            else { return }
+
+            player.setMute(true)
+            AppLog.playback.info("Prebuffer ready muted-playing channel=\(channel.name, privacy: .public)")
+            player.logPlaybackSyncSnapshot("prebuffer-ready")
+        }
+        player.onStreamIssue = nil
+        player.onMediaInfoChanged = nil
+        player.setMute(true)
+        player.loadURL(channel.streamURL, autoplay: true)
+        prebuffered[channel.id] = player
+        AppLog.playback.info("Prebuffering channel name=\(channel.name, privacy: .public) id=\(channel.id, privacy: .public)")
+        return player
+    }
+
+    @MainActor
+    func acquirePrebuffered(for channel: Channel) -> MPVPlayer? {
+        guard let player = prebuffered.removeValue(forKey: channel.id) else {
+            AppLog.playback.debug("No prebuffered player channel=\(channel.name, privacy: .public)")
+            return nil
+        }
+        guard player.currentURL == channel.streamURL else {
+            AppLog.playback.info("Discarding prebuffered player channel=\(channel.name, privacy: .public) currentURLMatches=false")
+            release(player)
+            return nil
+        }
+        guard player.hasRenderedCurrentLoad, player.isPlaying else {
+            AppLog.playback.info("Discarding prebuffered player channel=\(channel.name, privacy: .public) ready=false")
+            release(player)
+            return nil
+        }
+        AppLog.playback.info("Using prebuffered player channel=\(channel.name, privacy: .public)")
+        player.logPlaybackSyncSnapshot("prebuffer-acquired")
+        return player
+    }
+}
+
+@MainActor
+private enum PlayerStartupTiming {
+    private static var openStartedAt: [String: Date] = [:]
+
+    static func noteOpen(channel: Channel) {
+        openStartedAt[channel.id] = Date()
+        AppLog.playback.info("player open-request channel=\(channel.name, privacy: .public) id=\(channel.id, privacy: .public)")
+    }
+
+    static func noteFirstFrame(channel: Channel) {
+        guard let startedAt = openStartedAt.removeValue(forKey: channel.id) else { return }
+        let elapsedMs = Int((Date().timeIntervalSince(startedAt) * 1000).rounded())
+        AppLog.playback.info("player open-to-first-frame channel=\(channel.name, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
     }
 }
 
@@ -107,17 +197,26 @@ final class PlayerSlot: Identifiable {
         // Prefer a warm pooled handle (avoids mpv_create + full option/observer
         // setup + render init). The pool is populated on removeSlot / session
         // teardown.
-        let new = MPVPlayerPool.shared.acquire()
-        new.onPlaybackEnded = { [weak self] reason in
+        let new = MPVPlayerPool.shared.acquirePrebuffered(for: channel) ?? MPVPlayerPool.shared.acquire()
+        attachCallbacks(to: new)
+        _player = new
+        return new
+    }
+
+    private func attachCallbacks(to player: MPVPlayer) {
+        player.onPlaybackEnded = { [weak self] reason in
             self?.handlePlaybackEnded(reason)
         }
-        new.onFileLoaded = { [weak self] in
+        player.onFileLoaded = { [weak self] in
             self?.handleFileLoaded()
         }
-        new.onStreamIssue = { [weak self] issue in
+        player.onFirstFrame = { [weak self] in
+            self?.handleFirstFrame()
+        }
+        player.onStreamIssue = { [weak self] issue in
             self?.handleStreamIssue(issue)
         }
-        new.onMediaInfoChanged = { [weak self] info in
+        player.onMediaInfoChanged = { [weak self] info in
             guard let self else { return }
             StreamProbeService.shared.recordPlaybackInfo(
                 channelID: self.channel.id,
@@ -130,8 +229,6 @@ final class PlayerSlot: Identifiable {
                 liveLatencySeconds: info.liveLatencySeconds
             )
         }
-        _player = new
-        return new
     }
 
     // MARK: - Silent reconnect policy
@@ -230,6 +327,10 @@ final class PlayerSlot: Identifiable {
             pendingOnDemandSeekSeconds = nil
             player.seek(to: seekSeconds)
         }
+    }
+
+    private func handleFirstFrame() {
+        PlayerStartupTiming.noteFirstFrame(channel: channel)
     }
 
     private func handleStreamIssue(_ issue: MPVStreamIssue) {
@@ -594,6 +695,9 @@ final class PlayerSlot: Identifiable {
         playbackStreamHealth = StreamHealth()
         stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
+        if useCurrentLiveLoadIfPossible() {
+            return
+        }
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(channel.streamURL, autoplay: true)
         armRecoveryWatchdogs()
@@ -611,10 +715,36 @@ final class PlayerSlot: Identifiable {
         playbackStreamHealth = StreamHealth()
         stopRecoveryTasks(resetFailureWindow: true)
         player.clearReconnectingErrorMessage()
+        if useCurrentLiveLoadIfPossible() {
+            return
+        }
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(channel.streamURL, autoplay: true)
         armRecoveryWatchdogs()
         StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
+    }
+
+    private func useCurrentLiveLoadIfPossible() -> Bool {
+        let player = self.player
+        guard player.currentURL == channel.streamURL else { return false }
+        AppLog.playback.info("Using current live load channel=\(self.channel.name, privacy: .public)")
+        if player.hasRenderedCurrentLoad {
+            PlayerStartupTiming.noteFirstFrame(channel: channel)
+        }
+        Task { @MainActor [weak player] in
+            await Task.yield()
+            guard let player else { return }
+            player.setMute(false)
+            player.play()
+            player.logPlaybackSyncSnapshot("visible-unmuted")
+            try? await Task.sleep(for: .seconds(2))
+            player.logPlaybackSyncSnapshot("visible-2s")
+        }
+        lastObservedTimePos = player.timePos
+        lastPlaybackProgressAt = Date()
+        armRecoveryWatchdogs()
+        StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
+        return true
     }
 
     func loadCatchup(_ url: URL) {
@@ -655,6 +785,18 @@ final class PlayerSession {
         self.slots = [slot]
         self.focusedSlotID = slot.id
         self.layout = .single
+    }
+
+    static func prewarmPlayerPool() {
+        MPVPlayerPool.shared.prewarmFocusedHandle()
+    }
+
+    static func prebuffer(channel: Channel) -> MPVPlayer? {
+        MPVPlayerPool.shared.prebuffer(channel: channel)
+    }
+
+    static func noteOpen(channel: Channel) {
+        PlayerStartupTiming.noteOpen(channel: channel)
     }
 
     /// Called from `PlayerView.onAppear`. Side effects (loadURL/play) must

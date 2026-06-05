@@ -1,9 +1,9 @@
 import AppKit
 import SwiftUI
 
-struct HorizontalPrependAdjustment: Equatable {
+struct HorizontalScrollRequest: Equatable {
     let id: Int
-    let pixels: CGFloat
+    let targetX: CGFloat
 }
 
 /// Virtualized EPG grid built from three synchronized AppKit scroll views:
@@ -27,7 +27,7 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
     let headerHeight: CGFloat
     let nowLineX: CGFloat?
     let initialHorizontalOffset: CGFloat?
-    let horizontalPrependAdjustment: HorizontalPrependAdjustment?
+    let horizontalScrollRequest: HorizontalScrollRequest?
     let timelineIdentity: AnyHashable?
     var channelNameProvider: ((Item) -> String)? = nil
     var rowDataProvider: ((Item) -> ChannelLabelRowData)? = nil
@@ -36,7 +36,6 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
     let programContent: (Item) -> ProgramContent
     let headerContent: () -> HeaderContent
     let cornerContent: () -> CornerContent
-    var onNearLeadingEdge: (() -> Void)? = nil
 
     func makeNSView(context: Context) -> EPGContainerView {
         let container = EPGContainerView()
@@ -50,6 +49,12 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
         container.updateVisibleRowData = { [weak coordinatorRef] in
             coordinatorRef?.updateVisibleRowData()
         }
+        container.refreshVisibleRows = { [weak coordinatorRef] in
+            coordinatorRef?.refreshVisibleRows()
+        }
+        container.reloadVisibleProgramRows = { [weak coordinatorRef] in
+            coordinatorRef?.reloadVisibleProgramRows()
+        }
         return container
     }
 
@@ -61,14 +66,19 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
         container.updateVisibleRowData = { [weak coordinatorRef] in
             coordinatorRef?.updateVisibleRowData()
         }
+        container.refreshVisibleRows = { [weak coordinatorRef] in
+            coordinatorRef?.refreshVisibleRows()
+        }
+        container.reloadVisibleProgramRows = { [weak coordinatorRef] in
+            coordinatorRef?.reloadVisibleProgramRows()
+        }
         container.setTimelineIdentity(timelineIdentity)
         container.applyDimensions(dimensions)
         container.setHeaderContent(headerContent())
         container.setCornerContent(cornerContent())
         container.setNowLineX(nowLineX)
         container.setInitialHorizontalOffset(initialHorizontalOffset)
-        container.setHorizontalPrependAdjustment(horizontalPrependAdjustment)
-        container.onNearLeadingEdge = onNearLeadingEdge
+        container.setHorizontalScrollRequest(horizontalScrollRequest)
 
         if let channelNameProvider {
             container.setChannelNames(items.map { channelNameProvider($0) })
@@ -170,6 +180,15 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
             updateVisibleRowData()
         }
 
+        func reloadVisibleProgramRows() {
+            guard let container else { return }
+            let tableView = container.programTableView
+            refresh(tableView: tableView, isChannel: false)
+            tableView.needsLayout = true
+            tableView.layoutSubtreeIfNeeded()
+            updateVisibleRowData()
+        }
+
         /// Computes and pushes rowData ONLY for visible rows + a small overscroll window.
         /// This is the core of the Agent 02 / Master Issues visible-range rowData optimization.
         /// Called on state updates (via updateNSView) and vertical scroll (via container callback).
@@ -241,14 +260,16 @@ final class EPGContainerView: NSView {
     private var initialHorizontalOffset: CGFloat?
     private var didApplyInitialHorizontalOffset = false
     private var timelineIdentity: AnyHashable?
-    private var lastHorizontalPrependAdjustmentID: Int?
-    private var pendingHorizontalPrependAdjustment: HorizontalPrependAdjustment?
-    var onNearLeadingEdge: (() -> Void)?
+    private var lastHorizontalScrollRequestID: Int?
+    private var pendingHorizontalScrollRequest: HorizontalScrollRequest?
     /// Called by vertical scroll handlers so Coordinator can lazily compute rowData only for the new visible window.
     var updateVisibleRowData: (() -> Void)?
+    /// Rebinds currently visible hosted table rows after document-width or horizontal-position changes.
+    var refreshVisibleRows: (() -> Void)?
+    /// Recreates visible hosted program rows when the horizontal document width changes.
+    var reloadVisibleProgramRows: (() -> Void)?
     private var channelNames: [String] = []
     private var isSyncing = false
-    private var nearLeadingEdgeArmed = true
 
     override var isFlipped: Bool { true }
 
@@ -292,6 +313,7 @@ final class EPGContainerView: NSView {
 
     func applyDimensions(_ new: Dimensions) {
         guard new != dimensions else { return }
+        let oldProgramWidth = dimensions.programRowWidth
         dimensions = new
 
         if let col = channelTableView.tableColumns.first, col.width != new.channelColumnWidth {
@@ -306,6 +328,10 @@ final class EPGContainerView: NSView {
         }
         channelTableView.rowHeight = new.rowHeight
         programTableView.rowHeight = new.rowHeight
+        syncDocumentFrames()
+        if oldProgramWidth != new.programRowWidth {
+            refreshVisibleRows?()
+        }
         needsLayout = true
     }
 
@@ -351,9 +377,8 @@ final class EPGContainerView: NSView {
         timelineIdentity = identity
         didApplyInitialHorizontalOffset = false
         initialHorizontalOffset = nil
-        lastHorizontalPrependAdjustmentID = nil
-        pendingHorizontalPrependAdjustment = nil
-        nearLeadingEdgeArmed = true
+        lastHorizontalScrollRequestID = nil
+        pendingHorizontalScrollRequest = nil
     }
 
     func setInitialHorizontalOffset(_ x: CGFloat?) {
@@ -365,11 +390,11 @@ final class EPGContainerView: NSView {
         applyInitialHorizontalOffsetIfNeeded()
     }
 
-    func setHorizontalPrependAdjustment(_ adjustment: HorizontalPrependAdjustment?) {
-        guard let adjustment else { return }
-        guard lastHorizontalPrependAdjustmentID != adjustment.id else { return }
-        pendingHorizontalPrependAdjustment = adjustment
-        applyHorizontalPrependAdjustmentIfNeeded()
+    func setHorizontalScrollRequest(_ request: HorizontalScrollRequest?) {
+        guard let request else { return }
+        guard lastHorizontalScrollRequestID != request.id else { return }
+        pendingHorizontalScrollRequest = request
+        applyHorizontalScrollRequestIfNeeded()
     }
 
     private func configureTable(_ tableView: NSTableView, columnWidth: CGFloat) {
@@ -437,7 +462,7 @@ final class EPGContainerView: NSView {
         addSubview(channelLabelOverlay)
 
         // Now-time indicator line (sibling overlay; pixel-aligned so it stays straight).
-        // Keep it above the sticky text overlay so horizontal prepends cannot visually bury it.
+        // Keep it above the sticky text overlay so it remains visible while horizontally scrolling.
         nowLineView.wantsLayer = true
         nowLineView.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.7).cgColor
         nowLineView.isHidden = true
@@ -481,17 +506,45 @@ final class EPGContainerView: NSView {
         channelScrollView.frame = NSRect(x: 0, y: hh, width: ccw, height: bodyHeight)
         programScrollView.frame = NSRect(x: ccw, y: hh, width: bodyWidth, height: bodyHeight)
 
-        headerHost.frame = NSRect(x: 0, y: 0, width: dimensions.programRowWidth, height: hh)
-
+        syncDocumentFrames()
         channelLabelOverlay.frame = NSRect(x: ccw, y: hh, width: bodyWidth, height: bodyHeight)
         channelLabelOverlay.rowHeight = dimensions.rowHeight
 
         applyInitialHorizontalOffsetIfNeeded()
-        applyHorizontalPrependAdjustmentIfNeeded()
+        applyHorizontalScrollRequestIfNeeded()
         updateNowLineFrame()
     }
 
+    private func syncDocumentFrames() {
+        let bodyHeight = max(0, bounds.height - dimensions.headerHeight)
+        let tableHeight = max(bodyHeight, CGFloat(programTableView.numberOfRows) * dimensions.rowHeight)
+
+        headerHost.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: dimensions.programRowWidth,
+            height: dimensions.headerHeight
+        )
+        channelTableView.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: dimensions.channelColumnWidth,
+            height: tableHeight
+        )
+        programTableView.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: dimensions.programRowWidth,
+            height: tableHeight
+        )
+    }
+
     private func updateNowLineFrame() {
+        guard bounds.width > dimensions.channelColumnWidth, dimensions.programRowWidth > 0 else {
+            nowLineView.isHidden = true
+            return
+        }
+
         guard let x = nowLineX, x > 0, x < dimensions.programRowWidth else {
             nowLineView.isHidden = true
             return
@@ -537,18 +590,19 @@ final class EPGContainerView: NSView {
         channelLabelOverlay.scrollOffsetX = targetX
         updateNowLineFrame()
         updateChannelLabelOverlay()
+        reloadVisibleProgramRows?()
         didApplyInitialHorizontalOffset = true
     }
 
-    private func applyHorizontalPrependAdjustmentIfNeeded() {
-        guard let adjustment = pendingHorizontalPrependAdjustment,
-              lastHorizontalPrependAdjustmentID != adjustment.id,
+    private func applyHorizontalScrollRequestIfNeeded() {
+        guard let request = pendingHorizontalScrollRequest,
+              lastHorizontalScrollRequestID != request.id,
               dimensions.programRowWidth > 0,
               programScrollView.contentView.bounds.width > 0 else { return }
 
         let clip = programScrollView.contentView
         let maxX = max(0, dimensions.programRowWidth - clip.bounds.width)
-        let targetX = min(max(clip.bounds.origin.x + adjustment.pixels, 0), maxX)
+        let targetX = min(max(request.targetX, 0), maxX)
         let target = NSPoint(x: targetX, y: clip.bounds.origin.y)
 
         clip.scroll(to: target)
@@ -556,10 +610,10 @@ final class EPGContainerView: NSView {
         mirror(x: targetX, to: headerScrollView)
         updateNowLineFrame()
         updateChannelLabelOverlay()
+        reloadVisibleProgramRows?()
 
-        lastHorizontalPrependAdjustmentID = adjustment.id
-        pendingHorizontalPrependAdjustment = nil
-        nearLeadingEdgeArmed = targetX > 480
+        lastHorizontalScrollRequestID = request.id
+        pendingHorizontalScrollRequest = nil
     }
 
     // MARK: Scroll to row
@@ -604,7 +658,6 @@ final class EPGContainerView: NSView {
         updateNowLineFrame()
         updateChannelLabelOverlay()
         updateVisibleRowData?()   // visible rowData may have shifted; compute only for new window (not full list)
-        checkNearLeadingEdge(originX: origin.x)
     }
 
     @objc private func channelBoundsDidChange(_ note: Notification) {
@@ -624,7 +677,6 @@ final class EPGContainerView: NSView {
 
         mirror(x: clip.bounds.origin.x, to: programScrollView)
         updateNowLineFrame()
-        checkNearLeadingEdge(originX: clip.bounds.origin.x)
     }
 
     private func updateChannelLabelOverlay() {
@@ -650,15 +702,6 @@ final class EPGContainerView: NSView {
         scrollView.reflectScrolledClipView(clip)
     }
 
-    private func checkNearLeadingEdge(originX: CGFloat) {
-        let threshold: CGFloat = 240
-        if originX < threshold, nearLeadingEdgeArmed {
-            nearLeadingEdgeArmed = false
-            onNearLeadingEdge?()
-        } else if originX > threshold * 2 {
-            nearLeadingEdgeArmed = true
-        }
-    }
 }
 
 // MARK: - Channel label overlay
@@ -682,123 +725,8 @@ final class ChannelLabelOverlayView: NSView {
     override func hitTest(_ aPoint: NSPoint) -> NSView? { nil }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard !rowDataByIndex.isEmpty else { return }
-
-        // Clip to our own bounds so text doesn't bleed into the header
-        NSBezierPath(rect: bounds).addClip()
-
-        let nameAttrs: [NSAttributedString.Key: Any] = {
-            let p = NSMutableParagraphStyle()
-            p.lineBreakMode = .byTruncatingTail
-            return [
-                .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: NSColor.secondaryLabelColor,
-                .paragraphStyle: p,
-            ]
-        }()
-        let timeAttrs = nameAttrs
-
-        let insetX: CGFloat = 9
-        let insetY: CGFloat = 9
-        let currentFill = NSColor.tertiaryLabelColor.withAlphaComponent(0.28)
-
-        let firstVisibleRow = max(0, Int(scrollOffsetY / rowHeight))
-        let visibleRowCount = Int(ceil(bounds.height / rowHeight)) + 2  // +2 for smoother overscroll during fast vertical drags
-
-        for i in firstVisibleRow..<(firstVisibleRow + visibleRowCount) {
-            guard let data = rowDataByIndex[i] else { continue }
-            guard !data.blocks.isEmpty else { continue }
-
-            let rowY = CGFloat(i) * rowHeight - scrollOffsetY
-            let hasName = !data.channelName.isEmpty
-            let nameSize = hasName ? (data.channelName as NSString).size(withAttributes: nameAttrs) : .zero
-            let nameWidth = min(nameSize.width + 1, bounds.width * 0.35)
-
-            // The sticky X position for the channel name (screen coords)
-            let stickyX = insetX
-
-            for block in data.blocks {
-                let blockScreenMinX = block.rect.minX - scrollOffsetX
-                let blockScreenMaxX = block.rect.maxX - scrollOffsetX
-
-                guard blockScreenMaxX > 0, blockScreenMinX < bounds.width else { continue }
-
-                let blockTextMinX = max(0, blockScreenMinX) + 9
-                guard blockTextMinX < blockScreenMaxX - 10 else { continue }
-
-                // Clip to this block, inset to hide text in the gap
-                let clipInset: CGFloat = 2
-                let blockClipMinX = max(0, blockScreenMinX + clipInset)
-                let blockClipMaxX = blockScreenMaxX - clipInset
-                guard blockClipMaxX > blockClipMinX + 10 else { continue }
-
-                let blockClipRect = NSRect(
-                    x: blockClipMinX,
-                    y: rowY,
-                    width: blockClipMaxX - blockClipMinX,
-                    height: rowHeight
-                )
-
-                NSGraphicsContext.saveGraphicsState()
-                NSBezierPath(rect: blockClipRect).addClip()
-
-                if let nowLineX,
-                   nowLineX > block.rect.minX,
-                   nowLineX < block.rect.maxX {
-                    let fillMaxX = min(blockClipMaxX, nowLineX - scrollOffsetX)
-                    if fillMaxX > blockClipMinX {
-                        let fillRect = NSRect(
-                            x: blockClipMinX,
-                            y: rowY + block.rect.minY,
-                            width: fillMaxX - blockClipMinX,
-                            height: block.rect.height
-                        )
-                        let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 3, yRadius: 3)
-                        currentFill.setFill()
-                        fillPath.fill()
-                    }
-                }
-
-                // Does the sticky channel name overlap this block?
-                let stickyDocX = scrollOffsetX + stickyX
-                let stickyDocEndX = stickyDocX + nameWidth
-                let blockOverlapsSticky = hasName
-                    && block.rect.maxX > stickyDocX
-                    && block.rect.minX < stickyDocEndX
-
-                var timeStartX = blockTextMinX
-
-                if blockOverlapsSticky {
-                    // Draw channel name at sticky position
-                    let nameRect = NSRect(x: stickyX, y: rowY + insetY, width: nameWidth, height: nameSize.height)
-                    (data.channelName as NSString).draw(
-                        with: nameRect,
-                        options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
-                        attributes: nameAttrs
-                    )
-                    let nameEndX = stickyX + nameWidth + 8
-                    if nameEndX > timeStartX {
-                        timeStartX = nameEndX
-                    }
-                }
-
-                // Draw time
-                if let timeRange = block.timeRange {
-                    let timeAvail = blockClipMaxX - timeStartX - 9
-                    if timeAvail > 20 {
-                        let ts = (timeRange as NSString).size(withAttributes: timeAttrs)
-                        let timeRect = NSRect(x: timeStartX, y: rowY + insetY, width: min(ts.width, timeAvail), height: ts.height)
-                        (timeRange as NSString).draw(
-                            with: timeRect,
-                            options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
-                            attributes: timeAttrs
-                        )
-                    }
-                }
-
-                NSGraphicsContext.restoreGraphicsState()
-            }
-        }
+        // Program rows render their own cards, titles, and time ranges. Keeping
+        // this overlay visually empty prevents it from masking the actual EPG.
     }
 }
 

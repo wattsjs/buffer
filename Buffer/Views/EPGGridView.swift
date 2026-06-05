@@ -4,6 +4,7 @@ struct EPGGridView: View {
     let channels: [Channel]
     let hasLoadedOnce: Bool
     var revealChannelID: String? = nil
+    var catchupLookback: CatchupLookbackSetting = .default
     let programsProvider: (Channel) -> [EPGProgram]
     /// Optional ranged provider backed by pre-buckets in VM. When present, rowData + ProgramRow receive
     /// only programs intersecting the current timeline window (makes buildRowData/buildBlocks allocation-free for the window).
@@ -14,9 +15,9 @@ struct EPGGridView: View {
 
     @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
 
-    @State private var loadedCatchupPastHours = 6
-    @State private var prependAdjustmentID = 0
-    @State private var prependAdjustmentPixels: CGFloat = 0
+    @State private var timelineAnchor = Date()
+    @State private var timelineResetID = 0
+    @State private var scrollToCurrentID = 0
 
     // Lightweight "now" ticker (Agent 02 + 09). Updates every 20 s so the red
     // live line and "LIVE" badges stay accurate without relying
@@ -29,8 +30,6 @@ struct EPGGridView: View {
     private let pixelsPerMinute: CGFloat = 4
     private let headerHeight: CGFloat = 32
     private let minimumPastTimelineHours = 1
-    private let initialCatchupPastTimelineHours = 6
-    private let catchupPastLoadStepHours = 6
     private let futureTimelineHours = 11
 
     private func timelineHours(timelineStart: Date, timelineEnd: Date) -> Int {
@@ -43,10 +42,16 @@ struct EPGGridView: View {
 
     private func pastTimelineHours(for channels: [Channel]) -> Int {
         guard channels.contains(where: \.supportsRewind) else { return minimumPastTimelineHours }
-        return min(max(loadedCatchupPastHours, initialCatchupPastTimelineHours), maxPastTimelineHours(for: channels, now: now))
+        return maxPastTimelineHours(for: channels, now: timelineAnchor)
     }
 
     private func maxPastTimelineHours(for channels: [Channel], now: Date) -> Int {
+        let availableHours = availablePastTimelineHours(for: channels, now: now)
+        guard let limitHours = catchupLookback.limitHours else { return availableHours }
+        return min(availableHours, limitHours)
+    }
+
+    private func availablePastTimelineHours(for channels: [Channel], now: Date) -> Int {
         let earliest = earliestCatchupTimelineStart(for: channels, now: now)
         guard let earliest else { return minimumPastTimelineHours }
         let hours = Int(ceil(now.timeIntervalSince(earliest) / 3600))
@@ -95,8 +100,15 @@ struct EPGGridView: View {
         return CGFloat(max(0, target.timeIntervalSince(timelineStart) / 60)) * pixelsPerMinute
     }
 
-    private func timelineIdentity(for channels: [Channel], maxPastHours: Int) -> AnyHashable {
-        AnyHashable("\(channels.map(\.id).joined(separator: "\u{1F}"))|\(maxPastHours)")
+    private func timelineIdentity(for channels: [Channel], resetID: Int) -> AnyHashable {
+        AnyHashable("\(channels.map(\.id).joined(separator: "\u{1F}"))|\(resetID)")
+    }
+
+    private func resetTimelineWindow(for channels: [Channel], now currentNow: Date) {
+        now = currentNow
+        timelineAnchor = currentNow
+        scrollToCurrentID = 0
+        timelineResetID += 1
     }
 
     private func makeTimelineStart(from now: Date, pastHours: Int, channels: [Channel]) -> Date {
@@ -157,14 +169,13 @@ struct EPGGridView: View {
             // Date() on every body evaluation. This makes the live line and badges
             // accurate and smooth while avoiding full grid rebuilds on every tick.
             let now = self.now
+            let timelineAnchor = self.timelineAnchor
             let pastHours = pastTimelineHours(for: channels)
-            let timelineStart = makeTimelineStart(from: now, pastHours: pastHours, channels: channels)
-            let timelineEnd = makeTimelineEnd(from: now)
+            let timelineStart = makeTimelineStart(from: timelineAnchor, pastHours: pastHours, channels: channels)
+            let timelineEnd = makeTimelineEnd(from: timelineAnchor)
             let timelineHours = timelineHours(timelineStart: timelineStart, timelineEnd: timelineEnd)
             let width = timelineWidth(hours: timelineHours)
             let nowX = makeNowX(now: now, timelineStart: timelineStart, timelineWidth: width)
-            let maxPastHours = maxPastTimelineHours(for: channels, now: now)
-            let canLoadMorePast = channels.contains(where: \.supportsRewind) && pastHours < maxPastHours
 
             EPGScrollGrid(
                 items: channels,
@@ -174,11 +185,13 @@ struct EPGGridView: View {
                 headerHeight: headerHeight,
                 nowLineX: nowX,
                 initialHorizontalOffset: initialTimelineOffset(timelineStart: timelineStart, now: now),
-                horizontalPrependAdjustment: HorizontalPrependAdjustment(
-                    id: prependAdjustmentID,
-                    pixels: prependAdjustmentPixels
-                ),
-                timelineIdentity: timelineIdentity(for: channels, maxPastHours: maxPastHours),
+                horizontalScrollRequest: scrollToCurrentID > 0
+                    ? HorizontalScrollRequest(
+                        id: scrollToCurrentID,
+                        targetX: initialTimelineOffset(timelineStart: timelineStart, now: now)
+                    )
+                    : nil,
+                timelineIdentity: timelineIdentity(for: channels, resetID: timelineResetID),
                 channelNameProvider: { $0.name },
                 rowDataProvider: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd = timelineEnd, pixelsPerMinute, timelineHours] channel in
                     let progs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
@@ -188,7 +201,8 @@ struct EPGGridView: View {
                         timelineStart: timelineStart,
                         pixelsPerMinute: pixelsPerMinute,
                         timelineHours: timelineHours,
-                        rowHeight: rowHeight
+                        rowHeight: rowHeight,
+                        showGuideGaps: channel.supportsRewind
                     )
                 },
                 revealItemID: revealChannelID.map { AnyHashable($0) },
@@ -214,6 +228,7 @@ struct EPGGridView: View {
                         timelineWidth: width,
                         pixelsPerMinute: pixelsPerMinute,
                         rowHeight: rowHeight,
+                        showGuideGaps: channel.supportsRewind,
                         onPlay: { onChannelSelected(channel) },
                         playlistID: activePlaylistID
                     )
@@ -224,29 +239,18 @@ struct EPGGridView: View {
                     .fadeIfStreamDead(channelID: channel.id)
                 },
                 headerContent: { timeStrip(timelineStart: timelineStart, timelineHours: timelineHours, now: now) },
-                cornerContent: { cornerLabel },
-                onNearLeadingEdge: {
-                    guard canLoadMorePast else { return }
-                    let currentNow = Date()
-                    let currentMaxPastHours = maxPastTimelineHours(for: channels, now: currentNow)
-                    let currentTimelineStart = makeTimelineStart(from: currentNow, pastHours: pastHours, channels: channels)
-                    let next = min(pastHours + catchupPastLoadStepHours, currentMaxPastHours)
-                    let nextStart = makeTimelineStart(from: currentNow, pastHours: next, channels: channels)
-                    let deltaPixels = CGFloat(max(0, currentTimelineStart.timeIntervalSince(nextStart) / 60)) * pixelsPerMinute
-                    guard deltaPixels > 1 else { return }
-                    self.now = currentNow
-                    loadedCatchupPastHours = next
-                    prependAdjustmentPixels = deltaPixels
-                    prependAdjustmentID += 1
-                }
+                cornerContent: { cornerLabel }
             )
             .background(Color(nsColor: .textBackgroundColor))
             .onChange(of: channels.map(\.id)) { _, _ in
-                loadedCatchupPastHours = initialCatchupPastTimelineHours
-                prependAdjustmentID = 0
-                prependAdjustmentPixels = 0
+                resetTimelineWindow(for: channels, now: Date())
             }
-            .onAppear { startNowTicker() }
+            .onChange(of: catchupLookback) { _, _ in
+                resetTimelineWindow(for: channels, now: Date())
+            }
+            .onAppear {
+                startNowTicker()
+            }
             .onDisappear { stopNowTicker() }
         }
     }
@@ -257,7 +261,8 @@ struct EPGGridView: View {
         timelineStart: Date,
         pixelsPerMinute: CGFloat,
         timelineHours: Int,
-        rowHeight: CGFloat
+        rowHeight: CGFloat,
+        showGuideGaps: Bool
     ) -> ChannelLabelRowData {
         let timelineWidth = CGFloat(timelineHours * 60) * pixelsPerMinute
         let end = timelineStart.addingTimeInterval(Double(timelineWidth / pixelsPerMinute) * 60)
@@ -269,7 +274,22 @@ struct EPGGridView: View {
         var blocks: [(rect: CGRect, timeRange: String?)] = []
         var cursor = timelineStart
 
+        func appendGap(until gapEnd: Date) {
+            guard gapEnd > cursor else { return }
+            let startX = max(0, cursor.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
+            let endX = min(Double(timelineWidth), gapEnd.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
+            let width = endX - startX
+            guard width > 2 else { return }
+            blocks.append((
+                rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
+                timeRange: nil
+            ))
+        }
+
         for p in sorted {
+            if showGuideGaps {
+                appendGap(until: p.start)
+            }
             let effectiveStart = max(p.start, cursor)
             guard p.end > effectiveStart else { continue }
             let startX = max(0, effectiveStart.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
@@ -281,6 +301,10 @@ struct EPGGridView: View {
                 timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))"
             ))
             cursor = p.end
+        }
+
+        if showGuideGaps {
+            appendGap(until: end)
         }
 
         if blocks.isEmpty {
@@ -310,11 +334,20 @@ struct EPGGridView: View {
     }
 
     private var cornerLabel: some View {
-        HStack {
+        HStack(spacing: 6) {
             Text("TV Guide")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.primary)
             Spacer(minLength: 0)
+            Button {
+                scrollToCurrentID += 1
+            } label: {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("Scroll to current time")
         }
         .padding(.horizontal, 12)
         .frame(width: channelColumnWidth, height: headerHeight, alignment: .leading)
@@ -426,6 +459,7 @@ private struct ProgramRow: View {
     let timelineWidth: CGFloat
     let pixelsPerMinute: CGFloat
     let rowHeight: CGFloat
+    let showGuideGaps: Bool
     let onPlay: () -> Void
 
     @State private var selectedProgram: EPGProgram?
@@ -452,6 +486,7 @@ private struct ProgramRow: View {
             timelineWidth: timelineWidth,
             pixelsPerMinute: pixelsPerMinute,
             rowHeight: rowHeight,
+            showGuideGaps: showGuideGaps,
             reminderProgramIDs: reminderProgramIDs,
             onProgramTap: { program, rect in
                 selectedRect = rect
@@ -503,6 +538,7 @@ private struct ProgramCanvasLayer: View, Equatable {
     let timelineWidth: CGFloat
     let pixelsPerMinute: CGFloat
     let rowHeight: CGFloat
+    let showGuideGaps: Bool
     let reminderProgramIDs: Set<String>
     let onProgramTap: (EPGProgram, CGRect) -> Void
     let onEmptyTap: () -> Void
@@ -513,6 +549,7 @@ private struct ProgramCanvasLayer: View, Equatable {
               lhs.timelineWidth == rhs.timelineWidth,
               lhs.pixelsPerMinute == rhs.pixelsPerMinute,
               lhs.rowHeight == rhs.rowHeight,
+              lhs.showGuideGaps == rhs.showGuideGaps,
               lhs.fallbackTitle == rhs.fallbackTitle,
               lhs.reminderProgramIDs == rhs.reminderProgramIDs,
               lhs.programs.count == rhs.programs.count else { return false }
@@ -547,7 +584,28 @@ private struct ProgramCanvasLayer: View, Equatable {
         var blocks: [Block] = []
         var cursor: Date = timelineStart
 
+        func appendGap(until gapEnd: Date) {
+            guard gapEnd > cursor else { return }
+            let startX = max(0, cursor.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
+            let endX = min(Double(timelineWidth), gapEnd.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
+            let width = endX - startX
+            guard width > 2 else { return }
+            blocks.append(
+                Block(
+                    program: nil,
+                    rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
+                    title: "No guide data",
+                    timeRange: nil,
+                    hasReminder: false,
+                    isFallback: true
+                )
+            )
+        }
+
         for p in sorted {
+            if showGuideGaps {
+                appendGap(until: p.start)
+            }
             let effectiveStart = max(p.start, cursor)
             guard p.end > effectiveStart else { continue }
 
@@ -567,6 +625,10 @@ private struct ProgramCanvasLayer: View, Equatable {
                 )
             )
             cursor = p.end
+        }
+
+        if showGuideGaps {
+            appendGap(until: end)
         }
 
         if blocks.isEmpty {
@@ -602,11 +664,11 @@ private struct ProgramCanvasLayer: View, Equatable {
                 context.fill(path, with: .color(fill))
                 context.stroke(path, with: .color(border), lineWidth: 0.5)
 
-                let textRect = inset.insetBy(dx: 8, dy: 6)
+                let textRect = inset.insetBy(dx: 9, dy: 5)
                 guard textRect.width > 10 else { continue }
 
                 let titleText = Text(block.title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(textPrimary)
 
                 let resolvedTitle = context.resolve(titleText)
@@ -615,25 +677,49 @@ private struct ProgramCanvasLayer: View, Equatable {
                 let resolvedTime = block.timeRange.map {
                     context.resolve(
                         Text($0)
-                            .font(.system(size: 11, weight: .regular))
+                            .font(.system(size: 11, weight: .medium))
                             .foregroundColor(textSecondary)
                     )
                 }
                 let timeSize = resolvedTime?.measure(in: unbounded) ?? .zero
 
-                let timeLineHeight = timeSize.height
-
                 context.drawLayer { layer in
                     layer.clip(to: Path(inset))
 
-                    let titleOriginY = block.timeRange == nil
-                        ? inset.midY - titleSize.height / 2
-                        : textRect.minY + timeLineHeight + 1
-                    let titleOrigin = CGPoint(x: textRect.minX, y: titleOriginY)
-                    layer.draw(
-                        resolvedTitle,
-                        in: CGRect(origin: titleOrigin, size: CGSize(width: max(titleSize.width, textRect.width), height: titleSize.height))
-                    )
+                    if let resolvedTime {
+                        let lineGap: CGFloat = 2
+                        let groupHeight = timeSize.height + lineGap + titleSize.height
+                        let groupY = max(textRect.minY, inset.midY - groupHeight / 2)
+                        layer.draw(
+                            resolvedTime,
+                            in: CGRect(
+                                x: textRect.minX,
+                                y: groupY,
+                                width: textRect.width,
+                                height: timeSize.height
+                            )
+                        )
+                        layer.draw(
+                            resolvedTitle,
+                            in: CGRect(
+                                x: textRect.minX,
+                                y: groupY + timeSize.height + lineGap,
+                                width: textRect.width,
+                                height: titleSize.height
+                            )
+                        )
+                    } else {
+                        let titleOriginY = inset.midY - titleSize.height / 2
+                        layer.draw(
+                            resolvedTitle,
+                            in: CGRect(
+                                x: textRect.minX,
+                                y: titleOriginY,
+                                width: textRect.width,
+                                height: titleSize.height
+                            )
+                        )
+                    }
 
                     if block.hasReminder {
                         let bellText = Text(Image(systemName: "bell.fill"))

@@ -13,6 +13,38 @@ nonisolated struct CatchupInfo: Codable, Hashable, Sendable {
     let source: String?
 }
 
+nonisolated enum CatchupLookbackSetting: Int, CaseIterable, Identifiable {
+    case allAvailable = 0
+    case threeDays = 72
+    case sevenDays = 168
+    case fourteenDays = 336
+
+    static let appStorageKey = "buffer_catchup_lookback_hours"
+    static let `default`: CatchupLookbackSetting = .allAvailable
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .allAvailable: return "All available"
+        case .threeDays: return "3 days"
+        case .sevenDays: return "7 days"
+        case .fourteenDays: return "14 days"
+        }
+    }
+
+    var limitHours: Int? {
+        switch self {
+        case .allAvailable: return nil
+        case .threeDays, .sevenDays, .fourteenDays: return rawValue
+        }
+    }
+
+    static func stored(rawValue: Int) -> CatchupLookbackSetting {
+        CatchupLookbackSetting(rawValue: rawValue) ?? `default`
+    }
+}
+
 nonisolated enum ChannelContentType: String, Codable, Sendable {
     case live
     case vod

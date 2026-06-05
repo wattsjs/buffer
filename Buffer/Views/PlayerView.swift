@@ -235,10 +235,15 @@ struct PlayerView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                // Render stack differs by mode, but chrome is unified below.
-                if let s = session {
+                // Single-channel playback mounts the reused mpv layer directly.
+                // Multi-view keeps the grid/cell stack for per-slot layout and
+                // chrome.
+                if let s = session, s.isMulti {
                     PlayerGridView(session: s)
-                        .padding(s.isMulti ? 8 : 0)
+                        .padding(8)
+                        .ignoresSafeArea()
+                } else if let s = session {
+                    MPVLayerView(player: s.focusedSlot.player)
                         .ignoresSafeArea()
                 } else {
                     MPVLayerView(player: player)

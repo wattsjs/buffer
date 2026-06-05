@@ -99,10 +99,10 @@ final class MPVPlayer {
         static let stateEpsilon = 0.05
         static let timePosEpsilon = 0.25
         static let cacheEpsilon = 0.5
-        static let demuxerLavfProbeSize = 4_194_304
+        static let demuxerLavfProbeSize = 1_048_576
         // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
         // AVOption surface.
-        static let demuxerLavfAnalyzeDuration = 5.0
+        static let demuxerLavfAnalyzeDuration = 1.0
         static let fastProbeSize = 65_536
         static let fastAnalyzeDuration = 0.1
         static let liveLatencyEpsilon = 0.5
@@ -187,19 +187,12 @@ final class MPVPlayer {
 
         static var liveStreamLavfOptions: String {
             [
-                "reconnect=1",
-                "reconnect_streamed=1",
-                "reconnect_on_network_error=1",
-                // Explicit status codes only — exclude 509 (Bandwidth Limit
-                // Exceeded). 509 is account-level rate limiting: retrying
-                // at the segment-fetch level adds to the bandwidth that
-                // already exceeded the cap. Let it surface immediately so
-                // PlayerSlot can apply a long, coordinated backoff.
-                "reconnect_on_http_error=429,502,503,504",
-                "reconnect_delay_max=3",
-                "reconnect_max_retries=2",
-                "reconnect_delay_total_max=6",
-                "respect_retry_after=0",
+                // IPTV HLS providers often terminate playlist and segment
+                // responses without a finite content length. libavformat's
+                // reconnect options treat that normal EOF as a byte-range
+                // reconnect loop, delaying or preventing startup. Keep only
+                // a socket timeout here; PlayerSlot owns live-stream reload
+                // recovery at the item level.
                 "rw_timeout=10000000",
             ].joined(separator: ",")
         }
@@ -230,6 +223,9 @@ final class MPVPlayer {
     /// Last URL handed to `loadURL`. Used by callers to avoid redundant
     /// `loadURL` calls when handing off a player.
     private(set) var currentURL: URL?
+    var hasRenderedCurrentLoad: Bool {
+        currentURL != nil && firstRenderedLoadGeneration == loadGeneration
+    }
 
     /// Called whenever mpv fires MPV_EVENT_END_FILE. When non-nil, MPVPlayer
     /// suppresses its automatic `errorMessage` for error/EOF reasons — the
@@ -245,6 +241,8 @@ final class MPVPlayer {
     /// Owners use this to reset recovery watchdog state from "loading" to
     /// "waiting for first playback progress".
     var onFileLoaded: (() -> Void)?
+    /// Emitted after the first frame for a load is actually drawn.
+    var onFirstFrame: (() -> Void)?
     /// Emitted for mpv network/HLS warnings that do not always terminate
     /// playback. Owners can use this as a liveness signal when mpv sits in its
     /// own reconnect loop without delivering `MPV_EVENT_END_FILE`.
@@ -313,6 +311,9 @@ final class MPVPlayer {
     private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
     @ObservationIgnored private var lastHTTPStatusCode: Int = 0
     @ObservationIgnored private var playbackRequested = false
+    @ObservationIgnored private var loadStartedAt: ContinuousClock.Instant?
+    @ObservationIgnored private var loadGeneration = 0
+    @ObservationIgnored private var firstRenderedLoadGeneration = 0
     @ObservationIgnored private var displayPowerAssertion = IOPMAssertionID(0)
     @ObservationIgnored private var holdsDisplayPowerAssertion = false
 
@@ -342,7 +343,10 @@ final class MPVPlayer {
     func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false) {
         guard let handle else { return }
 
-        AppLog.playback.info("mpv load url=\(url.absoluteString, privacy: .private(mask: .hash)) autoplay=\(autoplay, privacy: .public) fastProbe=\(fastProbe, privacy: .public)")
+        loadGeneration &+= 1
+        firstRenderedLoadGeneration = 0
+        loadStartedAt = ContinuousClock.now
+        AppLog.playback.info("mpv load-start generation=\(self.loadGeneration, privacy: .public) url=\(url.absoluteString, privacy: .private(mask: .hash)) autoplay=\(autoplay, privacy: .public) fastProbe=\(fastProbe, privacy: .public)")
         errorMessage = nil
         resetMediaTrackState()
         timePos = 0
@@ -361,9 +365,9 @@ final class MPVPlayer {
         updateDisplayPowerAssertion()
 
         // Fast-probe path is used for known local MPEG-TS sources (recording
-        // files). With the default 1 MiB probesize +
-        // 2 s analyzeduration, mpv's ffmpeg demuxer can spend 5–10 s scanning
-        // the head of a multi-gigabyte .ts file before reporting stream info.
+        // files). With the default 1 MiB probesize + 1 s analyzeduration,
+        // mpv's ffmpeg demuxer can still spend seconds scanning the head of a
+        // multi-gigabyte .ts file before reporting stream info.
         // For MPEG-TS the SPS usually lands in the first few KB, so shrinking
         // the probe window by ~16x trims the open delay without losing
         // detection. Restored to the safe HLS defaults on the next non-fast
@@ -379,6 +383,18 @@ final class MPVPlayer {
         let path = url.absoluteString
         command(handle, ["loadfile", path, "replace"])
         setFlag("pause", !autoplay)
+    }
+
+    func noteRenderedFrame(width: Int, height: Int) {
+        guard currentURL != nil, firstRenderedLoadGeneration != loadGeneration else { return }
+        firstRenderedLoadGeneration = loadGeneration
+        let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
+        if isLoading {
+            isLoading = false
+            updateDisplayPowerAssertion()
+        }
+        AppLog.playback.info("mpv first-frame generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public) size=\(width, privacy: .public)x\(height, privacy: .public)")
+        onFirstFrame?()
     }
 
     func seek(to seconds: Double) {
@@ -405,6 +421,27 @@ final class MPVPlayer {
         command(handle, ["drop-buffers"])
     }
 
+    func nudgeVideoOutputAfterRenderContextAttach() {
+        guard let handle, currentURL != nil else { return }
+        let shouldDropBuffers = !(hasRenderedCurrentLoad && isPlaying)
+        setRuntimeProperty(handle, "vid", "auto")
+        videoDisabledForBackground = false
+        if shouldDropBuffers {
+            command(handle, ["drop-buffers"])
+        }
+        setFlag("pause", false)
+        playbackRequested = true
+        isPlaying = true
+        updateDisplayPowerAssertion()
+        AppLog.playback.info("mpv render-context handoff nudged video output dropBuffers=\(shouldDropBuffers, privacy: .public) rendered=\(self.hasRenderedCurrentLoad, privacy: .public)")
+        logPlaybackSyncSnapshot("render-context-handoff")
+    }
+
+    func logPlaybackSyncSnapshot(_ label: String) {
+        let stats = playbackStats
+        AppLog.playback.info("mpv sync \(label, privacy: .public) playing=\(self.isPlaying, privacy: .public) muted=\(self.isMuted, privacy: .public) cache=\(self.cacheSeconds, privacy: .public) time=\(self.timePos, privacy: .public) frameDrops=\(stats.frameDrops, privacy: .public) decoderDrops=\(stats.decoderFrameDrops, privacy: .public) delayed=\(stats.delayedFrames, privacy: .public) mistimed=\(stats.mistimedFrames, privacy: .public)")
+    }
+
     func play() {
         setFlag("pause", false)
         playbackRequested = true
@@ -426,6 +463,8 @@ final class MPVPlayer {
         isPlaying = false
         isBuffering = false
         isLoading = false
+        loadStartedAt = nil
+        firstRenderedLoadGeneration = loadGeneration
         updateDisplayPowerAssertion()
     }
 
@@ -457,6 +496,7 @@ final class MPVPlayer {
         // recovery logic firing on an idle pooled instance.
         onPlaybackEnded = nil
         onFileLoaded = nil
+        onFirstFrame = nil
         onStreamIssue = nil
         onMediaInfoChanged = nil
 
@@ -485,6 +525,8 @@ final class MPVPlayer {
         estimatedFps = 0
         lastHTTPStatusCode = 0
         mpvLogSuppression = [:]
+        loadStartedAt = nil
+        firstRenderedLoadGeneration = loadGeneration
         focusedScaling = true
 
         releaseDisplayPowerAssertion()
@@ -751,7 +793,7 @@ final class MPVPlayer {
         setOption(newHandle, "cache", "auto")
         setOption(newHandle, "cache-secs", String(Tuning.cacheCapacitySeconds(for: bufferSeconds)))
         setOption(newHandle, "cache-pause", "yes")
-        setOption(newHandle, "cache-pause-initial", "yes")
+        setOption(newHandle, "cache-pause-initial", "no")
         setOption(newHandle, "cache-pause-wait", String(Tuning.cachePauseWaitSeconds(for: bufferSeconds)))
 
         // Demuxer buffer sizing. Sized in MiB based on bitrate estimates,
@@ -819,6 +861,16 @@ final class MPVPlayer {
         // failures remain visible without spamming routine track/renderer
         // state on every load.
         mpv_request_log_messages(newHandle, "warn")
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1_000 + Double(components.attoseconds) / 1_000_000_000_000_000
+    }
+
+    private func loadElapsedMilliseconds() -> Double? {
+        guard let loadStartedAt else { return nil }
+        return Self.milliseconds(loadStartedAt.duration(to: ContinuousClock.now))
     }
 
     private func reloadBufferSetting() {
@@ -946,7 +998,9 @@ final class MPVPlayer {
                 AppLog.playback.debug("mpv start-file")
             case MPV_EVENT_FILE_LOADED:
                 errorMessage = nil
-                AppLog.playback.info("mpv file-loaded")
+                setState(\.isLoading, false)
+                let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
+                AppLog.playback.info("mpv file-loaded generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
                 onFileLoaded?()
                 if let paused = readFlagProperty("pause") {
                     pending.isPlaying = !paused

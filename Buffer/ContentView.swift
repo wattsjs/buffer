@@ -14,11 +14,15 @@ struct ContentView: View {
     @State private var sportsViewModel = SportsViewModel()
     @State private var appFeedback = AppFeedbackCenter.shared
     @State private var selectionBeforeSearch: SidebarSelection?
+    @State private var didSchedulePlayerPrewarm = false
+    @State private var prebufferedChannelID: String?
+    @State private var prebufferRenderPlayer: MPVPlayer?
     @FocusState private var searchFieldFocused: Bool
     @Environment(\.openWindow) private var openWindow
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
     @AppStorage("hideSport") private var hideSport = false
     @AppStorage(EPGViewModel.disableVODKey) private var disableVOD = false
+    @AppStorage(CatchupLookbackSetting.appStorageKey) private var catchupLookbackRawValue = CatchupLookbackSetting.default.rawValue
 
     private var playlistSelectionBinding: Binding<UUID> {
         Binding(
@@ -28,14 +32,31 @@ struct ContentView: View {
     }
 
     private func openChannel(_ channel: Channel) {
-        viewModel.addRecent(channel)
-        updateSportsMatchingPreferences()
         if selectedPlayer != .none {
+            viewModel.addRecent(channel)
+            updateSportsMatchingPreferences()
             AppLog.playback.info("Opening channel externally name=\(channel.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
             ExternalPlayer.launch(streamURL: channel.streamURL, using: selectedPlayer)
         } else {
             AppLog.playback.info("Opening channel in Buffer name=\(channel.name, privacy: .public)")
+            PlayerSession.noteOpen(channel: channel)
+            let shouldDetachPrebufferSurface = prebufferedChannelID == channel.id
             openWindow(value: channel)
+            Task { @MainActor in
+                await Task.yield()
+                viewModel.addRecent(channel)
+                updateSportsMatchingPreferences()
+                scheduleInternalPlayerPrewarm()
+            }
+            if shouldDetachPrebufferSurface {
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    if prebufferedChannelID == channel.id {
+                        prebufferRenderPlayer = nil
+                        prebufferedChannelID = nil
+                    }
+                }
+            }
         }
     }
 
@@ -177,6 +198,7 @@ struct ContentView: View {
                 onChannelSelected: { openChannel($0) },
                 onVODSelected: { openVODItem($0.item, resumePosition: $0.positionSeconds) },
                 onVODRemoved: { viewModel.removeVODResumeEntry(id: $0.id) },
+                onPrebufferCandidate: { schedulePredictedPlayerPrebuffer(channel: $0) },
                 sportsViewModel: sportsViewModel
             )
         case .sports:
@@ -298,6 +320,7 @@ struct ContentView: View {
                 channels: viewModel.filteredChannels,
                 hasLoadedOnce: viewModel.hasLoadedOnce,
                 revealChannelID: viewModel.revealChannelID,
+                catchupLookback: CatchupLookbackSetting.stored(rawValue: catchupLookbackRawValue),
                 programsProvider: { viewModel.programsForChannel($0) },
                 rangedProgramsProvider: { ch, start, end in viewModel.programsForChannel(ch, between: start, and: end) },
                 isFavorite: { viewModel.isFavorite($0) },
@@ -395,6 +418,64 @@ struct ContentView: View {
         .background(Color(nsColor: .textBackgroundColor))
     }
 
+    private func updateSearchIndex() {
+        let vodItems: [VODItem] = disableVOD ? [] : viewModel.movieItems + viewModel.seriesEpisodes.values.flatMap { $0 }
+        let vodSeries: [VODSeries] = disableVOD ? [] : viewModel.vodSeries
+        searchController.updateIndex(
+            programs: viewModel.searchEntries,
+            programStore: viewModel.programs,
+            channels: viewModel.channels,
+            vodItems: vodItems,
+            vodSeries: vodSeries
+        )
+    }
+
+    private func scheduleInternalPlayerPrewarm() {
+        guard selectedPlayer == .none, !didSchedulePlayerPrewarm else { return }
+        didSchedulePlayerPrewarm = true
+        Task { @MainActor in
+            await Task.yield()
+            PlayerSession.prewarmPlayerPool()
+        }
+    }
+
+    private func schedulePredictedPlayerPrebuffer() {
+        guard selectedPlayer == .none else { return }
+        guard let channel = predictedPrebufferChannel() else { return }
+        schedulePredictedPlayerPrebuffer(channel: channel)
+    }
+
+    private func schedulePredictedPlayerPrebuffer(channel: Channel) {
+        guard selectedPlayer == .none else { return }
+        guard prebufferedChannelID != channel.id else { return }
+        prebufferedChannelID = channel.id
+        Task { @MainActor in
+            await Task.yield()
+            prebufferRenderPlayer = PlayerSession.prebuffer(channel: channel)
+        }
+    }
+
+    private func predictedPrebufferChannel() -> Channel? {
+        let liveRecents = viewModel.recentChannels.filter { !$0.isOnDemand }
+        return liveRecents.first(where: isHighQualityChannel) ?? liveRecents.first
+    }
+
+    private func isHighQualityChannel(_ channel: Channel) -> Bool {
+        let text = "\(channel.name) \(channel.group)".localizedLowercase
+        return text.contains("4k") || text.contains("uhd")
+    }
+
+    @ViewBuilder
+    private var prebufferRenderSurface: some View {
+        if let prebufferRenderPlayer {
+            MPVLayerView(player: prebufferRenderPlayer)
+                .frame(width: 2, height: 2)
+                .opacity(0.01)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+
     var body: some View {
         Group {
             if viewModel.playlists.isEmpty {
@@ -422,18 +503,18 @@ struct ContentView: View {
                 }
             }
         }
+        .overlay(alignment: .bottomTrailing) {
+            prebufferRenderSurface
+        }
         .onAppear {
-            searchController.updateIndex(
-                programs: viewModel.searchEntries,
-                programStore: viewModel.programs,
-                channels: viewModel.channels,
-                vodItems: disableVOD ? [] : viewModel.movieItems + viewModel.seriesEpisodes.values.flatMap { $0 },
-                vodSeries: disableVOD ? [] : viewModel.vodSeries
-            )
+            updateSearchIndex()
             updateSportsMatchingContext()
+            scheduleInternalPlayerPrewarm()
+            schedulePredictedPlayerPrebuffer()
         }
         .onChange(of: viewModel.channels.count) { _, _ in
             updateSportsMatchingContext()
+            schedulePredictedPlayerPrebuffer()
         }
         .onChange(of: viewModel.programs.count) { _, _ in
             updateSportsMatchingContext()
@@ -443,6 +524,7 @@ struct ContentView: View {
         }
         .onChange(of: viewModel.recentChannelIDs) { _, _ in
             updateSportsMatchingPreferences()
+            schedulePredictedPlayerPrebuffer()
         }
         .onChange(of: viewModel.hiddenGroupNames) { _, _ in
             updateSportsMatchingContext()
@@ -452,23 +534,15 @@ struct ContentView: View {
         }
         .onChange(of: disableVOD) { _, disabled in
             viewModel.applyVODPreference(disabled: disabled)
-            searchController.updateIndex(
-                programs: viewModel.searchEntries,
-                programStore: viewModel.programs,
-                channels: viewModel.channels,
-                vodItems: disabled ? [] : viewModel.movieItems + viewModel.seriesEpisodes.values.flatMap { $0 },
-                vodSeries: disabled ? [] : viewModel.vodSeries
-            )
+            updateSearchIndex()
+        }
+        .onChange(of: catchupLookbackRawValue) { _, _ in
+            viewModel.syncGuideForLookbackChange()
         }
         .onChange(of: viewModel.searchIndexVersion) { _, _ in
-            searchController.updateIndex(
-                programs: viewModel.searchEntries,
-                programStore: viewModel.programs,
-                channels: viewModel.channels,
-                vodItems: disableVOD ? [] : viewModel.movieItems + viewModel.seriesEpisodes.values.flatMap { $0 },
-                vodSeries: disableVOD ? [] : viewModel.vodSeries
-            )
+            updateSearchIndex()
             updateSportsMatchingContext()
+            schedulePredictedPlayerPrebuffer()
         }
         .onChange(of: viewModel.selection) { oldValue, newValue in
             handleSidebarSelectionChange(from: oldValue, to: newValue)
@@ -497,6 +571,9 @@ struct ContentView: View {
             // Launch refreshes follow the user's automatic refresh settings.
             viewModel.syncOnLaunchIfNeeded()
             viewModel.startSyncScheduler()
+
+            scheduleInternalPlayerPrewarm()
+            schedulePredictedPlayerPrebuffer()
 
             // Pre-load sports data so live events show on the Home page.
             // Deferred by a short delay so app-launch paint + initial EPG sync
