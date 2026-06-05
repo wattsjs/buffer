@@ -17,49 +17,9 @@ struct XtreamAccountInfo: Codable, Equatable {
     }
 }
 
-// Xtream APIs return numbers as either strings or ints inconsistently.
-// This wrapper handles both.
-private struct FlexibleString: Decodable {
-    let value: String
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if container.decodeNil() {
-            value = ""
-        } else if let str = try? container.decode(String.self) {
-            value = str
-        } else if let int = try? container.decode(Int.self) {
-            value = String(int)
-        } else if let double = try? container.decode(Double.self) {
-            value = String(Int(double))
-        } else {
-            value = ""
-        }
-    }
-}
-
-private struct FlexibleBool: Decodable {
-    let value: Bool
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let bool = try? container.decode(Bool.self) {
-            value = bool
-        } else if let int = try? container.decode(Int.self) {
-            value = int != 0
-        } else if let string = try? container.decode(String.self) {
-            let normalized = string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            value = !(normalized.isEmpty || normalized == "0" || normalized == "false")
-        } else {
-            value = false
-        }
-    }
-}
-
-// MARK: - Flexible string decoding helpers
-// Avoids the per-field struct allocation of FlexibleString by decoding
-// directly in the keyed container. Xtream APIs return numbers inconsistently
-// as either String or Int; these helpers handle both.
+// MARK: - Flexible decode helpers
+// Xtream APIs return numbers inconsistently as either String or Int;
+// these helpers handle both without per-field struct allocations.
 
 extension KeyedDecodingContainer {
     // String-first: for fields that are typically strings (names, URLs, IDs)
@@ -211,11 +171,11 @@ actor XtreamClient {
         let plot: String?
         let description: String?
         let genre: String?
-        let rating: FlexibleString?
+        let rating: String?
         let releasedate: String?
         let releaseDate: String?
-        let duration_secs: FlexibleString?
-        let duration: FlexibleString?
+        let duration_secs: String?
+        let duration: String?
         let director: String?
         let cast: String?
         let country: String?
@@ -224,14 +184,45 @@ actor XtreamClient {
             case name, movie_image, cover_big, plot, description, genre, rating, releasedate, duration_secs, duration, director, cast, country
             case releaseDate = "release_date"
         }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+            movie_image = try c.decodeIfPresent(String.self, forKey: .movie_image)
+            cover_big = try c.decodeIfPresent(String.self, forKey: .cover_big)
+            plot = try c.decodeIfPresent(String.self, forKey: .plot)
+            description = try c.decodeIfPresent(String.self, forKey: .description)
+            genre = try c.decodeIfPresent(String.self, forKey: .genre)
+            rating = try c.flexStringIfPresent(forKey: .rating)
+            releasedate = try c.decodeIfPresent(String.self, forKey: .releasedate)
+            releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
+            duration_secs = try c.flexIntIfPresent(forKey: .duration_secs)
+            duration = try c.flexStringIfPresent(forKey: .duration)
+            director = try c.decodeIfPresent(String.self, forKey: .director)
+            cast = try c.decodeIfPresent(String.self, forKey: .cast)
+            country = try c.decodeIfPresent(String.self, forKey: .country)
+        }
     }
 
     private struct XtreamVODMovieData: Decodable {
-        let stream_id: FlexibleString?
+        let stream_id: String?
         let name: String?
-        let added: FlexibleString?
-        let category_id: FlexibleString?
+        let added: String?
+        let category_id: String?
         let container_extension: String?
+
+        enum CodingKeys: String, CodingKey {
+            case stream_id, name, added, category_id, container_extension
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            stream_id = try c.flexIntIfPresent(forKey: .stream_id)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+            added = try c.flexStringIfPresent(forKey: .added)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
+            container_extension = try c.decodeIfPresent(String.self, forKey: .container_extension)
+        }
     }
 
     private struct XtreamSeries: Decodable {
@@ -286,29 +277,42 @@ actor XtreamClient {
     private struct XtreamSeriesInfo: Decodable {
         let name: String?
         let cover: String?
-        let category_id: FlexibleString?
+        let category_id: String?
         let plot: String?
         let cast: String?
         let director: String?
         let genre: String?
         let releaseDate: String?
-        let rating: FlexibleString?
+        let rating: String?
 
         enum CodingKeys: String, CodingKey {
             case name, cover, category_id, plot, cast, director, genre, rating
             case releaseDate = "release_date"
         }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+            cover = try c.decodeIfPresent(String.self, forKey: .cover)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
+            plot = try c.decodeIfPresent(String.self, forKey: .plot)
+            cast = try c.decodeIfPresent(String.self, forKey: .cast)
+            director = try c.decodeIfPresent(String.self, forKey: .director)
+            genre = try c.decodeIfPresent(String.self, forKey: .genre)
+            releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
+            rating = try c.flexStringIfPresent(forKey: .rating)
+        }
     }
 
     private struct XtreamEpisode: Decodable {
         let id: String
-        let episode_num: FlexibleString?
+        let episode_num: String?
         let title: String?
         let name: String?
         let container_extension: String?
-        let season: FlexibleString?
+        let season: String?
         let plot: String?
-        let added: FlexibleString?
+        let added: String?
         let info: XtreamEpisodeInfo?
 
         enum CodingKeys: String, CodingKey {
@@ -318,29 +322,29 @@ actor XtreamClient {
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             id = (
-                try container.decodeIfPresent(FlexibleString.self, forKey: .id)?.value ??
-                container.decodeIfPresent(FlexibleString.self, forKey: .stream_id)?.value ??
-                container.decodeIfPresent(FlexibleString.self, forKey: .episode_id)?.value ??
+                try container.flexStringIfPresent(forKey: .id) ??
+                container.flexStringIfPresent(forKey: .stream_id) ??
+                container.flexStringIfPresent(forKey: .episode_id) ??
                 ""
             )
-            episode_num = try container.decodeIfPresent(FlexibleString.self, forKey: .episode_num)
+            episode_num = try container.flexStringIfPresent(forKey: .episode_num)
             title = try container.decodeIfPresent(String.self, forKey: .title)
             name = try container.decodeIfPresent(String.self, forKey: .name)
             container_extension = try container.decodeIfPresent(String.self, forKey: .container_extension)
-            season = try container.decodeIfPresent(FlexibleString.self, forKey: .season)
+            season = try container.flexStringIfPresent(forKey: .season)
             plot = try container.decodeIfPresent(String.self, forKey: .plot)
-            added = try container.decodeIfPresent(FlexibleString.self, forKey: .added)
+            added = try container.flexStringIfPresent(forKey: .added)
             info = try container.decodeIfPresent(XtreamEpisodeInfo.self, forKey: .info)
         }
     }
 
     private struct XtreamEpisodeInfo: Decodable {
         let plot: String?
-        let duration_secs: FlexibleString?
-        let duration: FlexibleString?
+        let duration_secs: String?
+        let duration: String?
         let movie_image: String?
         let cover: String?
-        let rating: FlexibleString?
+        let rating: String?
         let releasedate: String?
         let releaseDate: String?
         let director: String?
@@ -350,6 +354,21 @@ actor XtreamClient {
         enum CodingKeys: String, CodingKey {
             case plot, duration_secs, duration, movie_image, cover, rating, releasedate, director, cast, genre
             case releaseDate = "release_date"
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            plot = try c.decodeIfPresent(String.self, forKey: .plot)
+            duration_secs = try c.flexIntIfPresent(forKey: .duration_secs)
+            duration = try c.flexStringIfPresent(forKey: .duration)
+            movie_image = try c.decodeIfPresent(String.self, forKey: .movie_image)
+            cover = try c.decodeIfPresent(String.self, forKey: .cover)
+            rating = try c.flexStringIfPresent(forKey: .rating)
+            releasedate = try c.decodeIfPresent(String.self, forKey: .releasedate)
+            releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
+            director = try c.decodeIfPresent(String.self, forKey: .director)
+            cast = try c.decodeIfPresent(String.self, forKey: .cast)
+            genre = try c.decodeIfPresent(String.self, forKey: .genre)
         }
     }
 
@@ -553,9 +572,9 @@ actor XtreamClient {
             streamURL: item.streamURL,
             kind: item.kind,
             genre: nonEmpty(info?.genre) ?? item.genre,
-            durationSeconds: durationSeconds(seconds: info?.duration_secs?.value, duration: info?.duration) ?? item.durationSeconds,
-            rating: nonEmpty(info?.rating?.value) ?? item.rating,
-            releaseDate: firstNonEmpty(info?.releaseDate, info?.releasedate, epochDateString(from: movieData?.added?.value), item.releaseDate),
+            durationSeconds: durationSeconds(seconds: info?.duration_secs, duration: info?.duration) ?? item.durationSeconds,
+            rating: nonEmpty(info?.rating) ?? item.rating,
+            releaseDate: firstNonEmpty(info?.releaseDate, info?.releasedate, epochDateString(from: movieData?.added), item.releaseDate),
             containerExtension: nonEmpty(movieData?.container_extension) ?? item.containerExtension,
             summary: firstNonEmpty(info?.plot, info?.description, item.summary),
             director: nonEmpty(info?.director) ?? item.director,
@@ -606,7 +625,7 @@ actor XtreamClient {
         let envelope = try JSONDecoder().decode(XtreamSeriesInfoEnvelope.self, from: data)
         let seriesName = envelope.info?.name ?? series.name
         let posterURL = envelope.info?.cover.flatMap { URL(string: $0) } ?? series.posterURL
-        let categoryName = envelope.info?.category_id?.value.isEmpty == false ? series.group : series.group
+        let categoryName = envelope.info?.category_id?.isEmpty == false ? series.group : series.group
 
         var items: [VODItem] = []
         for (seasonKey, episodes) in envelope.episodes.seasons {
@@ -617,8 +636,8 @@ actor XtreamClient {
                 guard let streamURL = URL(string: "\(config.xtreamBaseURL)/series/\(config.username)/\(config.password)/\(episode.id).\(ext)") else {
                     continue
                 }
-                let episodeNumber = Int(episode.episode_num?.value ?? "") ?? 0
-                let seasonNumber = Int(episode.season?.value ?? "") ?? fallbackSeasonNumber
+                let episodeNumber = Int(episode.episode_num ?? "") ?? 0
+                let seasonNumber = Int(episode.season ?? "") ?? fallbackSeasonNumber
                 let fallbackTitle = formattedEpisodeTitle(seriesName: seriesName, season: seasonNumber, episode: episodeNumber)
                 let imageURL = episode.info?.movie_image.flatMap { URL(string: $0) }
                     ?? episode.info?.cover.flatMap { URL(string: $0) }
@@ -632,8 +651,8 @@ actor XtreamClient {
                     kind: .seriesEpisode,
                     genre: episode.info?.genre ?? envelope.info?.genre ?? categoryName,
                     durationSeconds: durationSeconds(from: episode.info),
-                    rating: episode.info?.rating?.value,
-                    releaseDate: episode.info?.releaseDate ?? episode.info?.releasedate ?? epochDateString(from: episode.added?.value),
+                    rating: episode.info?.rating,
+                    releaseDate: episode.info?.releaseDate ?? episode.info?.releasedate ?? epochDateString(from: episode.added),
                     containerExtension: ext,
                     summary: episode.plot ?? episode.info?.plot ?? envelope.info?.plot,
                     director: episode.info?.director ?? envelope.info?.director,
@@ -706,14 +725,14 @@ actor XtreamClient {
 
     private func durationSeconds(from info: XtreamEpisodeInfo?) -> Int? {
         guard let info else { return nil }
-        return durationSeconds(seconds: info.duration_secs?.value, duration: info.duration)
+        return durationSeconds(seconds: info.duration_secs, duration: info.duration)
     }
 
-    private func durationSeconds(seconds rawSeconds: String?, duration: FlexibleString?) -> Int? {
+    private func durationSeconds(seconds rawSeconds: String?, duration: String?) -> Int? {
         if let seconds = Int(rawSeconds ?? ""), seconds > 0 {
             return seconds
         }
-        guard let raw = duration?.value, !raw.isEmpty else { return nil }
+        guard let raw = duration, !raw.isEmpty else { return nil }
         let pieces = raw.split(separator: ":").compactMap { Int($0) }
         switch pieces.count {
         case 3:

@@ -16,9 +16,17 @@ PASS="${2:-d2xJ6JJr3m}"
 total_penalty=0
 stream_count=0
 
+# Clean up any leftover proxy processes
+pkill -f stability_proxy 2>/dev/null || true
+sleep 1
+
+port_base=19876
+port_idx=0
+
 for sid in $STREAM_IDS; do
-    # Use unique port per stream to avoid TIME_WAIT conflicts
-    PORT=$((19876 + sid % 100))
+    # Use unique port per stream
+    PORT=$((port_base + port_idx))
+    port_idx=$((port_idx + 1))
 
     STREAM_URL="${SERVER}/live/${USER}/${PASS}/${sid}.m3u8"
 
@@ -47,9 +55,12 @@ for sid in $STREAM_IDS; do
     MPV_EXIT=$?
     set -e
 
-    # Kill proxy + wait
+    # Kill proxy + wait + force-clean
     kill $PROXY_PID 2>/dev/null || true
     wait $PROXY_PID 2>/dev/null || true
+    # Force-kill any remaining child threads
+    lsof -ti :$PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 2
 
     # Count proxy stalls from log
     STALLS=$(grep -c '\[stall' "$PROXY_LOG" 2>/dev/null || echo "0")

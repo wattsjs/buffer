@@ -149,6 +149,7 @@ def main():
 
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PROXY_PORT), ProxyHandler)
     server.allow_reuse_address = True
+    server.daemon_threads = True
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # SO_REUSEPORT may not be available on all platforms; ignore if it fails
     try:
