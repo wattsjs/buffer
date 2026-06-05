@@ -396,9 +396,9 @@ actor XtreamClient {
 
         var channels: [Channel] = []
         channels.reserveCapacity(streams.count)
+        guard let baseURL = config.xtreamStreamBase else { return [] }
         for stream in streams {
-            guard let baseURL = config.xtreamStreamBase else { return nil }
-            let streamURL = baseURL.appendingPathComponent("\(stream.stream_id.value).m3u8")
+            let streamURL = baseURL.appendingPathComponent("\(stream.stream_id).m3u8")
             let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
 
             channels.append(Channel(
