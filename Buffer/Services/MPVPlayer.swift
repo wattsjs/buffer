@@ -197,10 +197,11 @@ final class MPVPlayer {
                 // reconnect loop, delaying or preventing startup. Keep only
                 // a socket timeout here; PlayerSlot owns live-stream reload
                 // recovery at the item level.
-                // Reduced from 10s to 3s — 10s of blocking I/O is longer than
-                // any healthy CDN segment fetch, and the app's own reconnect
-                // policy recovers faster than waiting for a socket timeout.
-                "rw_timeout=3000000",
+                // 8 s gives enough headroom for slow CDN segments (4–6 s)
+                // without triggering premature reconnects during transient
+                // network stalls, while still failing faster than the 10 s
+                // ffmpeg default.
+                "rw_timeout=8000000",
             ].joined(separator: ",")
         }
     }

@@ -22,33 +22,22 @@ SEED = int(os.environ.get("SEED", "42"))
 random.seed(SEED)
 
 class StallHandler:
-    """Manages artificial connection stalls and errors."""
+    """Manages artificial connection stalls."""
     def __init__(self):
-        self._stall_until = 0.0
-        self._lock = threading.Lock()
         self.stall_count = 0
-        self.error_count = 0
 
-    def maybe_disturb(self, path: str) -> str | None:
-        """Returns 'stall', 'error', or None."""
+    def maybe_stall(self, path: str) -> bool:
+        """Stall the request with probability SEGMENT_DROP_RATE. Returns True if stalled."""
         if not path.endswith('.ts'):
-            return None
+            return False
         if random.random() > SEGMENT_DROP_RATE:
-            return None
-        
-        # 20% chance of HTTP error (502), 80% stall
-        if random.random() < 0.2:
-            self.error_count += 1
-            print(f"[error #{self.error_count}] 502 on {path}", file=sys.stderr, flush=True)
-            return 'error'
+            return False
         
         duration = random.uniform(STALL_DURATION_MS * 0.5, STALL_DURATION_MS * 1.5) / 1000.0
-        with self._lock:
-            self._stall_until = time.time() + duration
         self.stall_count += 1
         print(f"[stall #{self.stall_count}] {duration*1000:.0f}ms on {path}", file=sys.stderr, flush=True)
         time.sleep(duration)
-        return 'stall'
+        return True
 
 stall_handler = StallHandler()
 
@@ -58,11 +47,11 @@ PLAYLIST_CONTENT = b""
 SEGMENT_CACHE = {}  # path -> (content_type, data)
 SEGMENT_CACHE_LOCK = threading.Lock()
 
-def fetch_with_retry(url, max_retries=3):
+def fetch_with_retry(url, max_retries=2):
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.read(), resp.headers.get('Content-Type', 'application/octet-stream')
         except Exception as e:
             if attempt == max_retries - 1:
@@ -88,22 +77,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path
 
-        # Inject stalls or errors
-        disturb = stall_handler.maybe_disturb(path)
-        if disturb == 'error':
-            self.send_response(502)
-            self.end_headers()
-            self.wfile.write(b'Bad Gateway')
-            return
-        # 'stall' already slept; continue normally
-        # None: no disturbance, continue normally
+        # Inject stalls (may sleep for several seconds)
+        stall_handler.maybe_stall(path)
 
         if path.endswith('.m3u8'):
             # Serve rewritten playlist
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
-            self.end_headers()
-            self.wfile.write(PLAYLIST_CONTENT)
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
+                self.end_headers()
+                self.wfile.write(PLAYLIST_CONTENT)
+            except BrokenPipeError:
+                pass
             return
 
         if path.endswith('.ts'):
@@ -111,11 +96,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             with SEGMENT_CACHE_LOCK:
                 if path in SEGMENT_CACHE:
                     content_type, data = SEGMENT_CACHE[path]
-                    self.send_response(200)
-                    self.send_header('Content-Type', content_type)
-                    self.send_header('Content-Length', str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
+                    try:
+                        self.send_response(200)
+                        self.send_header('Content-Type', content_type)
+                        self.send_header('Content-Length', str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                    except BrokenPipeError:
+                        pass
                     return
 
             # Fetch from upstream
@@ -129,11 +117,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+            except BrokenPipeError:
+                # Client disconnected during long stall — ignore
+                pass
             except Exception as e:
-                print(f"[proxy] segment fetch failed: {path} -> {e}", file=sys.stderr, flush=True)
-                self.send_response(502)
-                self.end_headers()
-                self.wfile.write(b'Bad Gateway')
+                # Only log if it's not a client disconnect
+                if not isinstance(e, BrokenPipeError):
+                    print(f"[proxy] segment fetch failed: {path} -> {e}", file=sys.stderr, flush=True)
+                try:
+                    self.send_response(502)
+                    self.end_headers()
+                    self.wfile.write(b'Bad Gateway')
+                except BrokenPipeError:
+                    pass
             return
 
         self.send_response(404)
