@@ -501,6 +501,9 @@ final class EPGContainerView: NSView {
         let bodyWidth = max(0, w - ccw)
         let bodyHeight = max(0, h - hh)
 
+        // Virtualized EPG grid with two main NSTableViews (channels and programs) that vertical scroll together.
+        // The standard AppKit table handles frame syncing, row recycling, and heights automatically.
+        // Drawing manual table frames on top of the layout system broke vertical scrolling in AppKit table.
         cornerHost.frame = NSRect(x: 0, y: 0, width: ccw, height: hh)
         headerScrollView.frame = NSRect(x: ccw, y: 0, width: bodyWidth, height: hh)
         channelScrollView.frame = NSRect(x: 0, y: hh, width: ccw, height: bodyHeight)
@@ -516,26 +519,11 @@ final class EPGContainerView: NSView {
     }
 
     private func syncDocumentFrames() {
-        let bodyHeight = max(0, bounds.height - dimensions.headerHeight)
-        let tableHeight = max(bodyHeight, CGFloat(programTableView.numberOfRows) * dimensions.rowHeight)
-
         headerHost.frame = NSRect(
             x: 0,
             y: 0,
             width: dimensions.programRowWidth,
             height: dimensions.headerHeight
-        )
-        channelTableView.frame = NSRect(
-            x: 0,
-            y: 0,
-            width: dimensions.channelColumnWidth,
-            height: tableHeight
-        )
-        programTableView.frame = NSRect(
-            x: 0,
-            y: 0,
-            width: dimensions.programRowWidth,
-            height: tableHeight
         )
     }
 
