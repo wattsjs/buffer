@@ -421,10 +421,16 @@ final class MPVPlayer {
         // URLSession reuses connections and resolves redirects faster than
         // mpv/ffmpeg's internal HTTP stack, saving ~4s on Xtream streams.
         let capturedURL = url
+        let capturedGeneration = loadGeneration
         let useFastProbe = fastProbe
         Task { @MainActor [weak self] in
             guard let self, let handle = self.handle else { return }
+            guard self.loadGeneration == capturedGeneration else {
+                AppLog.playback.info("mpv redirect resolution cancelled (stale generation)")
+                return
+            }
             let resolvedURL = await Self.resolveRedirect(for: capturedURL) ?? capturedURL
+            guard self.loadGeneration == capturedGeneration else { return }
             if resolvedURL != capturedURL {
                 AppLog.playback.info("mpv redirect resolved to=\(resolvedURL.absoluteString, privacy: .private(mask: .hash))")
                 self.currentURL = resolvedURL
