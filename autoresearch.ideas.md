@@ -8,38 +8,34 @@
 
 ### Larger ffmpeg I/O buffer (512KB)
 - `demuxer-lavf-buffersize=524288` — 16× the 32KB default
-- 4K startup: 4682ms → 1809ms (61%)
+- 4K startup: 4682ms → 1809ms (61% improvement)
 
 ### Reduced stream probing
 - probesize 524288, analyzeduration 0.5
 
 ### CDN redirect bypass + cache
 - URLSession HEAD resolves silksurfer.com → CDN edge URL before mpv
+- 5-minute in-memory cache
 
 ### Tighter network-timeout
 - network-timeout=5 (was 10)
 
-## Validated (this iteration)
+### Graduated readahead (this iteration)
+- Startup: `min(bufferSeconds, 8)` ≈ 5s readahead → faster first frame
+- After first frame renders: upgraded to full `cacheCapacitySeconds` ≈ 15s
+- Best of both: fast startup + full stall resilience after warm-up
 
-### video-timing-offset=0.016 is optimal
-- 0.008s: **27 frame drops** on 4K (decoder can't keep up)
-- 0.016s: 0 drops on both 4K and FHD ✅
-- 0.032s: 0 drops (no benefit over 0.016)
-- **Current app value is correct**
+## Validated
 
-### cache-pause-wait: 10s buffer dominates
-- Tested 1.0s, 2.5s, 5.0s — all zero drops with up to 8s stalls at 50%
-- The 10s cache buffer absorbs stalls before cache-pause ever triggers
-- Current 2.5s value is well-centered; no change needed
-
-### Proxy stall testing effective for FHD, impractical for 4K
-- Proxy-injected stalls accurately simulate network delays
-- FHD segments (~1-2MB) work well; 4K segments (~4-8MB) too large for proxy relay
-- Validated: 0 frame drops under 8s stalls at 50% rate on FHD
+### All current settings are well-tuned
+- `video-timing-offset=0.016`: 0 drops on 4K+FHD. 0.008 causes 27 drops on 4K
+- `cache-pause-wait=2.5s`: zero drops across 1.0s–5.0s range — 10s buffer absorbs stalls
+- `cache-secs=15` (app default): slightly faster startup than 10s, better stall margin than 5s
+- `readahead=15s`: 0.44s min cache during 7s stalls vs 0s for 5s readahead
 
 ## Deferred
 
-- **Connection reset recovery**: inject 502/503 errors to test mpv reconnect
-- **demuxer-hysteresis-secs**: currently 0; adding 1s might prevent rapid pause/resume under intermittent issues
-- **cache-pause-floor vs mpv cache-pause interaction**: app's guard pauses at 1.0s, mpv's pause triggers near 0 — verify these don't conflict
+- **Connection reset recovery**: inject 502/503 errors to test mpv reconnect behavior
 - **Multi-view stability**: 9-slot grid with stalls on one stream
+- **demuxer-hysteresis-secs**: currently 0; adding 1s might smooth rapid pause/resume
+- **Graduated cache-secs**: like readahead, could start smaller and ramp up after first frame

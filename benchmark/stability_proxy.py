@@ -22,22 +22,30 @@ SEED = int(os.environ.get("SEED", "42"))
 random.seed(SEED)
 
 class StallHandler:
-    """Manages artificial connection stalls."""
+    """Manages artificial network disturbances."""
     def __init__(self):
         self.stall_count = 0
+        self.error_count = 0
 
-    def maybe_stall(self, path: str) -> bool:
-        """Stall the request with probability SEGMENT_DROP_RATE. Returns True if stalled."""
+    def maybe_disturb(self, path: str) -> str | None:
+        """Returns 'stall', 'error', or None."""
         if not path.endswith('.ts'):
-            return False
+            return None
         if random.random() > SEGMENT_DROP_RATE:
-            return False
+            return None
+        
+        # ERROR_INJECT_RATE fraction of disturbances are 502 errors instead of stalls
+        error_rate = float(os.environ.get("ERROR_INJECT_RATE", "0"))
+        if random.random() < error_rate:
+            self.error_count += 1
+            print(f"[error #{self.error_count}] 502 on {path}", file=sys.stderr, flush=True)
+            return 'error'
         
         duration = random.uniform(STALL_DURATION_MS * 0.5, STALL_DURATION_MS * 1.5) / 1000.0
         self.stall_count += 1
         print(f"[stall #{self.stall_count}] {duration*1000:.0f}ms on {path}", file=sys.stderr, flush=True)
         time.sleep(duration)
-        return True
+        return 'stall'
 
 stall_handler = StallHandler()
 
@@ -77,8 +85,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path
 
-        # Inject stalls (may sleep for several seconds)
-        stall_handler.maybe_stall(path)
+        # Inject disturbances (stall or error)
+        disturb = stall_handler.maybe_disturb(path)
+        if disturb == 'error':
+            try:
+                self.send_response(502)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Bad Gateway')
+            except BrokenPipeError:
+                pass
+            return
+        # 'stall' already slept; continue normally
+        # None: no disturbance
 
         if path.endswith('.m3u8'):
             # Serve rewritten playlist

@@ -27,6 +27,7 @@ for sid in $STREAM_IDS; do
     # Start proxy, log to file
     PROXY_LOG=$(mktemp)
     STALL_DURATION_MS=$STALL_MS SEGMENT_DROP_RATE=$DROP_RATE PROXY_PORT=$PORT SEED=$((SEED + sid)) \
+    ERROR_INJECT_RATE="${ERROR_INJECT_RATE:-0}" \
         python3 -u "$SCRIPT_DIR/stability_proxy.py" "$STREAM_URL" > "$PROXY_LOG" 2>&1 &
     PROXY_PID=$!
     sleep 3
@@ -57,14 +58,15 @@ for sid in $STREAM_IDS; do
     wait $PROXY_PID 2>/dev/null || true
     lsof -ti :$PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
 
-    # Count stalls from proxy log
+    # Count stalls and errors from proxy log
     STALLS=$(grep -c '\[stall' "$PROXY_LOG" 2>/dev/null || echo "0")
+    ERRORS=$(grep -c '\[error' "$PROXY_LOG" 2>/dev/null || echo "0")
 
     if [ "$MPV_EXIT" = "142" ] || [ "$MPV_EXIT" = "124" ]; then
-        echo "STREAM $sid: TIMEOUT stalls=$STALLS penalty=500"
+        echo "STREAM $sid: TIMEOUT stalls=$STALLS errors=$ERRORS penalty=500"
         total_penalty=$((total_penalty + 500))
     elif [ "$MPV_EXIT" != "0" ] && [ "$MPV_EXIT" != "4" ]; then
-        echo "STREAM $sid: CRASH exit=$MPV_EXIT stalls=$STALLS penalty=1000"
+        echo "STREAM $sid: CRASH exit=$MPV_EXIT stalls=$STALLS errors=$ERRORS penalty=1000"
         total_penalty=$((total_penalty + 1000))
     else
         FINAL=$(tail -1 "$STAT_FILE" 2>/dev/null || echo "")
@@ -78,7 +80,7 @@ for sid in $STREAM_IDS; do
             CACHE=$(echo "$FINAL" | awk '{for(i=1;i<=NF;i++) if($i~/^cache=/) {split($i,a,"="); print a[2]; exit}}')
             DROP=${DROP:-0}; DDROP=${DDROP:-0}; DELAY=${DELAY:-0}
             PENALTY=$((DROP * 1 + DDROP * 2 + DELAY * 10))
-            echo "STREAM $sid: drops=$DROP ddrop=$DDROP delay=$DELAY cache=$CACHE stalls=$STALLS penalty=$PENALTY"
+            echo "STREAM $sid: drops=$DROP ddrop=$DDROP delay=$DELAY cache=$CACHE stalls=$STALLS errors=$ERRORS penalty=$PENALTY"
             total_penalty=$((total_penalty + PENALTY))
         fi
     fi
