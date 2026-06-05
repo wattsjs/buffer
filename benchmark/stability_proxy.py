@@ -3,6 +3,7 @@
 
 import http.server
 import socketserver
+import socket
 import urllib.request
 import urllib.parse
 import sys
@@ -148,6 +149,12 @@ def main():
 
     server = socketserver.ThreadingTCPServer(('127.0.0.1', PROXY_PORT), ProxyHandler)
     server.allow_reuse_address = True
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEPORT may not be available on all platforms; ignore if it fails
+    try:
+        server.socket.setsockopt(socket.SOL_SOCKET, 0x0200, 1)  # SO_REUSEPORT
+    except (AttributeError, OSError):
+        pass
 
     print(f"[proxy] Listening on :{PROXY_PORT}", file=sys.stderr, flush=True)
     print(f"[proxy] Drop rate={SEGMENT_DROP_RATE}, stall={STALL_DURATION_MS}ms, seed={SEED}", file=sys.stderr, flush=True)

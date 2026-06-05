@@ -1,31 +1,30 @@
 # Autoresearch Ideas — Xtream Feed Parsing
 
-## Completed (10 experiments)
-### Channel JSON parsing (38% reduction, 25,102 → 15,601 µs)
-- ✅ Replace FlexibleString struct with direct KeyedDecodingContainer helpers (flexString/flexInt)
-- ✅ reserveCapacity on channels and categories arrays
-- ✅ Direct URL construction (URL(string:) instead of appendingPathComponent)
-- ✅ tv_archive == "1" fast path instead of Int() conversion
-- ✅ Int-first for truly numeric fields (stream_id, tv_archive, tv_archive_duration)
-- ✅ String-first for string fields (category_id, added) — validated against real silksurfer.com data
+## Completed (11 experiments, 37% overall reduction)
+### Channel JSON parsing (25,102 → 15,810 µs)
+- ✅ Replace FlexibleString with direct KeyedDecodingContainer helpers
+- ✅ reserveCapacity on channels/categories arrays
+- ✅ Direct URL construction (URL(string:))
+- ✅ tv_archive == "1" fast path
+- ✅ Int-first for numeric fields, String-first for string fields (validated against real data)
 - ✅ Applied to XtreamStream, XtreamVODStream, XtreamSeries, XtreamCategory, XtreamUserInfo
+- ✅ Replace FlexibleBool with flexBool helper (avoids struct allocation in auth path)
 
 ### XMLTV EPG SAX parsing (109MB, 327K programmes)
-- ✅ memcmp replaces byte-by-byte cstrEquals (~2.3M calls per 327K-programme file, SIMD-accelerated)
+- ✅ memcmp replaces byte-by-byte cstrEquals (SIMD-accelerated)
 - ✅ Static SAX handler (avoids per-parse closure thunk allocation)
-- ✅ Direct attribute indexing by position (start/stop/channel) instead of loop + cstrEquals (~1M fewer calls)
-- ✅ reserveCapacity(262144) instead of 4096 (avoids reallocation for large guides)
-- ✅ Python expat baseline: ~763ms for 327K programmes on 109MB file
+- ✅ Direct attribute indexing (eliminates 1M cstrEquals calls per file)
+- ✅ reserveCapacity(524288) — avoids reallocation for observed 327K programmes
 
 ## Key Learnings
-- **JSONDecoder is optimal**: custom byte-level scanner is 1.8x slower on Apple platforms
-- **Type ordering matters**: wrong first try incurs ~9-19% penalty from error creation
-- **Validate against real data**: category_id is string in real servers, not int as benchmark assumed
-- **memcmp beats byte-by-byte**: SIMD acceleration matters at 2M+ calls
-- **Direct indexing beats generic loops**: known attribute orders save ~1M comparisons
+- JSONDecoder is optimal: custom scanner 1.8x slower
+- Type ordering matters: wrong first try costs 9-19%
+- Validate against real data: category_id is string, not int
+- memcmp beats byte-by-byte at 2M+ calls via SIMD
+- Direct indexing beats generic loops when order is consistent
+- Array(unsafeUninitializedCapacity:) segfaults with Swift 6.3 for non-trivial types — do not use
 
 ## Deferred Ideas
-- Replace remaining FlexibleString usages in detail types (XtreamVODInfo, XtreamEpisode, etc.) — lower priority
-- Replace FlexibleBool with native Bool decoding
+- Replace remaining FlexibleString usages in detail types (XtreamVODInfo, XtreamEpisode, etc.)
+- Pre-hash XMLTV element names for O(1) dispatch (only beneficial if sub-elements beyond title/desc)
 - Parallelize categories + streams HTTP fetches with async let
-- Pre-hash XMLTV element names for O(1) dispatch instead of sequential memcmp

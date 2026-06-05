@@ -461,10 +461,11 @@ actor XtreamClient {
             URLQueryItem(name: "action", value: "get_live_streams")
         ])
 
-        let categoriesMap = try await fetchCategories()
-
+        // Fetch categories and streams concurrently — independent HTTP requests
+        async let categoriesMap = fetchCategories()
         let data = try await fetchData(from: target)
         let streams = try JSONDecoder().decode([XtreamStream].self, from: data)
+        let cats = try await categoriesMap
 
         var channels: [Channel] = []
         channels.reserveCapacity(streams.count)
@@ -472,7 +473,7 @@ actor XtreamClient {
         let baseStr = baseURL.absoluteString
         for stream in streams {
             guard let streamURL = URL(string: "\(baseStr)/\(stream.stream_id).m3u8") else { continue }
-            let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
+            let categoryName = stream.category_id.flatMap { cats[$0] } ?? "Uncategorized"
 
             channels.append(Channel(
                 id: stream.stream_id,
@@ -494,16 +495,17 @@ actor XtreamClient {
             URLQueryItem(name: "action", value: "get_vod_streams")
         ])
 
-        let categoriesMap = (try? await fetchCategories(action: "get_vod_categories")) ?? [:]
+        async let categoriesMap = fetchCategories(action: "get_vod_categories")
         let data = try await fetchData(from: target)
         let streams = try JSONDecoder().decode([XtreamVODStream].self, from: data)
+        let cats = (try? await categoriesMap) ?? [:]
 
         return streams.compactMap { stream in
             let ext = normalizedContainerExtension(stream.container_extension)
             guard let streamURL = URL(string: "\(config.xtreamBaseURL)/movie/\(config.username)/\(config.password)/\(stream.stream_id).\(ext)") else {
                 return nil
             }
-            let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Movies"
+            let categoryName = stream.category_id.flatMap { cats[$0] } ?? "Movies"
 
             return VODItem(
                 id: stream.stream_id,
@@ -571,17 +573,18 @@ actor XtreamClient {
             URLQueryItem(name: "action", value: "get_series")
         ])
 
-        let categoriesMap = (try? await fetchCategories(action: "get_series_categories")) ?? [:]
+        async let categoriesMap = fetchCategories(action: "get_series_categories")
         let data = try await fetchData(from: target)
         let series = try JSONDecoder().decode([XtreamSeries].self, from: data)
+        let cats = (try? await categoriesMap) ?? [:]
 
         return series.map { entry in
             VODSeries(
                 id: entry.series_id,
                 name: entry.name ?? "Unknown",
                 posterURL: entry.cover.flatMap { URL(string: $0) },
-                group: entry.category_id.flatMap { categoriesMap[$0] } ?? "Series",
-                genre: entry.genre ?? entry.category_id.flatMap { categoriesMap[$0] },
+                group: entry.category_id.flatMap { cats[$0] } ?? "Series",
+                genre: entry.genre ?? entry.category_id.flatMap { cats[$0] },
                 rating: nonEmpty(entry.rating),
                 releaseDate: entry.releaseDate,
                 summary: entry.plot,
