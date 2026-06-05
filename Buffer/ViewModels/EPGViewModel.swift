@@ -638,18 +638,47 @@ class EPGViewModel {
                 do {
                     let periodHours = epgLookbackHours(for: channels)
                     AppLog.sync.info("Loading Stalker guide periodHours=\(periodHours, privacy: .public)")
-                    let allPrograms = try await StalkerClient(config: config).fetchEPG(periodHours: periodHours)
+                    var allPrograms = try await StalkerClient(config: config).fetchEPG(periodHours: periodHours)
+
+                    // The Stalker period parameter controls how far BACK the
+                    // EPG extends. When period is large (catchup lookback),
+                    // the server may return only past data with a truncated
+                    // future window. If the fetched data doesn't cover the
+                    // current broadcast window, pull a supplemental fetch
+                    // with the default 24 h window to fill in now-and-future
+                    // programs.
+                    if periodHours > 24 {
+                        let primaryOrganized = await Task.detached(priority: .userInitiated) {
+                            Self.organize(allPrograms)
+                        }.value
+                        if !Self.programsCoverCurrentWindow(primaryOrganized) {
+                            AppLog.sync.info("Stalker extended period missing current window — fetching supplemental 24 h EPG")
+                            let currentPrograms = try? await StalkerClient(config: config).fetchEPG(periodHours: 24)
+                            if let currentPrograms, !currentPrograms.isEmpty {
+                                let currentIDs = Set(currentPrograms.map(\.id))
+                                var merged = allPrograms.filter { !currentIDs.contains($0.id) }
+                                merged.append(contentsOf: currentPrograms)
+                                allPrograms = merged
+                            }
+                        }
+                    }
+
                     if !silent { loadingStage = "Organizing guide…" }
                     let organized = await Task.detached(priority: .userInitiated) {
                         Self.organize(allPrograms)
                     }.value
-                    programs = organized
+
+                    // Merge with existing programs so that any current/future
+                    // data already in memory isn't wiped by a fetch whose
+                    // period only extends the past window.
+                    programs = Self.mergePrograms(existing: programs, incoming: organized)
                     rebuildProgramHourBuckets()
                     rebuildSearchIndex()
                     syncedStatus.guideStatus = "Reachable"
 
+                    let mergedPrograms = programs
                     Task.detached(priority: .utility) {
-                        DataCache.savePrograms(organized, key: cacheKey)
+                        DataCache.savePrograms(mergedPrograms, key: cacheKey)
                     }
                 } catch {
                     AppLog.sync.error("Stalker EPG fetch failed error=\(error.localizedDescription, privacy: .public)")
@@ -1215,6 +1244,36 @@ class EPGViewModel {
             organized[key] = value.sorted { $0.start < $1.start }
         }
         return organized
+    }
+
+    /// Merges `incoming` programs into `existing`, preferring incoming data
+    /// for duplicate program IDs. Each channel's programs stay sorted by start
+    /// time. Channels that only exist in one source are preserved as-is.
+    nonisolated private static func mergePrograms(
+        existing: [String: [EPGProgram]],
+        incoming: [String: [EPGProgram]]
+    ) -> [String: [EPGProgram]] {
+        guard !existing.isEmpty else { return incoming }
+        guard !incoming.isEmpty else { return existing }
+
+        var merged = existing
+        for (channelID, incomingPrograms) in incoming {
+            guard !incomingPrograms.isEmpty else { continue }
+
+            if var existingChannelPrograms = merged[channelID] {
+                // Build a set of incoming IDs for fast lookup, then remove
+                // any existing programs that overlap with incoming (prefer
+                // the fresh data).
+                let incomingIDs = Set(incomingPrograms.map(\.id))
+                existingChannelPrograms.removeAll { incomingIDs.contains($0.id) }
+                existingChannelPrograms.append(contentsOf: incomingPrograms)
+                existingChannelPrograms.sort { $0.start < $1.start }
+                merged[channelID] = existingChannelPrograms
+            } else {
+                merged[channelID] = incomingPrograms
+            }
+        }
+        return merged
     }
 
     // MARK: - Playlist CRUD
