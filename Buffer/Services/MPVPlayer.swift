@@ -320,6 +320,13 @@ final class MPVPlayer {
     @ObservationIgnored private var displayPowerAssertion = IOPMAssertionID(0)
     @ObservationIgnored private var holdsDisplayPowerAssertion = false
 
+    /// In-memory cache of resolved CDN URLs. Xtream stream URLs redirect to
+    /// CDN edge servers; caching the final URL avoids a ~1s HEAD request on
+    /// every channel switch. Entries expire after 5 minutes since CDN tokens
+    /// and edge assignments can rotate.
+    @ObservationIgnored private static var resolvedURLCache: [URL: (resolved: URL, timestamp: Date)] = [:]
+    @ObservationIgnored private static let resolvedURLCacheTTL: TimeInterval = 300
+
     init() {
         setupMPV()
         refreshPlaybackTuningStats(renderProfile: "focused")
@@ -347,15 +354,25 @@ final class MPVPlayer {
     /// streams, the initial URL redirects to a CDN edge server. Resolving this
     /// eagerly via URLSession (which reuses HTTP connections) avoids ~4s of
     /// redirect + TLS renegotiation overhead inside mpv/ffmpeg.
+    /// Results are cached for 5 minutes to avoid the HEAD request on every
+    /// channel switch.
     private static func resolveRedirect(for url: URL) async -> URL? {
         guard url.scheme == "https" || url.scheme == "http" else { return nil }
         guard url.host?.contains("silksurfer.com") == true || url.host?.contains("783.") == true else { return nil }
+
+        // Check cache first
+        if let cached = resolvedURLCache[url],
+           Date().timeIntervalSince(cached.timestamp) < resolvedURLCacheTTL {
+            return cached.resolved
+        }
+
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
         request.httpMethod = "HEAD"
         guard let (_, response) = try? await URLSession.shared.data(for: request) as? (Data, HTTPURLResponse) else {
             return nil
         }
         if let finalURL = response.url, finalURL != url {
+            resolvedURLCache[url] = (resolved: finalURL, timestamp: Date())
             return finalURL
         }
         return nil

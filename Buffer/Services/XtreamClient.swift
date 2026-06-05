@@ -394,10 +394,25 @@ actor XtreamClient {
         let username: String?
         let auth: FlexibleBool?
         let status: String?
-        let exp_date: FlexibleString?
-        let active_cons: FlexibleString?
-        let max_connections: FlexibleString?
+        let exp_date: String?
+        let active_cons: String?
+        let max_connections: String?
         let is_trial: FlexibleBool?
+
+        enum CodingKeys: String, CodingKey {
+            case username, auth, status, exp_date, active_cons, max_connections, is_trial
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            username = try c.decodeIfPresent(String.self, forKey: .username)
+            auth = try c.decodeIfPresent(FlexibleBool.self, forKey: .auth)
+            status = try c.decodeIfPresent(String.self, forKey: .status)
+            exp_date = try c.flexIntIfPresent(forKey: .exp_date)
+            active_cons = try c.flexIntIfPresent(forKey: .active_cons)
+            max_connections = try c.flexIntIfPresent(forKey: .max_connections)
+            is_trial = try c.decodeIfPresent(FlexibleBool.self, forKey: .is_trial)
+        }
     }
 
     func fetchAccountInfo() async throws -> XtreamAccountInfo {
@@ -419,9 +434,9 @@ actor XtreamClient {
         return XtreamAccountInfo(
             isAuthenticated: isAuthenticated,
             status: userInfo.status,
-            expiryDate: Self.date(fromEpochString: userInfo.exp_date?.value),
-            activeConnections: Int(userInfo.active_cons?.value ?? ""),
-            maxConnections: Int(userInfo.max_connections?.value ?? ""),
+            expiryDate: Self.date(fromEpochString: userInfo.exp_date),
+            activeConnections: Int(userInfo.active_cons ?? ""),
+            maxConnections: Int(userInfo.max_connections ?? ""),
             username: userInfo.username,
             isTrial: userInfo.is_trial?.value
         )
