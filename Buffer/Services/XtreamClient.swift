@@ -62,6 +62,7 @@ private struct FlexibleBool: Decodable {
 // as either String or Int; these helpers handle both.
 
 extension KeyedDecodingContainer {
+    // String-first: for fields that are typically strings (names, URLs, IDs)
     func flexString(forKey key: Key) throws -> String {
         if let s = try? decode(String.self, forKey: key) { return s }
         if let i = try? decode(Int.self, forKey: key) { return String(i) }
@@ -71,6 +72,19 @@ extension KeyedDecodingContainer {
         if contains(key) {
             if let s = try? decode(String.self, forKey: key) { return s }
             if let i = try? decode(Int.self, forKey: key) { return String(i) }
+        }
+        return nil
+    }
+    // Int-first: for fields that are typically integers (stream_id, category_id, etc.)
+    func flexInt(forKey key: Key) throws -> String {
+        if let i = try? decode(Int.self, forKey: key) { return String(i) }
+        if let s = try? decode(String.self, forKey: key) { return s }
+        return ""
+    }
+    func flexIntIfPresent(forKey key: Key) throws -> String? {
+        if contains(key) {
+            if let i = try? decode(Int.self, forKey: key) { return String(i) }
+            if let s = try? decode(String.self, forKey: key) { return s }
         }
         return nil
     }
@@ -95,7 +109,7 @@ actor XtreamClient {
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            category_id = try c.flexString(forKey: .category_id)
+            category_id = try c.flexInt(forKey: .category_id)
             category_name = try c.decodeIfPresent(String.self, forKey: .category_name)
         }
     }
@@ -115,13 +129,13 @@ actor XtreamClient {
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            stream_id = try c.flexString(forKey: .stream_id)
+            stream_id = try c.flexInt(forKey: .stream_id)
             name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
             stream_icon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
             epg_channel_id = try c.decodeIfPresent(String.self, forKey: .epg_channel_id)
-            category_id = try c.flexStringIfPresent(forKey: .category_id)
-            tv_archive = try c.flexStringIfPresent(forKey: .tv_archive)
-            tv_archive_duration = try c.flexStringIfPresent(forKey: .tv_archive_duration)
+            category_id = try c.flexIntIfPresent(forKey: .category_id)
+            tv_archive = try c.flexIntIfPresent(forKey: .tv_archive)
+            tv_archive_duration = try c.flexIntIfPresent(forKey: .tv_archive_duration)
         }
     }
 
@@ -151,22 +165,22 @@ actor XtreamClient {
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            stream_id = try c.flexString(forKey: .stream_id)
+            stream_id = try c.flexInt(forKey: .stream_id)
             name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
             stream_icon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
-            category_id = try c.flexStringIfPresent(forKey: .category_id)
+            category_id = try c.flexIntIfPresent(forKey: .category_id)
             container_extension = try c.decodeIfPresent(String.self, forKey: .container_extension)
             rating = try c.flexStringIfPresent(forKey: .rating)
             rating_5based = try c.flexStringIfPresent(forKey: .rating_5based)
             plot = try c.decodeIfPresent(String.self, forKey: .plot)
-            year = try c.flexStringIfPresent(forKey: .year)
+            year = try c.flexIntIfPresent(forKey: .year)
             releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
-            added = try c.flexStringIfPresent(forKey: .added)
+            added = try c.flexIntIfPresent(forKey: .added)
             director = try c.decodeIfPresent(String.self, forKey: .director)
             cast = try c.decodeIfPresent(String.self, forKey: .cast)
             country = try c.decodeIfPresent(String.self, forKey: .country)
             genre = try c.decodeIfPresent(String.self, forKey: .genre)
-            duration_secs = try c.flexStringIfPresent(forKey: .duration_secs)
+            duration_secs = try c.flexIntIfPresent(forKey: .duration_secs)
         }
     }
 
@@ -229,10 +243,10 @@ actor XtreamClient {
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            series_id = try c.flexString(forKey: .series_id)
+            series_id = try c.flexInt(forKey: .series_id)
             name = try c.decodeIfPresent(String.self, forKey: .name)
             cover = try c.decodeIfPresent(String.self, forKey: .cover)
-            category_id = try c.flexStringIfPresent(forKey: .category_id)
+            category_id = try c.flexIntIfPresent(forKey: .category_id)
             plot = try c.decodeIfPresent(String.self, forKey: .plot)
             cast = try c.decodeIfPresent(String.self, forKey: .cast)
             director = try c.decodeIfPresent(String.self, forKey: .director)

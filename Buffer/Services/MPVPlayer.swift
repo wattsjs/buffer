@@ -99,10 +99,10 @@ final class MPVPlayer {
         static let stateEpsilon = 0.05
         static let timePosEpsilon = 0.25
         static let cacheEpsilon = 0.5
-        static let demuxerLavfProbeSize = 1_048_576
+        static let demuxerLavfProbeSize = 524_288
         // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
         // AVOption surface.
-        static let demuxerLavfAnalyzeDuration = 1.0
+        static let demuxerLavfAnalyzeDuration = 0.5
         static let fastProbeSize = 65_536
         static let fastAnalyzeDuration = 0.1
         static let liveLatencyEpsilon = 0.5
@@ -193,7 +193,10 @@ final class MPVPlayer {
                 // reconnect loop, delaying or preventing startup. Keep only
                 // a socket timeout here; PlayerSlot owns live-stream reload
                 // recovery at the item level.
-                "rw_timeout=10000000",
+                // Reduced from 10s to 3s — 10s of blocking I/O is longer than
+                // any healthy CDN segment fetch, and the app's own reconnect
+                // policy recovers faster than waiting for a socket timeout.
+                "rw_timeout=3000000",
             ].joined(separator: ",")
         }
     }
@@ -845,8 +848,9 @@ final class MPVPlayer {
         setOption(newHandle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
         setOption(newHandle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
 
-        // Network timeouts.
-        setOption(newHandle, "network-timeout", "10")
+        // Network timeouts. 5 s is enough for any healthy CDN; the app's
+        // reconnect policy handles longer outages faster than mpv's timeout.
+        setOption(newHandle, "network-timeout", "5")
 
         // libavformat-level reconnect covers single-segment network hiccups.
         // HLS playlist errors and false-EOF are handled by PlayerSlot's
