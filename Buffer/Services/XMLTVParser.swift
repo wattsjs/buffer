@@ -120,7 +120,8 @@ nonisolated private final class XMLTVSAXContext: @unchecked Sendable {
 
     init() {
         // Real Xtream guides can have 300K+ programmes (109MB for 327K seen in wild).
-        programs.reserveCapacity(262144)
+        // 512K capacity avoids reallocation for large guides while keeping memory ~4MB.
+        programs.reserveCapacity(524288)
         titleBytes.reserveCapacity(128)
         descBytes.reserveCapacity(512)
     }

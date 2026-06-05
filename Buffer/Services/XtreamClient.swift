@@ -88,6 +88,16 @@ extension KeyedDecodingContainer {
         }
         return nil
     }
+    // Bool decoder: handles true/false, 1/0, "true"/"false"/"1"/"0"
+    func flexBool(forKey key: Key) throws -> Bool {
+        if let b = try? decode(Bool.self, forKey: key) { return b }
+        if let i = try? decode(Int.self, forKey: key) { return i != 0 }
+        if let s = try? decode(String.self, forKey: key) {
+            let n = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !(n.isEmpty || n == "0" || n == "false")
+        }
+        return false
+    }
 }
 
 actor XtreamClient {
@@ -392,12 +402,12 @@ actor XtreamClient {
 
     private struct XtreamUserInfo: Decodable {
         let username: String?
-        let auth: FlexibleBool?
+        let auth: Bool
         let status: String?
         let exp_date: String?
         let active_cons: String?
         let max_connections: String?
-        let is_trial: FlexibleBool?
+        let is_trial: Bool
 
         enum CodingKeys: String, CodingKey {
             case username, auth, status, exp_date, active_cons, max_connections, is_trial
@@ -406,12 +416,12 @@ actor XtreamClient {
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             username = try c.decodeIfPresent(String.self, forKey: .username)
-            auth = try c.decodeIfPresent(FlexibleBool.self, forKey: .auth)
+            auth = try c.flexBool(forKey: .auth)
             status = try c.decodeIfPresent(String.self, forKey: .status)
             exp_date = try c.flexIntIfPresent(forKey: .exp_date)
             active_cons = try c.flexIntIfPresent(forKey: .active_cons)
             max_connections = try c.flexIntIfPresent(forKey: .max_connections)
-            is_trial = try c.decodeIfPresent(FlexibleBool.self, forKey: .is_trial)
+            is_trial = try c.flexBool(forKey: .is_trial)
         }
     }
 
@@ -426,7 +436,7 @@ actor XtreamClient {
             throw XtreamError.decodingFailed
         }
 
-        let isAuthenticated = userInfo.auth?.value ?? true
+        let isAuthenticated = userInfo.auth
         if !isAuthenticated {
             throw XtreamError.authenticationFailed
         }
@@ -438,7 +448,7 @@ actor XtreamClient {
             activeConnections: Int(userInfo.active_cons ?? ""),
             maxConnections: Int(userInfo.max_connections ?? ""),
             username: userInfo.username,
-            isTrial: userInfo.is_trial?.value
+            isTrial: userInfo.is_trial
         )
     }
 
