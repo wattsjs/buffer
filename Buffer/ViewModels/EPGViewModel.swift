@@ -637,30 +637,37 @@ class EPGViewModel {
                 if !silent { loadingStage = "Loading guide…" }
                 do {
                     let periodHours = epgLookbackHours(for: channels)
+                    let client = StalkerClient(config: config)
                     AppLog.sync.info("Loading Stalker guide periodHours=\(periodHours, privacy: .public)")
-                    var allPrograms = try await StalkerClient(config: config).fetchEPG(periodHours: periodHours)
 
-                    // The Stalker period parameter controls how far BACK the
-                    // EPG extends. When period is large (catchup lookback),
-                    // the server may return only past data with a truncated
-                    // future window. If the fetched data doesn't cover the
-                    // current broadcast window, pull a supplemental fetch
-                    // with the default 24 h window to fill in now-and-future
-                    // programs.
+                    // Fetch the extended lookback window. The Stalker period
+                    // parameter controls how far BACK the EPG extends; when
+                    // period is large the server may truncate the future
+                    // window. We always follow up with a short-period fetch
+                    // and merge so current and future programs are covered.
+                    let lookbackPrograms = try await client.fetchEPG(periodHours: periodHours)
+                    let allPrograms: [EPGProgram]
                     if periodHours > 24 {
-                        let primaryOrganized = await Task.detached(priority: .userInitiated) {
-                            Self.organize(allPrograms)
-                        }.value
-                        if !Self.programsCoverCurrentWindow(primaryOrganized) {
-                            AppLog.sync.info("Stalker extended period missing current window — fetching supplemental 24 h EPG")
-                            let currentPrograms = try? await StalkerClient(config: config).fetchEPG(periodHours: 24)
-                            if let currentPrograms, !currentPrograms.isEmpty {
-                                let currentIDs = Set(currentPrograms.map(\.id))
-                                var merged = allPrograms.filter { !currentIDs.contains($0.id) }
-                                merged.append(contentsOf: currentPrograms)
-                                allPrograms = merged
-                            }
+                        let currentPrograms: [EPGProgram]
+                        do {
+                            currentPrograms = try await client.fetchEPG(periodHours: 24)
+                        } catch {
+                            AppLog.sync.error("Stalker supplemental 24 h EPG fetch failed error=\(error.localizedDescription, privacy: .public)")
+                            currentPrograms = []
                         }
+                        let lookbackCount = lookbackPrograms.count
+                        let currentCount = currentPrograms.count
+                        AppLog.sync.info("Stalker EPG merged lookback=\(lookbackCount, privacy: .public) current=\(currentCount, privacy: .public)")
+                        if currentPrograms.isEmpty {
+                            allPrograms = lookbackPrograms
+                        } else {
+                            let currentIDs = Set(currentPrograms.map(\.id))
+                            var merged = lookbackPrograms.filter { !currentIDs.contains($0.id) }
+                            merged.append(contentsOf: currentPrograms)
+                            allPrograms = merged
+                        }
+                    } else {
+                        allPrograms = lookbackPrograms
                     }
 
                     if !silent { loadingStage = "Organizing guide…" }
@@ -668,9 +675,8 @@ class EPGViewModel {
                         Self.organize(allPrograms)
                     }.value
 
-                    // Merge with existing programs so that any current/future
-                    // data already in memory isn't wiped by a fetch whose
-                    // period only extends the past window.
+                    // Merge into existing programs so we never lose
+                    // current/future data that was already in memory.
                     programs = Self.mergePrograms(existing: programs, incoming: organized)
                     rebuildProgramHourBuckets()
                     rebuildSearchIndex()
