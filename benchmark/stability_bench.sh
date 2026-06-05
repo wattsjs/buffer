@@ -4,7 +4,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PORT=19876
 DURATION="${DURATION:-20}"
 DROP_RATE="${DROP_RATE:-0.3}"
 STALL_MS="${STALL_MS:-3000}"
@@ -18,9 +17,8 @@ total_penalty=0
 stream_count=0
 
 for sid in $STREAM_IDS; do
-    # Kill anything still on the port
-    lsof -ti :$PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 1
+    # Use unique port per stream to avoid TIME_WAIT conflicts
+    PORT=$((19876 + sid % 100))
 
     STREAM_URL="${SERVER}/live/${USER}/${PASS}/${sid}.m3u8"
 
@@ -82,7 +80,7 @@ for sid in $STREAM_IDS; do
     fi
     stream_count=$((stream_count + 1))
     rm -f "$STAT_FILE" "$PROXY_LOG"
-    sleep 4  # Wait for port to fully release
+    sleep 2
 done
 
 if [ $stream_count -gt 0 ]; then
