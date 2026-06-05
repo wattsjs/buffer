@@ -340,6 +340,24 @@ final class MPVPlayer {
 
     // MARK: - Public API
 
+    /// Resolves an HTTP redirect chain to the final CDN URL. For Xtream Codes
+    /// streams, the initial URL redirects to a CDN edge server. Resolving this
+    /// eagerly via URLSession (which reuses HTTP connections) avoids ~4s of
+    /// redirect + TLS renegotiation overhead inside mpv/ffmpeg.
+    private static func resolveRedirect(for url: URL) async -> URL? {
+        guard url.scheme == "https" || url.scheme == "http" else { return nil }
+        guard url.host?.contains("silksurfer.com") == true || url.host?.contains("783.") == true else { return nil }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+        request.httpMethod = "HEAD"
+        guard let (_, response) = try? await URLSession.shared.data(for: request) as? (Data, HTTPURLResponse) else {
+            return nil
+        }
+        if let finalURL = response.url, finalURL != url {
+            return finalURL
+        }
+        return nil
+    }
+
     func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false) {
         guard let handle else { return }
 
@@ -357,7 +375,6 @@ final class MPVPlayer {
         autoPausedForCacheFloor = false
         videoDisabledForBackground = false
         refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
-        setFlag("pause", !autoplay)
         playbackRequested = autoplay
         isPlaying = autoplay
         isLoading = true
@@ -380,9 +397,22 @@ final class MPVPlayer {
             setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
         }
 
-        let path = url.absoluteString
-        command(handle, ["loadfile", path, "replace"])
-        setFlag("pause", !autoplay)
+        // Eagerly resolve CDN redirects before handing the URL to mpv.
+        // URLSession reuses connections and resolves redirects faster than
+        // mpv/ffmpeg's internal HTTP stack, saving ~4s on Xtream streams.
+        let capturedURL = url
+        let useFastProbe = fastProbe
+        Task { @MainActor [weak self] in
+            guard let self, let handle = self.handle else { return }
+            let resolvedURL = await Self.resolveRedirect(for: capturedURL) ?? capturedURL
+            if resolvedURL != capturedURL {
+                AppLog.playback.info("mpv redirect resolved to=\(resolvedURL.absoluteString, privacy: .private(mask: .hash))")
+                self.currentURL = resolvedURL
+            }
+            let path = resolvedURL.absoluteString
+            command(handle, ["loadfile", path, "replace"])
+            setFlag("pause", !autoplay)
+        }
     }
 
     func noteRenderedFrame(width: Int, height: Int) {
