@@ -1,1 +1,2 @@
 {"type":"config","name":"Optimize Xtream feed JSON parsing","metricName":"parse_µs","metricUnit":"µs","bestDirection":"lower"}
+{"run":1,"commit":"ae795c3","metric":25102,"metrics":{},"status":"keep","description":"Baseline: JSONDecoder + FlexibleString + compactMap mapping for 5000 streams","timestamp":1780669394248,"segment":0,"confidence":null,"asi":{"hypothesis":"Establish baseline before any optimizations"}}
