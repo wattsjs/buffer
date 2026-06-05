@@ -509,9 +509,13 @@ class EPGViewModel {
             DataCache.loadPrograms(key: key)
         }.value
         if let programsCache {
-            programs = programsCache.programs
-            rebuildProgramHourBuckets()
-            rebuildSearchIndex()
+            if Self.programsCoverCurrentWindow(programsCache.programs) {
+                programs = programsCache.programs
+                rebuildProgramHourBuckets()
+                rebuildSearchIndex()
+            } else {
+                AppLog.sync.info("Skipping stale guide cache savedAt=\(programsCache.savedAt, privacy: .public)")
+            }
         }
     }
 
@@ -632,7 +636,9 @@ class EPGViewModel {
             if config.type == .stalker {
                 if !silent { loadingStage = "Loading guide…" }
                 do {
-                    let allPrograms = try await StalkerClient(config: config).fetchEPG()
+                    let periodHours = epgLookbackHours(for: channels)
+                    AppLog.sync.info("Loading Stalker guide periodHours=\(periodHours, privacy: .public)")
+                    let allPrograms = try await StalkerClient(config: config).fetchEPG(periodHours: periodHours)
                     if !silent { loadingStage = "Organizing guide…" }
                     let organized = await Task.detached(priority: .userInitiated) {
                         Self.organize(allPrograms)
@@ -767,6 +773,22 @@ class EPGViewModel {
         }
     }
 
+    private func epgLookbackHours(for channels: [Channel]) -> Int {
+        let archiveHours = channels
+            .compactMap { channel -> Int? in
+                guard channel.supportsRewind, let days = channel.catchup?.days, days > 0 else { return nil }
+                return days * 24
+            }
+            .max() ?? 0
+        guard archiveHours > 0 else { return 24 }
+
+        let setting = CatchupLookbackSetting.stored(
+            rawValue: UserDefaults.standard.integer(forKey: CatchupLookbackSetting.appStorageKey)
+        )
+        let requestedHours = setting.limitHours ?? archiveHours
+        return min(archiveHours, requestedHours)
+    }
+
     private func syncIfAutomatic(scope: SyncScope, silent: Bool = false) {
         if automaticRefreshEnabled(scope: scope) {
             sync(silent: silent, scope: scope)
@@ -777,8 +799,50 @@ class EPGViewModel {
         guard activePlaylist != nil else { return }
         if channels.isEmpty {
             syncIfAutomatic(scope: .all)
+        } else if guideNeedsInitialLoad() {
+            sync(scope: .epg)
         } else {
             syncIfAutomatic(scope: .epg, silent: true)
+        }
+    }
+
+    func syncGuideForLookbackChange() {
+        guard activePlaylist != nil, !channels.isEmpty else { return }
+        sync(scope: .epg)
+    }
+
+    private func guideNeedsInitialLoad(now: Date = Date()) -> Bool {
+        guard Self.programsCoverCurrentWindow(programs, now: now) else { return true }
+
+        // Only Stalker supports requesting a wider EPG window via the period
+        // parameter. For Xtream/M3U, the full XMLTV is downloaded regardless —
+        // re-downloading won't add more past data than the server provides.
+        guard serverConfig?.type == .stalker else { return false }
+
+        let rewindEPGIDs = Set(channels.filter(\.supportsRewind).compactMap(\.epgChannelID))
+        guard !rewindEPGIDs.isEmpty else { return false }
+
+        let lookbackHours = epgLookbackHours(for: channels)
+        guard lookbackHours > 24 else { return false }
+
+        let requiredStart = now.addingTimeInterval(-Double(max(0, lookbackHours - 1)) * 3600)
+        var earliestRewindProgram: Date?
+        for epgID in rewindEPGIDs {
+            guard let firstStart = programs[epgID]?.first?.start else { continue }
+            earliestRewindProgram = min(earliestRewindProgram ?? firstStart, firstStart)
+        }
+        guard let earliestRewindProgram else { return true }
+        return earliestRewindProgram > requiredStart
+    }
+
+    private static func programsCoverCurrentWindow(_ programs: [String: [EPGProgram]], now: Date = Date()) -> Bool {
+        guard !programs.isEmpty else { return false }
+        let windowStart = now.addingTimeInterval(-30 * 60)
+        let windowEnd = now.addingTimeInterval(2 * 3600)
+        return programs.values.contains { channelPrograms in
+            channelPrograms.contains { program in
+                program.end > windowStart && program.start < windowEnd
+            }
         }
     }
 

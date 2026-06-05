@@ -201,7 +201,7 @@ actor StalkerClient {
                 group: group,
                 streamURL: streamURL,
                 epgChannelID: Self.nonEmpty(channel.xmltvID) ?? channel.id,
-                catchup: nil
+                catchup: makeStalkerCatchup(archive: channel)
             )
         }
     }
@@ -302,11 +302,11 @@ actor StalkerClient {
         return episodes
     }
 
-    func fetchEPG() async throws -> [EPGProgram] {
+    func fetchEPG(periodHours: Int) async throws -> [EPGProgram] {
         let epg: EPGInfo = try await fetch(
             "itv",
             action: "get_epg_info",
-            extra: [URLQueryItem(name: "period", value: "24")]
+            extra: [URLQueryItem(name: "period", value: "\(periodHours)")]
         )
         return epg.data.flatMap { channelID, entries in
             entries.compactMap { entry in
@@ -517,6 +517,16 @@ actor StalkerClient {
             }
         }
         return nil
+    }
+
+    private func makeStalkerCatchup(archive: StalkerChannel) -> CatchupInfo? {
+        let isArchived = (Int(archive.enableTVArchive?.value ?? "") ?? 0) > 0
+        guard isArchived else { return nil }
+        let providerDays = Int(archive.tvArchiveDuration?.value ?? "") ?? 0
+        let days = max(providerDays, 1)
+        // Stalker/Ministra catchup works by appending ?utcstart=&utcend= query
+        // parameters to the live stream URL, matching the .shift kind.
+        return CatchupInfo(kind: .shift, days: days, source: nil)
     }
 
     private func applyMAGHeaders(to request: inout URLRequest) {
