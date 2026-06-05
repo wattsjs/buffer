@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
 
-// Benchmark: mapping optimization (full pipeline)
+// Benchmark: Test CFURLCreateWithString vs URL(string:) for stream URLs
 
 import Foundation
 
@@ -30,7 +30,7 @@ extension KeyedDecodingContainer {
     }
 }
 
-struct XtreamStream: Decodable {
+struct Stream: Decodable {
     let name: String; let stream_id: String; let stream_icon: String?
     let epg_channel_id: String?; let category_id: String?
     let tv_archive: String?; let tv_archive_duration: String?
@@ -51,64 +51,16 @@ struct XtreamStream: Decodable {
     }
 }
 
-// MARK: - Current full pipeline
-
-func parseCurrent(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
-    let streams = try! JSONDecoder().decode([XtreamStream].self, from: data)
-    var channels: [Channel] = []
-    channels.reserveCapacity(streams.count)
-    for stream in streams {
-        let streamURL = streamBase.appendingPathComponent("\(stream.stream_id).m3u8")
-        let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
-        channels.append(Channel(
-            id: stream.stream_id, name: stream.name,
-            logoURL: stream.stream_icon.flatMap { URL(string: $0) },
-            group: categoryName, streamURL: streamURL,
-            epgChannelID: stream.epg_channel_id,
-            catchup: {
-                guard let tvA = stream.tv_archive, (Int(tvA) ?? 0) > 0 else { return nil }
-                return CatchupInfo(kind: .xc, days: max(Int(stream.tv_archive_duration ?? "") ?? 0, 1), source: nil)
-            }()
-        ))
-    }
-    return channels
+// CFURL-based stream URL creation
+func makeStreamURL(base: String, streamID: String) -> URL? {
+    let str = "\(base)/\(streamID).m3u8" as CFString
+    return CFURLCreateWithString(nil, str, nil) as URL?
 }
 
-// MARK: - Optimized full pipeline
-
-func parseOptimized(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
-    let streams = try! JSONDecoder().decode([XtreamStream].self, from: data)
-    var channels: [Channel] = []
-    channels.reserveCapacity(streams.count)
-
-    let baseStr = streamBase.absoluteString
-
-    for stream in streams {
-        guard let streamURL = URL(string: "\(baseStr)/\(stream.stream_id).m3u8") else { continue }
-        let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
-
-        let logoURL: URL? = stream.stream_icon.flatMap { URL(string: $0) }
-
-        let catchup: CatchupInfo?
-        if let tvA = stream.tv_archive, tvA == "1" {
-            let days: Int
-            if let dur = stream.tv_archive_duration, let d = Int(dur), d > 0 { days = d }
-            else { days = 1 }
-            catchup = CatchupInfo(kind: .xc, days: days, source: nil)
-        } else {
-            catchup = nil
-        }
-
-        channels.append(Channel(
-            id: stream.stream_id, name: stream.name,
-            logoURL: logoURL, group: categoryName, streamURL: streamURL,
-            epgChannelID: stream.epg_channel_id, catchup: catchup
-        ))
-    }
-    return channels
+// Current: URL(string:)
+func makeStreamURLCurrent(base: String, streamID: String) -> URL? {
+    URL(string: "\(base)/\(streamID).m3u8")
 }
-
-// MARK: - Generate test data
 
 func generateSampleJSON(count: Int) -> Data {
     var streams: [[String: Any]] = []
@@ -128,11 +80,59 @@ func generateSampleJSON(count: Int) -> Data {
     return try! JSONSerialization.data(withJSONObject: streams, options: [])
 }
 
-// MARK: - Benchmark
+func parseCurrent(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
+    let streams = try! JSONDecoder().decode([Stream].self, from: data)
+    var channels: [Channel] = []
+    channels.reserveCapacity(streams.count)
+    let baseStr = streamBase.absoluteString
+    for stream in streams {
+        guard let streamURL = URL(string: "\(baseStr)/\(stream.stream_id).m3u8") else { continue }
+        let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
+        let logoURL: URL? = stream.stream_icon.flatMap { URL(string: $0) }
+        let catchup: CatchupInfo? = {
+            guard let tvA = stream.tv_archive, tvA == "1" else { return nil }
+            let days: Int
+            if let dur = stream.tv_archive_duration, let d = Int(dur), d > 0 { days = d }
+            else { days = 1 }
+            return CatchupInfo(kind: .xc, days: days, source: nil)
+        }()
+        channels.append(Channel(
+            id: stream.stream_id, name: stream.name,
+            logoURL: logoURL, group: categoryName, streamURL: streamURL,
+            epgChannelID: stream.epg_channel_id, catchup: catchup
+        ))
+    }
+    return channels
+}
+
+func parseCFURL(data: Data, categoriesMap: [String: String], streamBase: URL) -> [Channel] {
+    let streams = try! JSONDecoder().decode([Stream].self, from: data)
+    var channels: [Channel] = []
+    channels.reserveCapacity(streams.count)
+    let baseStr = streamBase.absoluteString
+    for stream in streams {
+        let urlStr = "\(baseStr)/\(stream.stream_id).m3u8" as CFString
+        guard let streamURL = CFURLCreateWithString(nil, urlStr, nil) as URL? else { continue }
+        let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Uncategorized"
+        let logoURL: URL? = stream.stream_icon.flatMap { URL(string: $0) }
+        let catchup: CatchupInfo? = {
+            guard let tvA = stream.tv_archive, tvA == "1" else { return nil }
+            let days: Int
+            if let dur = stream.tv_archive_duration, let d = Int(dur), d > 0 { days = d }
+            else { days = 1 }
+            return CatchupInfo(kind: .xc, days: days, source: nil)
+        }()
+        channels.append(Channel(
+            id: stream.stream_id, name: stream.name,
+            logoURL: logoURL, group: categoryName, streamURL: streamURL,
+            epgChannelID: stream.epg_channel_id, catchup: catchup
+        ))
+    }
+    return channels
+}
 
 let count = 5000
 let iterations = 50
-
 var categoriesMap: [String: String] = [:]
 for i in 1...20 { categoriesMap[String(i)] = "Category \(i)" }
 let streamBase = URL(string: "http://example.com/live/user/pass")!
@@ -140,36 +140,31 @@ let data = generateSampleJSON(count: count)
 
 // Warmup
 _ = parseCurrent(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-_ = parseOptimized(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
+_ = parseCFURL(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
 usleep(100000)
 
 var totalCurrent: Double = 0
-var totalOptimized: Double = 0
-
+var totalCFURL: Double = 0
 for _ in 0..<iterations {
     let t0 = CFAbsoluteTimeGetCurrent()
     let r1 = parseCurrent(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
     totalCurrent += CFAbsoluteTimeGetCurrent() - t0
     _ = r1.count
-
     let t1 = CFAbsoluteTimeGetCurrent()
-    let r2 = parseOptimized(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-    totalOptimized += CFAbsoluteTimeGetCurrent() - t1
+    let r2 = parseCFURL(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
+    totalCFURL += CFAbsoluteTimeGetCurrent() - t1
     _ = r2.count
 }
 
 let avgCurrent = totalCurrent / Double(iterations) * 1_000_000
-let avgOptimized = totalOptimized / Double(iterations) * 1_000_000
+let avgCFURL = totalCFURL / Double(iterations) * 1_000_000
 
-// Verify
 let ref = parseCurrent(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-let opt = parseOptimized(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
-let idsMatch = ref.map(\.id) == opt.map(\.id)
-
+let cfu = parseCFURL(data: data, categoriesMap: categoriesMap, streamBase: streamBase)
 print("count=\(count) iterations=\(iterations)")
-print("current:   \(Int(avgCurrent)) µs")
-print("optimized: \(Int(avgOptimized)) µs")
-print("ids_match=\(idsMatch)")
+print("URL(string:):        \(Int(avgCurrent)) µs")
+print("CFURLCreateWithString: \(Int(avgCFURL)) µs")
+print("ref=\(ref.count) cfurl=\(cfu.count) ids=\(ref.map(\.id) == cfu.map(\.id))")
 print("")
-print("METRIC parse_µs=\(Int(avgOptimized))")
-print("METRIC current_µs=\(Int(avgCurrent))")
+print("METRIC parse_µs=\(Int(avgCurrent))")
+print("METRIC cfurl_µs=\(Int(avgCFURL))")

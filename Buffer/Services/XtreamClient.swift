@@ -126,28 +126,47 @@ actor XtreamClient {
     }
 
     private struct XtreamVODStream: Decodable {
-        let num: FlexibleString?
-        let name: String?
-        let stream_id: FlexibleString
+        let name: String
+        let stream_id: String
         let stream_icon: String?
-        let category_id: FlexibleString?
+        let category_id: String?
         let container_extension: String?
-        let rating: FlexibleString?
-        let rating_5based: FlexibleString?
+        let rating: String?
+        let rating_5based: String?
         let plot: String?
-        let year: FlexibleString?
+        let year: String?
         let releaseDate: String?
-        let added: FlexibleString?
+        let added: String?
         let director: String?
         let cast: String?
         let country: String?
         let genre: String?
-        let duration_secs: FlexibleString?
+        let duration_secs: String?
 
         enum CodingKeys: String, CodingKey {
-            case num, name, stream_id, stream_icon, category_id, container_extension
+            case name, stream_id, stream_icon, category_id, container_extension
             case rating, rating_5based, plot, year, added, director, cast, country, genre, duration_secs
             case releaseDate = "release_date"
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            stream_id = try c.flexString(forKey: .stream_id)
+            name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Unknown"
+            stream_icon = try c.decodeIfPresent(String.self, forKey: .stream_icon)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
+            container_extension = try c.decodeIfPresent(String.self, forKey: .container_extension)
+            rating = try c.flexStringIfPresent(forKey: .rating)
+            rating_5based = try c.flexStringIfPresent(forKey: .rating_5based)
+            plot = try c.decodeIfPresent(String.self, forKey: .plot)
+            year = try c.flexStringIfPresent(forKey: .year)
+            releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
+            added = try c.flexStringIfPresent(forKey: .added)
+            director = try c.decodeIfPresent(String.self, forKey: .director)
+            cast = try c.decodeIfPresent(String.self, forKey: .cast)
+            country = try c.decodeIfPresent(String.self, forKey: .country)
+            genre = try c.decodeIfPresent(String.self, forKey: .genre)
+            duration_secs = try c.flexStringIfPresent(forKey: .duration_secs)
         }
     }
 
@@ -192,20 +211,34 @@ actor XtreamClient {
     }
 
     private struct XtreamSeries: Decodable {
-        let series_id: FlexibleString
+        let series_id: String
         let name: String?
         let cover: String?
-        let category_id: FlexibleString?
+        let category_id: String?
         let plot: String?
         let cast: String?
         let director: String?
         let genre: String?
         let releaseDate: String?
-        let rating: FlexibleString?
+        let rating: String?
 
         enum CodingKeys: String, CodingKey {
             case series_id, name, cover, category_id, plot, cast, director, genre, rating
             case releaseDate = "release_date"
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            series_id = try c.flexString(forKey: .series_id)
+            name = try c.decodeIfPresent(String.self, forKey: .name)
+            cover = try c.decodeIfPresent(String.self, forKey: .cover)
+            category_id = try c.flexStringIfPresent(forKey: .category_id)
+            plot = try c.decodeIfPresent(String.self, forKey: .plot)
+            cast = try c.decodeIfPresent(String.self, forKey: .cast)
+            director = try c.decodeIfPresent(String.self, forKey: .director)
+            genre = try c.decodeIfPresent(String.self, forKey: .genre)
+            releaseDate = try c.decodeIfPresent(String.self, forKey: .releaseDate)
+            rating = try c.flexStringIfPresent(forKey: .rating)
         }
     }
 
@@ -428,22 +461,22 @@ actor XtreamClient {
 
         return streams.compactMap { stream in
             let ext = normalizedContainerExtension(stream.container_extension)
-            guard let streamURL = URL(string: "\(config.xtreamBaseURL)/movie/\(config.username)/\(config.password)/\(stream.stream_id.value).\(ext)") else {
+            guard let streamURL = URL(string: "\(config.xtreamBaseURL)/movie/\(config.username)/\(config.password)/\(stream.stream_id).\(ext)") else {
                 return nil
             }
-            let categoryName = stream.category_id.flatMap { categoriesMap[$0.value] } ?? "Movies"
+            let categoryName = stream.category_id.flatMap { categoriesMap[$0] } ?? "Movies"
 
             return VODItem(
-                id: stream.stream_id.value,
-                name: stream.name ?? "Unknown",
+                id: stream.stream_id,
+                name: stream.name,
                 posterURL: stream.stream_icon.flatMap { URL(string: $0) },
                 group: categoryName,
                 streamURL: streamURL,
                 kind: .movie,
                 genre: nonEmpty(stream.genre) ?? categoryName,
-                durationSeconds: Int(stream.duration_secs?.value ?? ""),
-                rating: stream.rating?.value.isEmpty == false ? stream.rating?.value : stream.rating_5based?.value,
-                releaseDate: stream.releaseDate ?? stream.year?.value,
+                durationSeconds: Int(stream.duration_secs ?? ""),
+                rating: stream.rating?.isEmpty == false ? stream.rating : stream.rating_5based,
+                releaseDate: stream.releaseDate ?? stream.year,
                 containerExtension: ext,
                 summary: stream.plot,
                 director: stream.director,
@@ -505,12 +538,12 @@ actor XtreamClient {
 
         return series.map { entry in
             VODSeries(
-                id: entry.series_id.value,
+                id: entry.series_id,
                 name: entry.name ?? "Unknown",
                 posterURL: entry.cover.flatMap { URL(string: $0) },
-                group: entry.category_id.flatMap { categoriesMap[$0.value] } ?? "Series",
-                genre: entry.genre ?? entry.category_id.flatMap { categoriesMap[$0.value] },
-                rating: nonEmpty(entry.rating?.value),
+                group: entry.category_id.flatMap { categoriesMap[$0] } ?? "Series",
+                genre: entry.genre ?? entry.category_id.flatMap { categoriesMap[$0] },
+                rating: nonEmpty(entry.rating),
                 releaseDate: entry.releaseDate,
                 summary: entry.plot,
                 director: entry.director,
