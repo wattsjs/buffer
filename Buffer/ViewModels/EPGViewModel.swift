@@ -580,6 +580,15 @@ class EPGViewModel {
         }
 
         do {
+            // For non-Stalker configs with full sync, the EPG fetch is independent
+            // of channels/VOD. Launch it early so both run concurrently.
+            let prefetchedEPG: Task<[EPGProgram], any Error>?
+            if scope == .all, config.type != .stalker, let epgURL = epgURL(for: config) {
+                prefetchedEPG = Task { try await XMLTVParser.parse(from: epgURL) }
+            } else {
+                prefetchedEPG = nil
+            }
+
             if scope == .all {
                 switch config.type {
                 case .xtream:
@@ -694,9 +703,15 @@ class EPGViewModel {
                     }
                 }
             } else if let epgURL = epgURL(for: config) {
-                if !silent { loadingStage = "Loading guide…" }
                 do {
-                    let allPrograms = try await XMLTVParser.parse(from: epgURL)
+                    let allPrograms: [EPGProgram]
+                    if let task = prefetchedEPG {
+                        if !silent { loadingStage = "Loading guide…" }
+                        allPrograms = try await task.value
+                    } else {
+                        if !silent { loadingStage = "Loading guide…" }
+                        allPrograms = try await XMLTVParser.parse(from: epgURL)
+                    }
                     if !silent { loadingStage = "Organizing guide…" }
                     let organized = await Task.detached(priority: .userInitiated) {
                         Self.organize(allPrograms)

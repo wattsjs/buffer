@@ -20,7 +20,7 @@ stream_count=0
 pkill -f stability_proxy 2>/dev/null || true
 sleep 1
 
-port_base=19876
+port_base=21987
 port_idx=0
 
 for sid in $STREAM_IDS; do
