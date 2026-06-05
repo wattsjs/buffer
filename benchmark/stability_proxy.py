@@ -22,25 +22,33 @@ SEED = int(os.environ.get("SEED", "42"))
 random.seed(SEED)
 
 class StallHandler:
-    """Manages artificial connection stalls."""
+    """Manages artificial connection stalls and errors."""
     def __init__(self):
         self._stall_until = 0.0
         self._lock = threading.Lock()
         self.stall_count = 0
+        self.error_count = 0
 
-    def maybe_stall(self, path: str) -> bool:
-        """Decide whether to stall this request. Returns True if stalled."""
+    def maybe_disturb(self, path: str) -> str | None:
+        """Returns 'stall', 'error', or None."""
         if not path.endswith('.ts'):
-            return False
+            return None
         if random.random() > SEGMENT_DROP_RATE:
-            return False
+            return None
+        
+        # 20% chance of HTTP error (502), 80% stall
+        if random.random() < 0.2:
+            self.error_count += 1
+            print(f"[error #{self.error_count}] 502 on {path}", file=sys.stderr, flush=True)
+            return 'error'
+        
         duration = random.uniform(STALL_DURATION_MS * 0.5, STALL_DURATION_MS * 1.5) / 1000.0
         with self._lock:
             self._stall_until = time.time() + duration
         self.stall_count += 1
         print(f"[stall #{self.stall_count}] {duration*1000:.0f}ms on {path}", file=sys.stderr, flush=True)
         time.sleep(duration)
-        return True
+        return 'stall'
 
 stall_handler = StallHandler()
 
@@ -80,8 +88,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path
 
-        # Inject stalls
-        stall_handler.maybe_stall(path)
+        # Inject stalls or errors
+        disturb = stall_handler.maybe_disturb(path)
+        if disturb == 'error':
+            self.send_response(502)
+            self.end_headers()
+            self.wfile.write(b'Bad Gateway')
+            return
+        # 'stall' already slept; continue normally
+        # None: no disturbance, continue normally
 
         if path.endswith('.m3u8'):
             # Serve rewritten playlist
