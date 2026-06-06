@@ -321,6 +321,14 @@ struct PlayerView: View {
                     showChrome = true
                 }
             }
+            .onChange(of: showChannelPicker) { _, isShowing in
+                if isShowing {
+                    chromeHideTask?.cancel()
+                    showChrome = true
+                } else {
+                    scheduleChromeHide()
+                }
+            }
             .onChange(of: player.timePos) { _, _ in
                 saveVODProgressIfNeeded()
             }
@@ -1577,6 +1585,12 @@ struct PlayerView: View {
             showChrome = true
             return
         }
+        // Keep the toolbar (and thus the popover's anchor) alive while the
+        // channel picker is open, otherwise the popover dismisses itself.
+        guard !showChannelPicker else {
+            showChrome = true
+            return
+        }
         chromeHideTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
@@ -1861,12 +1875,28 @@ private struct ChannelPickerPopover: View {
     let onDismiss: () -> Void
 
     @State private var query: String = ""
+    @FocusState private var searchFocused: Bool
 
     private var filteredChannels: [Channel] {
         let existing = Set(session.slots.map(\.channel.id))
         let pool = viewModel.channels.filter { !existing.contains($0.id) }
         if query.isEmpty { return pool }
         return pool.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    private func add(_ channel: Channel) {
+        session.addChannel(
+            channel,
+            currentProgram: viewModel.currentProgram(for: channel)
+        )
+        query = ""
+        // Keep the picker open so several channels can be added in a row;
+        // close automatically once the grid is full.
+        if session.canAddMoreSlots() {
+            searchFocused = true
+        } else {
+            onDismiss()
+        }
     }
 
     var body: some View {
@@ -1876,6 +1906,10 @@ private struct ChannelPickerPopover: View {
                     .foregroundStyle(.secondary)
                 TextField("Search channels…", text: $query)
                     .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .onSubmit {
+                        if let first = filteredChannels.first { add(first) }
+                    }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -1886,11 +1920,7 @@ private struct ChannelPickerPopover: View {
                 LazyVStack(spacing: 0) {
                     ForEach(filteredChannels.prefix(200), id: \.id) { channel in
                         Button {
-                            session.addChannel(
-                                channel,
-                                currentProgram: viewModel.currentProgram(for: channel)
-                            )
-                            onDismiss()
+                            add(channel)
                         } label: {
                             HStack(spacing: 10) {
                                 ChannelLogoView(url: channel.logoURL, contentInset: 2)
@@ -1926,6 +1956,7 @@ private struct ChannelPickerPopover: View {
             .frame(maxHeight: 360)
         }
         .frame(width: 320)
+        .onAppear { searchFocused = true }
     }
 }
 
