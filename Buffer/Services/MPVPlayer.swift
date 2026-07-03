@@ -99,10 +99,10 @@ final class MPVPlayer {
         static let stateEpsilon = 0.05
         static let timePosEpsilon = 0.25
         static let cacheEpsilon = 0.5
-        static let demuxerLavfProbeSize = 524_288
+        static let demuxerLavfProbeSize = 2_097_152
         // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
         // AVOption surface.
-        static let demuxerLavfAnalyzeDuration = 0.5
+        static let demuxerLavfAnalyzeDuration = 5.0
         // ffmpeg I/O buffer for reading stream data. 512 KB cuts system-call
         // overhead by 16× vs the 32 KB default, which matters a lot for 4 K
         // HEVC segments that are 4–8 MB each.
@@ -211,6 +211,30 @@ final class MPVPlayer {
                 "rw_timeout=8000000",
             ].joined(separator: ",")
         }
+
+        /// Transport options for non-HLS network media (VOD files, catchup
+        /// TS). These go through ffmpeg's HTTP protocol directly, where a
+        /// dropped connection mid-transfer is otherwise a fatal error — and
+        /// non-live playback modes have no app-level reconnect. ffmpeg's
+        /// reconnect resumes at the current byte offset via a Range request.
+        /// `reconnect_at_eof` stays off: a finished stream must still end.
+        static var vodStreamLavfOptions: String {
+            [
+                "rw_timeout=8000000",
+                "reconnect=1",
+                "reconnect_on_network_error=1",
+                "reconnect_delay_max=5",
+            ].joined(separator: ",")
+        }
+    }
+
+    /// True when the URL points at an HLS playlist (as opposed to a VOD
+    /// container file, catchup TS stream, or local recording).
+    private static func isHLSURL(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        if ext == "m3u8" || ext == "m3u" { return true }
+        // Some providers hide the playlist extension behind query routing.
+        return url.absoluteString.lowercased().contains(".m3u8")
     }
 
     private struct MPVLogSuppression {
@@ -339,6 +363,13 @@ final class MPVPlayer {
     @ObservationIgnored private static var resolvedURLCache: [URL: (resolved: URL, timestamp: Date)] = [:]
     @ObservationIgnored private static let resolvedURLCacheTTL: TimeInterval = 300
 
+    /// Drops the cached CDN resolution for a URL. Reconnect policy calls this
+    /// when a stream is failing so the reload re-resolves the edge assignment
+    /// instead of reusing a possibly expired CDN URL for the rest of the TTL.
+    static func invalidateResolvedURL(for url: URL) {
+        resolvedURLCache[url] = nil
+    }
+
     init() {
         setupMPV()
         refreshPlaybackTuningStats(renderProfile: "focused")
@@ -414,7 +445,7 @@ final class MPVPlayer {
         updateDisplayPowerAssertion()
 
         // Fast-probe path is used for known local MPEG-TS sources (recording
-        // files). With the default 1 MiB probesize + 1 s analyzeduration,
+        // files). With the regular live probe/analyze window,
         // mpv's ffmpeg demuxer can still spend seconds scanning the head of a
         // multi-gigabyte .ts file before reporting stream info.
         // For MPEG-TS the SPS usually lands in the first few KB, so shrinking
@@ -427,22 +458,33 @@ final class MPVPlayer {
         } else {
             setRuntimeProperty(handle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
             setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
-            // For HLS streams, set the format explicitly so ffmpeg skips the
-            // content-based format detection step. TS recordings (fastProbe)
-            // rely on auto-detection.
-            setRuntimeProperty(handle, "demuxer-lavf-format", "hls")
-            // Higher probescore skips low-confidence verification when the
-            // format is already known. Safe for HLS; TS recordings use the
-            // default (26) to avoid misdetection.
-            setRuntimeProperty(handle, "demuxer-lavf-probescore", "50")
         }
+        // For HLS playlists, set the format explicitly so ffmpeg skips the
+        // content-based detection step, and raise the probescore so it skips
+        // low-confidence verification. Everything else (VOD .mkv/.mp4, catchup
+        // .ts, recordings) must auto-detect: forcing "hls" makes ffmpeg's HLS
+        // demuxer reject non-playlist input outright. Properties persist
+        // across loads on a reused handle, so both branches always set both.
+        let isHLS = Self.isHLSURL(url)
+        setRuntimeProperty(handle, "demuxer-lavf-format", isHLS ? "hls" : "")
+        setRuntimeProperty(handle, "demuxer-lavf-probescore", isHLS ? "50" : "26")
+        // Segment/VOD transport recovery lives at the ffmpeg HTTP layer for
+        // non-HLS media: a mid-transfer socket drop resumes at the current
+        // byte offset instead of killing playback (which non-live modes
+        // surface straight to the user). HLS keeps the plain timeout-only
+        // options — its recovery is handled by the demuxer retry flags and
+        // PlayerSlot's reconnect policy.
+        let isNetwork = url.scheme == "http" || url.scheme == "https"
+        setRuntimeProperty(
+            handle, "stream-lavf-o",
+            !isHLS && isNetwork ? Tuning.vodStreamLavfOptions : Tuning.liveStreamLavfOptions
+        )
 
         // Eagerly resolve CDN redirects before handing the URL to mpv.
         // URLSession reuses connections and resolves redirects faster than
         // mpv/ffmpeg's internal HTTP stack, saving ~4s on Xtream streams.
         let capturedURL = url
         let capturedGeneration = loadGeneration
-        let useFastProbe = fastProbe
         Task { @MainActor [weak self] in
             guard let self, let handle = self.handle else { return }
             guard self.loadGeneration == capturedGeneration else {
@@ -711,22 +753,10 @@ final class MPVPlayer {
         setRuntimeProperty(handle, "demuxer-max-bytes", maxBytes)
         setRuntimeProperty(handle, "demuxer-max-back-bytes", maxBackBytes)
 
-        var cacheVal = Tuning.cacheCapacitySeconds(for: cacheFloorSecs)
-        _ = "cache-secs".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &cacheVal)
-        }
-        var readahead = Tuning.demuxerReadAheadSeconds(for: cacheFloorSecs)
-        _ = "demuxer-readahead-secs".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &readahead)
-        }
-        var hysteresis = Tuning.demuxerHysteresisSeconds(for: cacheFloorSecs)
-        _ = "demuxer-hysteresis-secs".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &hysteresis)
-        }
-        var cachePauseWait = Tuning.cachePauseWaitSeconds(for: cacheFloorSecs)
-        _ = "cache-pause-wait".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &cachePauseWait)
-        }
+        setRuntimeDouble(handle, "cache-secs", Tuning.cacheCapacitySeconds(for: cacheFloorSecs))
+        setRuntimeDouble(handle, "demuxer-readahead-secs", Tuning.demuxerReadAheadSeconds(for: cacheFloorSecs))
+        setRuntimeDouble(handle, "demuxer-hysteresis-secs", Tuning.demuxerHysteresisSeconds(for: cacheFloorSecs))
+        setRuntimeDouble(handle, "cache-pause-wait", Tuning.cachePauseWaitSeconds(for: cacheFloorSecs))
 
         setRuntimeProperty(handle, "scale", scaleFilter)
         setRuntimeProperty(handle, "cscale", cscaleFilter)
@@ -900,7 +930,13 @@ final class MPVPlayer {
         // http_persistent reuses TCP connections across segments instead of
         // creating a new one for each HLS segment fetch. http_multiple allows
         // parallel downloads, speeding up the initial segment burst.
-        setOption(newHandle, "demuxer-lavf-o", "fflags=+discardcorrupt+genpts+igndts,http_persistent=1,http_multiple=1")
+        // seg_max_retry re-fetches a failed segment (transient 4xx/5xx, socket
+        // drop) before the HLS demuxer skips or errors — ffmpeg's default is 0,
+        // meaning a single blip mid-stream becomes a visible glitch.
+        // extension_picky=0: ffmpeg 8 refuses HLS segments whose filename
+        // extension isn't a known media extension; IPTV providers routinely
+        // serve segments with arbitrary names.
+        setOption(newHandle, "demuxer-lavf-o", "fflags=+discardcorrupt+genpts+igndts,http_persistent=1,http_multiple=1,seg_max_retry=2,extension_picky=0")
         setOption(newHandle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
         setOption(newHandle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
         setOption(newHandle, "demuxer-lavf-buffersize", "\(Tuning.demuxerLavfBufferSize)")
@@ -972,22 +1008,10 @@ final class MPVPlayer {
         activeCachePauseResumeSeconds = Tuning.cachePauseResumeSeconds(for: newValue)
         refreshPlaybackTuningStats()
         guard let handle else { return }
-        var value = Tuning.cacheCapacitySeconds(for: newValue)
-        _ = "cache-secs".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &value)
-        }
-        var readahead = Tuning.demuxerReadAheadSeconds(for: newValue)
-        _ = "demuxer-readahead-secs".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &readahead)
-        }
-        var hysteresis = Tuning.demuxerHysteresisSeconds(for: newValue)
-        _ = "demuxer-hysteresis-secs".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &hysteresis)
-        }
-        var cachePauseWait = Tuning.cachePauseWaitSeconds(for: newValue)
-        _ = "cache-pause-wait".withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &cachePauseWait)
-        }
+        setRuntimeDouble(handle, "cache-secs", Tuning.cacheCapacitySeconds(for: newValue))
+        setRuntimeDouble(handle, "demuxer-readahead-secs", Tuning.demuxerReadAheadSeconds(for: newValue))
+        setRuntimeDouble(handle, "demuxer-hysteresis-secs", Tuning.demuxerHysteresisSeconds(for: newValue))
+        setRuntimeDouble(handle, "cache-pause-wait", Tuning.cachePauseWaitSeconds(for: newValue))
     }
 
     private func destroy() {
@@ -1080,7 +1104,7 @@ final class MPVPlayer {
             case MPV_EVENT_SHUTDOWN:
                 applyPendingChanges(pending)
                 return
-            case MPV_EVENT_PROPERTY_CHANGE:
+            case MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_GET_PROPERTY_REPLY:
                 if let prop = evt.data?.assumingMemoryBound(to: mpv_event_property.self).pointee {
                     collectProperty(id: evt.reply_userdata, prop: prop, into: &pending)
                 }
@@ -1093,19 +1117,13 @@ final class MPVPlayer {
                 let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
                 AppLog.playback.info("mpv file-loaded generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
                 onFileLoaded?()
-                if let paused = readFlagProperty("pause") {
-                    pending.isPlaying = !paused
-                }
-                if let fps = readDoubleProperty("container-fps") {
-                    pending.containerFps = max(pending.containerFps ?? 0, fps)
-                } else {
-                    pending.containerFps = pending.containerFps ?? 0
-                }
-                if let fps = readDoubleProperty("estimated-vf-fps") {
-                    pending.estimatedFps = max(pending.estimatedFps ?? 0, fps)
-                } else {
-                    pending.estimatedFps = pending.estimatedFps ?? 0
-                }
+                // Async reads: replies land as GET_PROPERTY_REPLY below and
+                // merge into the property pipeline. A synchronous
+                // mpv_get_property here can block behind mpv's dispatch lock
+                // while the decoder is still configuring the new file.
+                requestProperty(.pause, "pause", MPV_FORMAT_FLAG)
+                requestProperty(.fps, "container-fps", MPV_FORMAT_DOUBLE)
+                requestProperty(.estimatedFps, "estimated-vf-fps", MPV_FORMAT_DOUBLE)
             case MPV_EVENT_END_FILE:
                 if let end = evt.data?.assumingMemoryBound(to: mpv_event_end_file.self).pointee {
                     handleEndFileEvent(end)
@@ -1714,11 +1732,30 @@ final class MPVPlayer {
         }
     }
 
+    // All runtime control goes through mpv's async request API. The
+    // synchronous variants (mpv_command, mpv_set_property, mpv_get_property)
+    // block until the core processes the request — and during startup, seeks,
+    // or decoder reconfiguration mpv can hold its dispatch lock for hundreds
+    // of milliseconds, which beach-balls the main thread (see checkCacheFloor).
+    // Async requests from one client handle are executed in the order they
+    // were issued, so command/property sequencing is preserved. mpv copies
+    // request data before returning. Set/command replies are ignored (the
+    // sync return values were ignored too); get replies are folded into the
+    // normal property pipeline in drainEvents.
+
     private func setRuntimeProperty(_ handle: OpaquePointer, _ name: String, _ value: String) {
         _ = name.withCString { n in
             value.withCString { v in
-                mpv_set_property_string(handle, n, v)
+                var stringPtr: UnsafeMutablePointer<CChar>? = UnsafeMutablePointer(mutating: v)
+                return mpv_set_property_async(handle, 0, n, MPV_FORMAT_STRING, &stringPtr)
             }
+        }
+    }
+
+    private func setRuntimeDouble(_ handle: OpaquePointer, _ name: String, _ value: Double) {
+        var v = value
+        _ = name.withCString { n in
+            mpv_set_property_async(handle, 0, n, MPV_FORMAT_DOUBLE, &v)
         }
     }
 
@@ -1726,7 +1763,7 @@ final class MPVPlayer {
         guard let handle else { return }
         var flag: Int32 = value ? 1 : 0
         _ = name.withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_FLAG, &flag)
+            mpv_set_property_async(handle, 0, n, MPV_FORMAT_FLAG, &flag)
         }
         switch name {
         case "mute":
@@ -1738,10 +1775,7 @@ final class MPVPlayer {
 
     private func setDouble(_ name: String, _ value: Double) {
         guard let handle else { return }
-        var v = value
-        _ = name.withCString { n in
-            mpv_set_property(handle, n, MPV_FORMAT_DOUBLE, &v)
-        }
+        setRuntimeDouble(handle, name, value)
         switch name {
         case "volume":
             setApproxState(\.volume, value, epsilon: Tuning.stateEpsilon)
@@ -1753,22 +1787,14 @@ final class MPVPlayer {
         }
     }
 
-    private func readDoubleProperty(_ name: String) -> Double? {
-        guard let handle else { return nil }
-        var value = 0.0
-        let err = name.withCString { n in
-            mpv_get_property(handle, n, MPV_FORMAT_DOUBLE, &value)
+    /// Requests a property read; the value arrives as
+    /// MPV_EVENT_GET_PROPERTY_REPLY in drainEvents and flows through the same
+    /// collectProperty path as observed property changes.
+    private func requestProperty(_ id: PropID, _ name: String, _ format: mpv_format) {
+        guard let handle else { return }
+        _ = name.withCString { n in
+            mpv_get_property_async(handle, id.rawValue, n, format)
         }
-        return err >= 0 ? value : nil
-    }
-
-    private func readFlagProperty(_ name: String) -> Bool? {
-        guard let handle else { return nil }
-        var value: Int32 = 0
-        let err = name.withCString { n in
-            mpv_get_property(handle, n, MPV_FORMAT_FLAG, &value)
-        }
-        return err >= 0 ? value != 0 : nil
     }
 
     private func command(_ handle: OpaquePointer, _ args: [String]) {
@@ -1777,7 +1803,7 @@ final class MPVPlayer {
         cStrings.append(nil)
         defer { duped.forEach { if let p = $0 { free(p) } } }
         cStrings.withUnsafeMutableBufferPointer { buf in
-            _ = mpv_command(handle, buf.baseAddress)
+            _ = mpv_command_async(handle, 0, buf.baseAddress)
         }
     }
 

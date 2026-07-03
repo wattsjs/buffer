@@ -30,7 +30,7 @@ struct PlayerSlotCell: View {
                     .onTapGesture(perform: onFocus)
             }
 
-            if let error = slot.player.errorMessage {
+            if let error = slot.recoveryErrorMessage ?? slot.player.errorMessage {
                 VStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.title2)

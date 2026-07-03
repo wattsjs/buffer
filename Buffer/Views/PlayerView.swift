@@ -149,6 +149,9 @@ struct PlayerView: View {
     private var focusedStreamHealth: StreamHealth {
         session?.focusedSlot.playbackStreamHealth ?? StreamHealth()
     }
+    private var playbackErrorMessage: String? {
+        session?.focusedSlot.recoveryErrorMessage ?? player.errorMessage
+    }
     private var liveProgram: EPGProgram? {
         guard let c = channel else { return nil }
         return viewModel?.currentProgram(for: c)
@@ -299,7 +302,7 @@ struct PlayerView: View {
                 }
             }
             .overlay {
-                if let error = player.errorMessage {
+                if let error = playbackErrorMessage {
                     playbackErrorView(error)
                         .padding(24)
                 }
@@ -313,7 +316,7 @@ struct PlayerView: View {
                     scheduleChromeHide()
                 }
             }
-            .onChange(of: player.errorMessage) { _, error in
+            .onChange(of: playbackErrorMessage) { _, error in
                 if error == nil {
                     scheduleChromeHide()
                 } else {
@@ -1577,7 +1580,7 @@ struct PlayerView: View {
 
     private func scheduleChromeHide() {
         chromeHideTask?.cancel()
-        guard player.errorMessage == nil else {
+        guard playbackErrorMessage == nil else {
             showChrome = true
             return
         }

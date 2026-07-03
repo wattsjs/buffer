@@ -9,7 +9,6 @@ import OSLog
 private final class MPVPlayerPool {
     static let shared = MPVPlayerPool()
     private var idle: [MPVPlayer] = []
-    private var prebuffered: [String: MPVPlayer] = [:]
     private let maxIdle = 3
 
     private init() {}
@@ -35,75 +34,11 @@ private final class MPVPlayerPool {
 
     @MainActor
     func prewarmFocusedHandle() {
-        guard idle.isEmpty, prebuffered.isEmpty else { return }
+        guard idle.isEmpty else { return }
         let p = MPVPlayer()
         p.prepareForReuse()
         idle.append(p)
         AppLog.playback.info("Prewarmed mpv player handle idle=\(self.idle.count, privacy: .public)")
-    }
-
-    @MainActor
-    func prebuffer(channel: Channel) -> MPVPlayer? {
-        guard !channel.isOnDemand else { return nil }
-        if let existing = prebuffered[channel.id], existing.currentURL == channel.streamURL {
-            return existing
-        }
-
-        for (_, player) in prebuffered {
-            release(player)
-        }
-        prebuffered.removeAll()
-
-        let player: MPVPlayer
-        if idle.isEmpty {
-            player = MPVPlayer()
-        } else {
-            player = idle.removeLast()
-            player.prepareForReuse()
-        }
-
-        player.onPlaybackEnded = nil
-        player.onFileLoaded = nil
-        player.onFirstFrame = { [weak self, weak player] in
-            guard
-                let self,
-                let player,
-                self.prebuffered[channel.id] === player,
-                player.currentURL == channel.streamURL
-            else { return }
-
-            player.setMute(true)
-            AppLog.playback.info("Prebuffer ready muted-playing channel=\(channel.name, privacy: .public)")
-            player.logPlaybackSyncSnapshot("prebuffer-ready")
-        }
-        player.onStreamIssue = nil
-        player.onMediaInfoChanged = nil
-        player.setMute(true)
-        player.loadURL(channel.streamURL, autoplay: true)
-        prebuffered[channel.id] = player
-        AppLog.playback.info("Prebuffering channel name=\(channel.name, privacy: .public) id=\(channel.id, privacy: .public)")
-        return player
-    }
-
-    @MainActor
-    func acquirePrebuffered(for channel: Channel) -> MPVPlayer? {
-        guard let player = prebuffered.removeValue(forKey: channel.id) else {
-            AppLog.playback.debug("No prebuffered player channel=\(channel.name, privacy: .public)")
-            return nil
-        }
-        guard player.currentURL == channel.streamURL else {
-            AppLog.playback.info("Discarding prebuffered player channel=\(channel.name, privacy: .public) currentURLMatches=false")
-            release(player)
-            return nil
-        }
-        guard player.hasRenderedCurrentLoad, player.isPlaying else {
-            AppLog.playback.info("Discarding prebuffered player channel=\(channel.name, privacy: .public) ready=false")
-            release(player)
-            return nil
-        }
-        AppLog.playback.info("Using prebuffered player channel=\(channel.name, privacy: .public)")
-        player.logPlaybackSyncSnapshot("prebuffer-acquired")
-        return player
     }
 }
 
@@ -185,6 +120,7 @@ final class PlayerSlot: Identifiable {
     var channel: Channel
     var currentProgram: EPGProgram?
     private(set) var playbackStreamHealth = StreamHealth()
+    private(set) var recoveryErrorMessage: String?
 
     // MPVPlayer is created lazily on first access (or acquired from the
     // warm reuse pool). SwiftUI re-invokes view inits on every parent
@@ -197,7 +133,7 @@ final class PlayerSlot: Identifiable {
         // Prefer a warm pooled handle (avoids mpv_create + full option/observer
         // setup + render init). The pool is populated on removeSlot / session
         // teardown.
-        let new = MPVPlayerPool.shared.acquirePrebuffered(for: channel) ?? MPVPlayerPool.shared.acquire()
+        let new = MPVPlayerPool.shared.acquire()
         attachCallbacks(to: new)
         _player = new
         return new
@@ -255,6 +191,7 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var expectedStoppedEndFiles: Int = 0
     @ObservationIgnored private var lastReconnectAt: Date?
     @ObservationIgnored private var pendingOnDemandSeekSeconds: Double?
+    @ObservationIgnored private var hasRenderedAnyFrame = false
 
     /// Tracks whether we have explicitly paused recovery Tasks + player for
     /// system sleep via AppLifecycleCoordinator. Prevents duplicate work on
@@ -266,6 +203,9 @@ final class PlayerSlot: Identifiable {
     /// task keeps running in the background — the banner auto-clears if a
     /// later attempt gets a frame through.
     @ObservationIgnored private let fatalReconnectWindow: TimeInterval = 60
+    @ObservationIgnored private let startupFailureVisibleWindow: TimeInterval = 8
+    @ObservationIgnored private let startupFailureSlowRetryWindow: TimeInterval = 12
+    @ObservationIgnored private let startupFailureSlowRetryDelay: TimeInterval = 15
 
     /// Seconds of continuous playback required before we consider the stream
     /// "healthy" and reset the reconnect backoff counter.
@@ -278,6 +218,10 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private let stalledWhilePlayingSeconds: TimeInterval = 6
     @ObservationIgnored private let playbackProgressEpsilon: Double = 0.25
     @ObservationIgnored private let minimumImmediateReconnectSpacing: TimeInterval = 2
+    /// Forward-cache level below which warning-level stream issues escalate
+    /// to a full reload. Above this, ffmpeg's internal retries get to run
+    /// while playback continues uninterrupted from the cache.
+    @ObservationIgnored private let escalationCacheFloorSeconds: Double = 3
     @ObservationIgnored private let slowRetryFailureWindow: TimeInterval = 60
     @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
 
@@ -330,6 +274,8 @@ final class PlayerSlot: Identifiable {
     }
 
     private func handleFirstFrame() {
+        hasRenderedAnyFrame = true
+        clearRecoveryErrorMessage()
         PlayerStartupTiming.noteFirstFrame(channel: channel)
     }
 
@@ -342,18 +288,27 @@ final class PlayerSlot: Identifiable {
 
         let recoveryReason: MPVEndReason?
         switch issue {
-        case .hlsReloadFailed:
-            recoveryReason = .error(
-                code: 0,
-                message: "stream network recovery: \(issue.recoveryMessage)"
-            )
         case .httpError(let message) where isHTTP509Message(message):
             recoveryReason = .http509(message: message)
-        case .httpError:
-            recoveryReason = .error(
-                code: 0,
-                message: "stream network recovery: \(issue.recoveryMessage)"
-            )
+        case .hlsReloadFailed, .httpError:
+            // ffmpeg keeps retrying playlist reloads and segment fetches
+            // (seg_max_retry) on its own while playback continues out of the
+            // forward cache — most of these warnings resolve with zero visible
+            // impact. Reloading immediately would throw that cache away and
+            // guarantee an interruption. Escalate only once the cache is
+            // nearly drained; the warnings repeat while the problem persists,
+            // so a failing stream still reconnects before mpv pauses. The
+            // stall watchdog and END_FILE remain the backstops for everything
+            // else.
+            if player.cacheSeconds < escalationCacheFloorSeconds {
+                recoveryReason = .error(
+                    code: 0,
+                    message: "stream network recovery: \(issue.recoveryMessage)"
+                )
+            } else {
+                AppLog.playback.info("Stream issue absorbed by cache channel=\(self.channel.name, privacy: .public) cache=\(self.player.cacheSeconds, privacy: .public)")
+                recoveryReason = nil
+            }
         case .reconnecting:
             // mpv's libavformat reconnect is a lightweight segment-level
             // recovery path. Escalating these warnings to `loadfile replace`
@@ -413,9 +368,9 @@ final class PlayerSlot: Identifiable {
             let fastDelay = min(http509BaseDelay * pow(2.0, Double(min(attempt, 3))), http509MaxDelay)
             let delay = failureAge >= slowRetryFailureWindow ? http509SlowRetryDelay : fastDelay
             if failureAge >= http509VisibleFailureWindow {
-                player.setReconnectingErrorMessage("Bandwidth limit — retrying in \(Int(delay))s…")
+                setRecoveryErrorMessage("Bandwidth limit — retrying in \(Int(delay))s…")
             } else {
-                player.clearReconnectingErrorMessage()
+                clearRecoveryErrorMessage()
             }
             reconnectTask?.cancel()
             pendingReconnectIs509 = true
@@ -428,8 +383,12 @@ final class PlayerSlot: Identifiable {
         }
 
         let failureAge = firstFailureAt.map { Date().timeIntervalSince($0) } ?? 0
-        let shouldSurfaceError = failureAge >= fatalReconnectWindow
-        let shouldSlowRetry = failureAge >= slowRetryFailureWindow
+        let isStartupFailure = !hasRenderedAnyFrame
+        let visibleFailureWindow = isStartupFailure ? startupFailureVisibleWindow : fatalReconnectWindow
+        let slowRetryWindow = isStartupFailure ? startupFailureSlowRetryWindow : slowRetryFailureWindow
+        let slowRetryDelay = isStartupFailure ? startupFailureSlowRetryDelay : self.slowRetryDelay
+        let shouldSurfaceError = failureAge >= visibleFailureWindow
+        let shouldSlowRetry = failureAge >= slowRetryWindow
 
         let delay: Double
         if immediate {
@@ -442,13 +401,13 @@ final class PlayerSlot: Identifiable {
             delay = shouldSlowRetry ? slowRetryDelay : min(baseDelay, 5.0)
         }
 
-        let player = self.player
         if shouldSurfaceError {
+            let retrySeconds = max(1, Int(delay.rounded(.up)))
             switch reason {
             case .eof:
-                player.setReconnectingErrorMessage("Stream offline — retrying in background.")
+                setRecoveryErrorMessage("Stream offline — retrying in \(retrySeconds)s.")
             case .error(_, let message):
-                player.setReconnectingErrorMessage("Stream offline — retrying in background. (\(message))")
+                setRecoveryErrorMessage("Stream offline — retrying in \(retrySeconds)s. (\(message))")
             case .stopped, .http509:
                 break
             }
@@ -474,6 +433,9 @@ final class PlayerSlot: Identifiable {
         pendingReconnectIs509 = false
         stopRecoveryTasks(resetFailureWindow: false)
         noteExpectedStopIfReplacingCurrentItem()
+        // The stream just failed — a cached CDN edge assignment is a prime
+        // suspect (expired token, dead edge). Force a fresh resolution.
+        MPVPlayer.invalidateResolvedURL(for: channel.streamURL)
         player.loadURL(channel.streamURL, autoplay: true)
         armRecoveryWatchdogs()
     }
@@ -492,7 +454,7 @@ final class PlayerSlot: Identifiable {
                    self.player.timePos - startTime >= self.healthyPlaybackSeconds {
                     self.reconnectAttempt = 0
                     self.firstFailureAt = nil
-                    self.player.clearReconnectingErrorMessage()
+                    self.clearRecoveryErrorMessage()
                     return
                 }
             }
@@ -610,8 +572,19 @@ final class PlayerSlot: Identifiable {
             reconnectAttempt = 0
             firstFailureAt = nil
             lastReconnectAt = nil
+            clearRecoveryErrorMessage()
         }
 
+    }
+
+    private func setRecoveryErrorMessage(_ message: String) {
+        recoveryErrorMessage = message
+        player.setReconnectingErrorMessage(message)
+    }
+
+    private func clearRecoveryErrorMessage() {
+        recoveryErrorMessage = nil
+        _player?.clearReconnectingErrorMessage()
     }
 
     private func noteExpectedStopIfReplacingCurrentItem() {
@@ -693,8 +666,9 @@ final class PlayerSlot: Identifiable {
         }
         playbackMode = .live
         playbackStreamHealth = StreamHealth()
+        hasRenderedAnyFrame = false
         stopRecoveryTasks(resetFailureWindow: true)
-        player.clearReconnectingErrorMessage()
+        clearRecoveryErrorMessage()
         if useCurrentLiveLoadIfPossible() {
             return
         }
@@ -713,8 +687,9 @@ final class PlayerSlot: Identifiable {
         }
         playbackMode = .live
         playbackStreamHealth = StreamHealth()
+        hasRenderedAnyFrame = false
         stopRecoveryTasks(resetFailureWindow: true)
-        player.clearReconnectingErrorMessage()
+        clearRecoveryErrorMessage()
         if useCurrentLiveLoadIfPossible() {
             return
         }
@@ -729,6 +704,7 @@ final class PlayerSlot: Identifiable {
         guard player.currentURL == channel.streamURL else { return false }
         AppLog.playback.info("Using current live load channel=\(self.channel.name, privacy: .public)")
         if player.hasRenderedCurrentLoad {
+            hasRenderedAnyFrame = true
             PlayerStartupTiming.noteFirstFrame(channel: channel)
         }
         Task { @MainActor [weak player] in
@@ -751,7 +727,7 @@ final class PlayerSlot: Identifiable {
         playbackMode = .catchup
         playbackStreamHealth = StreamHealth()
         cancelReconnect()
-        player.clearReconnectingErrorMessage()
+        clearRecoveryErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
         player.setMute(false)
         player.loadURL(url, autoplay: true)
@@ -766,7 +742,7 @@ final class PlayerSlot: Identifiable {
         playbackMode = .onDemand
         playbackStreamHealth = StreamHealth()
         cancelReconnect()
-        player.clearReconnectingErrorMessage()
+        clearRecoveryErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(channel.streamURL, autoplay: true)
     }
@@ -790,10 +766,6 @@ final class PlayerSession {
 
     static func prewarmPlayerPool() {
         MPVPlayerPool.shared.prewarmFocusedHandle()
-    }
-
-    static func prebuffer(channel: Channel) -> MPVPlayer? {
-        MPVPlayerPool.shared.prebuffer(channel: channel)
     }
 
     static func noteOpen(channel: Channel) {
