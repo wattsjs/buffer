@@ -84,6 +84,28 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
         contentType == .live && (catchup?.days ?? 0) > 0
     }
 
+    /// The wall-clock interval this channel's provider archive covers right
+    /// now, or nil when the channel has no catchup. Single source of truth
+    /// for "how far back can this channel go" — every eligibility check and
+    /// clamp derives from this.
+    func archiveWindow(now: Date = Date()) -> DateInterval? {
+        guard contentType == .live, let days = catchup?.days, days > 0 else { return nil }
+        return DateInterval(start: now.addingTimeInterval(-Double(days) * 86400), end: now)
+    }
+
+    /// True when `date` can be played from the archive.
+    func archiveContains(_ date: Date, now: Date = Date()) -> Bool {
+        archiveWindow(now: now)?.contains(date) ?? false
+    }
+
+    /// True when the program has started airing and its start still falls
+    /// inside the archive window — i.e. "Play from start" can work. Includes
+    /// programs currently on air.
+    func canReplay(_ program: EPGProgram, now: Date = Date()) -> Bool {
+        guard let window = archiveWindow(now: now) else { return false }
+        return program.start < now && program.start >= window.start
+    }
+
     var isOnDemand: Bool { contentType == .vod }
 
     func hash(into hasher: inout Hasher) {

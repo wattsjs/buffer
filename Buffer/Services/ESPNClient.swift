@@ -9,6 +9,7 @@ actor ESPNClient {
     private let lookbackDays = 1
     private let futureDays = 7
     private let requestLimit = 250
+    private let maxConcurrentLeagueFetches = 8
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -19,14 +20,29 @@ actor ESPNClient {
     /// Fetch events for all configured leagues concurrently.
     func fetchAllEvents() async -> [SportEvent] {
         await withTaskGroup(of: [SportEvent].self) { group in
-            for league in League.all {
+            let leagues = League.all
+            var nextIndex = 0
+            let initialCount = min(maxConcurrentLeagueFetches, leagues.count)
+
+            for _ in 0..<initialCount {
+                let league = leagues[nextIndex]
+                nextIndex += 1
                 group.addTask { [self] in
                     await self.fetchEvents(for: league)
                 }
             }
+
             var all: [SportEvent] = []
-            for await events in group {
+            while let events = await group.next() {
                 all.append(contentsOf: events)
+
+                if nextIndex < leagues.count {
+                    let league = leagues[nextIndex]
+                    nextIndex += 1
+                    group.addTask { [self] in
+                        await self.fetchEvents(for: league)
+                    }
+                }
             }
             return all
         }

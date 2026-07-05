@@ -326,6 +326,7 @@ struct ProgramSearchResultsPage: View {
     let totalIndexed: Int
     let currentProgram: (Channel) -> EPGProgram?
     let onSelect: (Channel) -> Void
+    let onPlayFromStart: (Channel, EPGProgram) -> Void
     let onSelectVOD: (VODItem) -> Void
     let onOpenSeries: (VODSeries) -> Void
     let onShowInEPG: (Channel) -> Void
@@ -563,6 +564,7 @@ struct ProgramSearchResultsPage: View {
                                             result: result,
                                             query: controller.query,
                                             onSelect: { onSelect(result.channel) },
+                                            onPlayFromStart: { onPlayFromStart(result.channel, result.program) },
                                             onShowInEPG: { onShowInEPG(result.channel) }
                                         )
                                     }
@@ -845,6 +847,7 @@ private struct ProgramResultRow: View {
     let result: ProgramSearchResult
     let query: String
     let onSelect: () -> Void
+    let onPlayFromStart: () -> Void
     let onShowInEPG: () -> Void
 
     @State private var hovered = false
@@ -861,12 +864,10 @@ private struct ProgramResultRow: View {
         result.program.end > Date()
     }
 
-    /// The program is in the past (or currently airing) AND the channel's
-    /// catchup window still covers its start — suitable for "Play from start".
+    /// The program has aired (or is airing) and the channel archive still
+    /// covers its start — suitable for "Play from start".
     private var canPlayFromCatchup: Bool {
-        guard let days = result.channel.catchup?.days, days > 0 else { return false }
-        let windowStart = Date().addingTimeInterval(-Double(days) * 86400)
-        return result.program.start >= windowStart && result.program.start < Date()
+        result.channel.canReplay(result.program)
     }
 
     private var isLive: Bool {
@@ -913,13 +914,6 @@ private struct ProgramResultRow: View {
                 channel: result.channel,
                 onPlay: {
                     showPopover = false
-                    if canPlayFromCatchup {
-                        PendingCatchup.set(
-                            channelID: result.channel.id,
-                            start: result.program.start,
-                            duration: result.program.duration
-                        )
-                    }
                     onSelect()
                 }
             )
@@ -973,9 +967,9 @@ private struct ProgramResultRow: View {
 
         if canPlayFromCatchup {
             Button {
-                activate()
+                onPlayFromStart()
             } label: {
-                Label("Play from start", systemImage: "play.fill")
+                Label("Play from start", systemImage: "gobackward")
             }
             Button {
                 onSelect()

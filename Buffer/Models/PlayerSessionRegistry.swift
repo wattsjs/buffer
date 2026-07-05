@@ -33,6 +33,27 @@ final class PlayerSessionRegistry {
         allSessions.removeAll { $0 === session }
     }
 
+    /// Hand `request` to an already-open player session showing the same
+    /// channel, raising its window. Returns false when no open window can
+    /// take it (the caller should open a new one). Catchup and resume need
+    /// the single-view transport, so multi-view sessions only accept live
+    /// requests for a slot they already host.
+    func deliver(_ request: PlaybackRequest) -> Bool {
+        for session in allSessions {
+            guard let slot = session.slots.first(where: { $0.channel.id == request.channel.id }) else {
+                continue
+            }
+            if session.isMulti, request.intent != .live {
+                continue
+            }
+            session.focus(slotID: slot.id)
+            session.externalRequest = request
+            session.hostWindow?.makeKeyAndOrderFront(nil)
+            return true
+        }
+        return false
+    }
+
     // MARK: - Lifecycle passthrough (Agent 09)
 
     func pauseAllBackgroundWork() {

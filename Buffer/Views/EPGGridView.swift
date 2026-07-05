@@ -1,14 +1,17 @@
 import SwiftUI
+import AppKit
 
 struct EPGGridView: View {
     let channels: [Channel]
     let hasLoadedOnce: Bool
     var revealChannelID: String? = nil
     var catchupLookback: CatchupLookbackSetting = .default
+    let guideVersion: Int
     let programsProvider: (Channel) -> [EPGProgram]
     /// Optional ranged provider backed by pre-buckets in VM. When present, rowData + ProgramRow receive
     /// only programs intersecting the current timeline window (makes buildRowData/buildBlocks allocation-free for the window).
     var rangedProgramsProvider: ((Channel, Date, Date) -> [EPGProgram])? = nil
+    var onCatchupGuideNeeded: (([Channel]) -> Void)? = nil
     let isFavorite: (Channel) -> Bool
     let onToggleFavorite: (Channel) -> Void
     let onChannelSelected: (Channel) -> Void
@@ -30,7 +33,8 @@ struct EPGGridView: View {
     private let pixelsPerMinute: CGFloat = 4
     private let headerHeight: CGFloat = 32
     private let minimumPastTimelineHours = 1
-    private let futureTimelineHours = 11
+    private let liveFutureTimelineHours = 11
+    private let maximumCatchupTimelineHours = 14 * 24
 
     private func timelineHours(timelineStart: Date, timelineEnd: Date) -> Int {
         max(1, Int(ceil(timelineEnd.timeIntervalSince(timelineStart) / 3600)))
@@ -40,37 +44,17 @@ struct EPGGridView: View {
         CGFloat(hours * 60) * pixelsPerMinute
     }
 
-    private func pastTimelineHours(for channels: [Channel]) -> Int {
-        guard channels.contains(where: \.supportsRewind) else { return minimumPastTimelineHours }
-        return maxPastTimelineHours(for: channels, now: timelineAnchor)
-    }
+    private func timelineBounds(for channels: [Channel], anchor: Date) -> (start: Date, end: Date) {
+        let anchorHour = Calendar.current.dateInterval(of: .hour, for: anchor)?.start ?? anchor
+        let end = anchorHour.addingTimeInterval(Double(liveFutureTimelineHours) * 3600)
 
-    private func maxPastTimelineHours(for channels: [Channel], now: Date) -> Int {
-        let availableHours = availablePastTimelineHours(for: channels, now: now)
-        guard let limitHours = catchupLookback.limitHours else { return availableHours }
-        return min(availableHours, limitHours)
-    }
+        guard let archiveStart = archiveStart(for: channels, now: anchor) else {
+            return (anchorHour.addingTimeInterval(-Double(minimumPastTimelineHours) * 3600), end)
+        }
 
-    private func availablePastTimelineHours(for channels: [Channel], now: Date) -> Int {
-        let earliest = earliestCatchupTimelineStart(for: channels, now: now)
-        guard let earliest else { return minimumPastTimelineHours }
-        let hours = Int(ceil(now.timeIntervalSince(earliest) / 3600))
-        return max(minimumPastTimelineHours, hours)
-    }
-
-    private func earliestCatchupTimelineStart(for channels: [Channel], now: Date) -> Date? {
-        channels
-            .compactMap { channel -> Date? in
-                guard let days = channel.catchup?.days, days > 0 else { return nil }
-                let catchupStart = now.addingTimeInterval(-Double(days) * 86400)
-                return programsProvider(channel)
-                    .lazy
-                    .filter { $0.start < now && $0.end > catchupStart }
-                    .map { max($0.start, catchupStart) }
-                    .min()
-            }
-            .min()
-            .map { floorToHalfHour($0) }
+        let archiveHour = Calendar.current.dateInterval(of: .hour, for: archiveStart)?.start ?? archiveStart
+        let cappedStart = anchorHour.addingTimeInterval(-Double(maximumCatchupTimelineHours) * 3600)
+        return (max(archiveHour, cappedStart), end)
     }
 
     // MARK: - Live "now" ticker (Agent 02/09)
@@ -111,25 +95,33 @@ struct EPGGridView: View {
         timelineResetID += 1
     }
 
-    private func makeTimelineStart(from now: Date, pastHours: Int, channels: [Channel]) -> Date {
-        let cal = Calendar.current
-        let currentHour = cal.dateInterval(of: .hour, for: now)?.start ?? now
-        let requested = currentHour.addingTimeInterval(-Double(pastHours) * 60 * 60)
-        guard let earliest = earliestCatchupTimelineStart(for: channels, now: now) else { return requested }
-        return max(requested, earliest)
+    private func resetToCurrentTimeline() {
+        let currentNow = Date()
+        now = currentNow
+        timelineAnchor = currentNow
+        timelineResetID += 1
+        scrollToCurrentID += 1
     }
 
-    private func makeTimelineEnd(from now: Date) -> Date {
-        let cal = Calendar.current
-        let currentHour = cal.dateInterval(of: .hour, for: now)?.start ?? now
-        return currentHour.addingTimeInterval(Double(futureTimelineHours) * 3600)
+    /// Earliest wall-clock moment the timeline can reach for these channels.
+    /// Derived ONLY from channel catchup metadata and the lookback setting so
+    /// it is deterministic for a fixed anchor: loaded guide data must never
+    /// move the document origin between hard resets, or content would shift
+    /// under the user's scroll position.
+    private func archiveStart(for channels: [Channel], now currentNow: Date) -> Date? {
+        guard let channelArchiveStart = channels
+            .compactMap({ $0.archiveWindow(now: currentNow)?.start })
+            .min() else { return nil }
+
+        guard let limitHours = catchupLookback.limitHours else { return channelArchiveStart }
+        return max(channelArchiveStart, currentNow.addingTimeInterval(-Double(limitHours) * 3600))
     }
 
-    private func floorToHalfHour(_ date: Date) -> Date {
-        let cal = Calendar.current
-        let hourStart = cal.dateInterval(of: .hour, for: date)?.start ?? date
-        let minute = cal.component(.minute, from: date)
-        return hourStart.addingTimeInterval(minute >= 30 ? 30 * 60 : 0)
+
+
+    private func requestCatchupGuideIfNeeded(for channels: [Channel]) {
+        guard channels.contains(where: \.supportsRewind) else { return }
+        onCatchupGuideNeeded?(channels)
     }
 
     private func makeNowX(now: Date, timelineStart: Date, timelineWidth: CGFloat) -> CGFloat? {
@@ -170,9 +162,9 @@ struct EPGGridView: View {
             // accurate and smooth while avoiding full grid rebuilds on every tick.
             let now = self.now
             let timelineAnchor = self.timelineAnchor
-            let pastHours = pastTimelineHours(for: channels)
-            let timelineStart = makeTimelineStart(from: timelineAnchor, pastHours: pastHours, channels: channels)
-            let timelineEnd = makeTimelineEnd(from: timelineAnchor)
+            let bounds = timelineBounds(for: channels, anchor: timelineAnchor)
+            let timelineStart = bounds.start
+            let timelineEnd = bounds.end
             let timelineHours = timelineHours(timelineStart: timelineStart, timelineEnd: timelineEnd)
             let width = timelineWidth(hours: timelineHours)
             let nowX = makeNowX(now: now, timelineStart: timelineStart, timelineWidth: width)
@@ -192,6 +184,11 @@ struct EPGGridView: View {
                     )
                     : nil,
                 timelineIdentity: timelineIdentity(for: channels, resetID: timelineResetID),
+                dataVersion: AnyHashable(guideVersion),
+                timeStripSlots: timeSlots(from: timelineStart, timelineHours: timelineHours).map {
+                    TimeStripSlot(x: CGFloat($0.timeIntervalSince(timelineStart) / 60) * pixelsPerMinute, title: Self.headerTime($0, relativeTo: now))
+                },
+                timeStripSlotWidth: 30 * pixelsPerMinute,
                 channelNameProvider: { $0.name },
                 rowDataProvider: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd = timelineEnd, pixelsPerMinute, timelineHours] channel in
                     let progs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
@@ -238,18 +235,20 @@ struct EPGGridView: View {
                     }
                     .fadeIfStreamDead(channelID: channel.id)
                 },
-                headerContent: { timeStrip(timelineStart: timelineStart, timelineHours: timelineHours, now: now) },
                 cornerContent: { cornerLabel }
             )
             .background(Color(nsColor: .textBackgroundColor))
             .onChange(of: channels.map(\.id)) { _, _ in
                 resetTimelineWindow(for: channels, now: Date())
+                requestCatchupGuideIfNeeded(for: channels)
             }
             .onChange(of: catchupLookback) { _, _ in
                 resetTimelineWindow(for: channels, now: Date())
+                requestCatchupGuideIfNeeded(for: channels)
             }
             .onAppear {
                 startNowTicker()
+                requestCatchupGuideIfNeeded(for: channels)
             }
             .onDisappear { stopNowTicker() }
         }
@@ -271,7 +270,7 @@ struct EPGGridView: View {
             .filter { $0.end > timelineStart && $0.start < end }
             .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
 
-        var blocks: [(rect: CGRect, timeRange: String?)] = []
+        var blocks: [ChannelLabelBlockData] = []
         var cursor = timelineStart
 
         func appendGap(until gapEnd: Date) {
@@ -280,9 +279,10 @@ struct EPGGridView: View {
             let endX = min(Double(timelineWidth), gapEnd.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
             let width = endX - startX
             guard width > 2 else { return }
-            blocks.append((
+            blocks.append(ChannelLabelBlockData(
                 rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                timeRange: nil
+                timeRange: nil,
+                title: nil
             ))
         }
 
@@ -296,42 +296,21 @@ struct EPGGridView: View {
             let endX = min(Double(timelineWidth), p.end.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
             let width = endX - startX
             guard width > 2 else { continue }
-            blocks.append((
+            blocks.append(ChannelLabelBlockData(
                 rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))"
+                timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))",
+                title: p.title.isEmpty ? "No Event Today" : p.title
             ))
             cursor = p.end
         }
 
-        if showGuideGaps {
+        if showGuideGaps && !sorted.isEmpty {
             appendGap(until: end)
-        }
-
-        if blocks.isEmpty {
-            blocks.append((
-                rect: CGRect(x: 0, y: 3, width: timelineWidth, height: rowHeight - 6),
-                timeRange: nil
-            ))
         }
 
         return ChannelLabelRowData(channelName: channel.name, blocks: blocks)
     }
 
-    private func timeStrip(timelineStart: Date, timelineHours: Int, now: Date) -> some View {
-        HStack(spacing: 0) {
-            ForEach(timeSlots(from: timelineStart, timelineHours: timelineHours), id: \.self) { time in
-                Text(Self.headerTime(time, relativeTo: now))
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .frame(width: 30 * pixelsPerMinute, alignment: .leading)
-                    .padding(.leading, 6)
-            }
-        }
-        .frame(width: timelineWidth(hours: timelineHours), height: headerHeight, alignment: .leading)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
-    }
 
     private var cornerLabel: some View {
         HStack(spacing: 6) {
@@ -340,7 +319,7 @@ struct EPGGridView: View {
                 .foregroundStyle(.primary)
             Spacer(minLength: 0)
             Button {
-                scrollToCurrentID += 1
+                resetToCurrentTimeline()
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: 12, weight: .semibold))
@@ -394,7 +373,7 @@ private struct ChannelCell: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(bgColor)
-                ChannelLogoView(url: channel.logoURL) { color in
+                ChannelLogoView(url: channel.logoURL, contentInset: 5) { color in
                     withAnimation(.easeInOut(duration: 0.25)) {
                         bgColor = Color(nsColor: color)
                     }
@@ -449,7 +428,7 @@ private struct ChannelCell: View {
     }
 }
 
-// MARK: - Program row (Canvas-rendered)
+// MARK: - Program row
 
 private struct ProgramRow: View {
     let channel: Channel
@@ -529,7 +508,7 @@ private struct ProgramRow: View {
     }
 }
 
-// MARK: - Canvas layer (isolated from selection state for snappy popover response)
+// MARK: - AppKit program block layer (tiled drawing for full-archive widths)
 
 private struct ProgramCanvasLayer: View, Equatable {
     let programs: [EPGProgram]
@@ -562,16 +541,7 @@ private struct ProgramCanvasLayer: View, Equatable {
     fileprivate struct Block {
         let program: EPGProgram?
         let rect: CGRect
-        let title: String
-        let timeRange: String?
         let hasReminder: Bool
-        let isFallback: Bool
-    }
-
-    private static func timelineTime(_ date: Date) -> String {
-        date.formatted(date: .omitted, time: .shortened)
-            .replacingOccurrences(of: " ", with: "")
-            .lowercased()
     }
 
     private func buildBlocks() -> [Block] {
@@ -594,10 +564,7 @@ private struct ProgramCanvasLayer: View, Equatable {
                 Block(
                     program: nil,
                     rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                    title: "No guide data",
-                    timeRange: nil,
-                    hasReminder: false,
-                    isFallback: true
+                    hasReminder: false
                 )
             )
         }
@@ -618,145 +585,143 @@ private struct ProgramCanvasLayer: View, Equatable {
                 Block(
                     program: p,
                     rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                    title: p.title.isEmpty ? "No Event Today" : p.title,
-                    timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))",
-                    hasReminder: reminderProgramIDs.contains(p.id),
-                    isFallback: false
+                    hasReminder: reminderProgramIDs.contains(p.id)
                 )
             )
             cursor = p.end
         }
 
-        if showGuideGaps {
+        if showGuideGaps && !sorted.isEmpty {
             appendGap(until: end)
-        }
-
-        if blocks.isEmpty {
-            let title = fallbackTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !title.isEmpty {
-                blocks.append(
-                    Block(
-                        program: nil,
-                        rect: CGRect(x: 0, y: 3, width: timelineWidth, height: rowHeight - 6),
-                        title: title,
-                        timeRange: nil,
-                        hasReminder: false,
-                        isFallback: true
-                    )
-                )
-            }
         }
 
         return blocks
     }
 
     var body: some View {
-        let blocks = buildBlocks()
-        let fill = Color(nsColor: .quaternaryLabelColor).opacity(0.5)
-        let border = Color(nsColor: .separatorColor)
-        let textPrimary = Color.primary
-        let textSecondary = Color.secondary
-
-        Canvas { context, _ in
-            for block in blocks {
-                let inset = block.rect.insetBy(dx: 1, dy: 0)
-                let path = Path(roundedRect: inset, cornerRadius: 3)
-                context.fill(path, with: .color(fill))
-                context.stroke(path, with: .color(border), lineWidth: 0.5)
-
-                let textRect = inset.insetBy(dx: 9, dy: 5)
-                guard textRect.width > 10 else { continue }
-
-                let titleText = Text(block.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(textPrimary)
-
-                let resolvedTitle = context.resolve(titleText)
-                let unbounded = CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-                let titleSize = resolvedTitle.measure(in: unbounded)
-                let resolvedTime = block.timeRange.map {
-                    context.resolve(
-                        Text($0)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(textSecondary)
-                    )
-                }
-                let timeSize = resolvedTime?.measure(in: unbounded) ?? .zero
-
-                context.drawLayer { layer in
-                    layer.clip(to: Path(inset))
-
-                    if let resolvedTime {
-                        let lineGap: CGFloat = 2
-                        let groupHeight = timeSize.height + lineGap + titleSize.height
-                        let groupY = max(textRect.minY, inset.midY - groupHeight / 2)
-                        layer.draw(
-                            resolvedTime,
-                            in: CGRect(
-                                x: textRect.minX,
-                                y: groupY,
-                                width: textRect.width,
-                                height: timeSize.height
-                            )
-                        )
-                        layer.draw(
-                            resolvedTitle,
-                            in: CGRect(
-                                x: textRect.minX,
-                                y: groupY + timeSize.height + lineGap,
-                                width: textRect.width,
-                                height: titleSize.height
-                            )
-                        )
-                    } else {
-                        let titleOriginY = inset.midY - titleSize.height / 2
-                        layer.draw(
-                            resolvedTitle,
-                            in: CGRect(
-                                x: textRect.minX,
-                                y: titleOriginY,
-                                width: textRect.width,
-                                height: titleSize.height
-                            )
-                        )
-                    }
-
-                    if block.hasReminder {
-                        let bellText = Text(Image(systemName: "bell.fill"))
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.orange)
-                        let resolvedBell = context.resolve(bellText)
-                        let bellSize = resolvedBell.measure(in: unbounded)
-                        let bellOrigin = CGPoint(
-                            x: inset.maxX - bellSize.width - 5,
-                            y: inset.minY + 5
-                        )
-                        layer.draw(resolvedBell, at: bellOrigin, anchor: .topLeading)
-                    }
-                }
-            }
-        }
-        .background(Color(nsColor: .textBackgroundColor))
-        .contentShape(Rectangle())
-        .onTapGesture(coordinateSpace: .local) { location in
-            if let block = blocks.first(where: { $0.rect.contains(location) }) {
-                if let program = block.program {
-                    onProgramTap(program, block.rect)
-                } else {
-                    onEmptyTap()
-                }
-            } else {
-                onEmptyTap()
-            }
-        }
-        .overlay(
-            RightClickCatcher { location, event, view in
-                if let block = blocks.first(where: { $0.rect.contains(location) }),
-                   let program = block.program {
-                    onProgramRightClick(program, event, view)
-                }
-            }
+        ProgramBlocksRepresentable(
+            blocks: buildBlocks(),
+            onProgramTap: onProgramTap,
+            onEmptyTap: onEmptyTap,
+            onProgramRightClick: onProgramRightClick
         )
+    }
+}
+
+private struct ProgramBlocksRepresentable: NSViewRepresentable {
+    let blocks: [ProgramCanvasLayer.Block]
+    let onProgramTap: (EPGProgram, CGRect) -> Void
+    let onEmptyTap: () -> Void
+    let onProgramRightClick: (EPGProgram, NSEvent, NSView) -> Void
+
+    func makeNSView(context: Context) -> ProgramBlocksView {
+        let view = ProgramBlocksView()
+        view.setHandlers(
+            onProgramTap: onProgramTap,
+            onEmptyTap: onEmptyTap,
+            onProgramRightClick: onProgramRightClick
+        )
+        view.setBlocks(blocks)
+        return view
+    }
+
+    func updateNSView(_ view: ProgramBlocksView, context: Context) {
+        view.setHandlers(
+            onProgramTap: onProgramTap,
+            onEmptyTap: onEmptyTap,
+            onProgramRightClick: onProgramRightClick
+        )
+        view.setBlocks(blocks)
+    }
+}
+
+private final class ProgramBlocksView: NSView {
+    private var blocks: [ProgramCanvasLayer.Block] = []
+    private var onProgramTap: ((EPGProgram, CGRect) -> Void)?
+    private var onEmptyTap: (() -> Void)?
+    private var onProgramRightClick: ((EPGProgram, NSEvent, NSView) -> Void)?
+
+    override var isFlipped: Bool { true }
+
+    func setHandlers(
+        onProgramTap: @escaping (EPGProgram, CGRect) -> Void,
+        onEmptyTap: @escaping () -> Void,
+        onProgramRightClick: @escaping (EPGProgram, NSEvent, NSView) -> Void
+    ) {
+        self.onProgramTap = onProgramTap
+        self.onEmptyTap = onEmptyTap
+        self.onProgramRightClick = onProgramRightClick
+    }
+
+    func setBlocks(_ blocks: [ProgramCanvasLayer.Block]) {
+        self.blocks = blocks
+        needsDisplay = true
+    }
+
+    private static let bellImage: NSImage? = {
+        let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+            .applying(.init(paletteColors: [.systemOrange]))
+        return NSImage(systemSymbolName: "bell.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+    }()
+
+    private static func blockFillColor(for block: ProgramCanvasLayer.Block) -> NSColor {
+        block.program == nil
+            ? NSColor(calibratedWhite: 0.46, alpha: 0.90)
+            : NSColor(calibratedWhite: 0.86, alpha: 1)
+    }
+
+    private static let blockStrokeColor = NSColor(calibratedWhite: 0.72, alpha: 0.55)
+
+    override func draw(_ dirtyRect: NSRect) {
+        let strokeColor = Self.blockStrokeColor
+
+        for block in blocks {
+            guard block.program != nil else { continue }
+            guard block.rect.intersects(dirtyRect) else { continue }
+            let inset = block.rect.insetBy(dx: 1, dy: 0)
+            let path = NSBezierPath(roundedRect: inset, xRadius: 3, yRadius: 3)
+            Self.blockFillColor(for: block).setFill()
+            path.fill()
+            strokeColor.setStroke()
+            path.lineWidth = 0.5
+            path.stroke()
+
+            guard block.hasReminder, let bell = Self.bellImage else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            path.addClip()
+            let titleY = max(inset.minY, EPGStickyLabelMetrics.titleRowY)
+            let size = bell.size
+            bell.draw(
+                in: NSRect(
+                    x: inset.maxX - size.width - 6,
+                    y: titleY + 1,
+                    width: size.width,
+                    height: size.height
+                ),
+                from: .zero,
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: nil
+            )
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        if let block = blocks.first(where: { $0.rect.contains(location) }), let program = block.program {
+            onProgramTap?(program, block.rect)
+        } else {
+            onEmptyTap?()
+        }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        guard let block = blocks.first(where: { $0.rect.contains(location) }), let program = block.program else { return }
+        onProgramRightClick?(program, event, self)
     }
 }
 

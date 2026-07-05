@@ -13,7 +13,7 @@ enum SyncInterval: Int, CaseIterable, Identifiable {
     static let playlistStorageKey = "buffer_playlist_sync_interval_hours"
     static let epgStorageKey = "buffer_epg_sync_interval_hours"
     static let playlistDefault: SyncInterval = .oneDay
-    static let epgDefault: SyncInterval = .sixHours
+    static let epgDefault: SyncInterval = .oneHour
 
     var id: Int { rawValue }
     var hours: Int { rawValue }

@@ -30,22 +30,50 @@ struct ContentView: View {
     }
 
     private func openChannel(_ channel: Channel) {
+        open(.live(channel))
+    }
+
+    private func openCatchup(_ channel: Channel, program: EPGProgram) {
+        open(.catchup(channel, from: program.start))
+    }
+
+    private func open(_ request: PlaybackRequest) {
+        let channel = request.channel
         if selectedPlayer != .none {
             viewModel.addRecent(channel)
             updateSportsMatchingPreferences()
             AppLog.playback.info("Opening channel externally name=\(channel.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
-            ExternalPlayer.launch(streamURL: channel.streamURL, using: selectedPlayer)
-        } else {
-            AppLog.playback.info("Opening channel in Buffer name=\(channel.name, privacy: .public)")
+            ExternalPlayer.launch(streamURL: externalPlayerURL(for: request), using: selectedPlayer)
+            return
+        }
+
+        AppLog.playback.info("Opening channel in Buffer name=\(channel.name, privacy: .public)")
+        // An already-open window for this channel takes the request in
+        // place (and comes to front) instead of spawning a duplicate.
+        if !PlayerSessionRegistry.shared.deliver(request) {
             PlayerSession.noteOpen(channel: channel)
-            openWindow(value: channel)
-            Task { @MainActor in
-                await Task.yield()
-                viewModel.addRecent(channel)
-                updateSportsMatchingPreferences()
-                scheduleInternalPlayerPrewarm()
+            openWindow(value: request)
+        }
+        Task { @MainActor in
+            await Task.yield()
+            viewModel.addRecent(channel)
+            updateSportsMatchingPreferences()
+            scheduleInternalPlayerPrewarm()
+        }
+    }
+
+    /// External players can't be handed playback intents — resolve the
+    /// request to the best matching URL up front.
+    private func externalPlayerURL(for request: PlaybackRequest) -> URL {
+        let channel = request.channel
+        if case .catchup(let start) = request.intent {
+            let program = viewModel.program(for: channel, at: start)
+            let duration = program.map(\.duration) ?? 2 * 3600
+            if let url = CatchupURLBuilder.url(for: channel, start: start, duration: duration) {
+                return url
             }
         }
+        return channel.streamURL
     }
 
     private func openVODItem(_ item: VODItem, resumePosition: Double? = nil) {
@@ -58,11 +86,15 @@ struct ContentView: View {
                     AppLog.playback.info("Opening VOD externally name=\(playableItem.name, privacy: .public) player=\(selectedPlayer.displayName, privacy: .public)")
                     ExternalPlayer.launch(streamURL: playableItem.streamURL, using: selectedPlayer)
                 } else {
-                    if let resumePosition, resumePosition > 0 {
-                        PendingVODResume.set(channelID: channel.id, positionSeconds: resumePosition)
-                    }
                     AppLog.playback.info("Opening VOD in Buffer name=\(playableItem.name, privacy: .public)")
-                    openWindow(value: channel)
+                    let request: PlaybackRequest = if let resumePosition, resumePosition > 0 {
+                        .resume(channel, at: resumePosition)
+                    } else {
+                        .live(channel)
+                    }
+                    if !PlayerSessionRegistry.shared.deliver(request) {
+                        openWindow(value: request)
+                    }
                 }
             } catch {
                 AppLog.playback.error("Failed to resolve VOD playback URL error=\(error.localizedDescription, privacy: .public)")
@@ -290,6 +322,7 @@ struct ContentView: View {
                 totalIndexed: viewModel.searchEntries.count,
                 currentProgram: { viewModel.currentProgram(for: $0) },
                 onSelect: { openChannel($0) },
+                onPlayFromStart: { channel, program in openCatchup(channel, program: program) },
                 onSelectVOD: { viewModel.selection = .movieDetail($0) },
                 onOpenSeries: { series in
                     viewModel.selection = .seriesDetail(series)
@@ -308,8 +341,10 @@ struct ContentView: View {
                 hasLoadedOnce: viewModel.hasLoadedOnce,
                 revealChannelID: viewModel.revealChannelID,
                 catchupLookback: CatchupLookbackSetting.stored(rawValue: catchupLookbackRawValue),
+                guideVersion: viewModel.guideVersion,
                 programsProvider: { viewModel.programsForChannel($0) },
                 rangedProgramsProvider: { ch, start, end in viewModel.programsForChannel(ch, between: start, and: end) },
+                onCatchupGuideNeeded: { channels in viewModel.syncCatchupGuideIfNeeded(for: channels) },
                 isFavorite: { viewModel.isFavorite($0) },
                 onToggleFavorite: { viewModel.toggleFavorite($0) },
                 onChannelSelected: { channel in

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import OSLog
@@ -56,6 +57,23 @@ private enum PlayerStartupTiming {
         let elapsedMs = Int((Date().timeIntervalSince(startedAt) * 1000).rounded())
         AppLog.playback.info("player open-to-first-frame channel=\(channel.name, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
     }
+}
+
+/// Wall-clock description of an in-flight catchup playback. Owned by
+/// `PlayerSlot` (not the view) so the state survives chrome rebuilds, focus
+/// changes, and can drive auto-advance when a clip ends.
+struct CatchupPlayback {
+    /// The wall-clock span the transport bar represents — normally one EPG
+    /// program, or an ad-hoc window when no guide data matched.
+    var timeline: DateInterval
+    /// Wall-clock time corresponding to position 0 of the clip mpv currently
+    /// has loaded. `loadedStart + player.timePos` = the moment being watched.
+    var loadedStart: Date
+    /// EPG program anchoring `timeline`, when one matched.
+    var programID: String?
+    /// True from the moment a catchup load/seek is issued until the new clip
+    /// actually starts playing.
+    var isSwitching: Bool
 }
 
 enum MultiViewLayout: String, CaseIterable, Identifiable {
@@ -121,6 +139,21 @@ final class PlayerSlot: Identifiable {
     var currentProgram: EPGProgram?
     private(set) var playbackStreamHealth = StreamHealth()
     private(set) var recoveryErrorMessage: String?
+
+    /// Non-nil while this slot plays from the channel archive.
+    private(set) var catchup: CatchupPlayback?
+    /// Fired when a catchup clip reaches its end (provider EOF). The owner
+    /// decides what "next" means — advance to the following program's
+    /// archive or return to live.
+    @ObservationIgnored var onCatchupClipEnded: (() -> Void)?
+    @ObservationIgnored private var catchupSwitchTimeout: Task<Void, Never>?
+
+    var isCatchup: Bool { catchup != nil }
+
+    /// The wall-clock moment currently being watched, when in catchup.
+    var catchupWallClock: Date? {
+        catchup.map { $0.loadedStart.addingTimeInterval(player.timePos) }
+    }
 
     // MPVPlayer is created lazily on first access (or acquired from the
     // warm reuse pool). SwiftUI re-invokes view inits on every parent
@@ -254,7 +287,12 @@ final class PlayerSlot: Identifiable {
                 player.setReconnectingErrorMessage("Playback failed: \(message)")
             case .http509(let message):
                 player.setReconnectingErrorMessage("Bandwidth limit — stream paused: \(message)")
-            case .eof, .stopped:
+            case .eof:
+                if playbackMode == .catchup {
+                    endCatchupSwitching()
+                    onCatchupClipEnded?()
+                }
+            case .stopped:
                 break
             }
             return
@@ -276,6 +314,7 @@ final class PlayerSlot: Identifiable {
     private func handleFirstFrame() {
         hasRenderedAnyFrame = true
         clearRecoveryErrorMessage()
+        endCatchupSwitching()
         PlayerStartupTiming.noteFirstFrame(channel: channel)
     }
 
@@ -665,6 +704,7 @@ final class PlayerSlot: Identifiable {
             return
         }
         playbackMode = .live
+        clearCatchupState()
         playbackStreamHealth = StreamHealth()
         hasRenderedAnyFrame = false
         stopRecoveryTasks(resetFailureWindow: true)
@@ -686,6 +726,7 @@ final class PlayerSlot: Identifiable {
             return
         }
         playbackMode = .live
+        clearCatchupState()
         playbackStreamHealth = StreamHealth()
         hasRenderedAnyFrame = false
         stopRecoveryTasks(resetFailureWindow: true)
@@ -723,14 +764,94 @@ final class PlayerSlot: Identifiable {
         return true
     }
 
-    func loadCatchup(_ url: URL) {
+    // MARK: - Catchup playback
+
+    /// Start archive playback at `start`, presenting `timeline` on the
+    /// transport bar. `start` is clamped into the channel's archive window
+    /// and to the timeline itself.
+    func playCatchup(from start: Date, timeline: DateInterval, programID: String?) {
+        // Falling back to live on failure matters: callers may have skipped
+        // the initial live load expecting this to take over — silently
+        // returning would leave a black player.
+        guard let window = channel.archiveWindow() else {
+            loadLive()
+            return
+        }
+        let clampedStart = clampCatchupStart(start, window: window, timeline: timeline)
+
+        // Request through to the end of the timeline so mpv gets one
+        // continuous clip for the presented program. Providers clamp
+        // still-airing ends themselves.
+        let duration = max(timeline.end.timeIntervalSince(clampedStart), 60)
+        guard let url = CatchupURLBuilder.url(for: channel, start: clampedStart, duration: duration) else {
+            AppLog.playback.error("Catchup URL build failed channel=\(self.channel.name, privacy: .public)")
+            loadLive()
+            return
+        }
+
+        AppLog.playback.info("Loading catchup channel=\(self.channel.name, privacy: .public) start=\(clampedStart, privacy: .public) timeline=\(timeline.start, privacy: .public)…\(timeline.end, privacy: .public)")
+
         playbackMode = .catchup
         playbackStreamHealth = StreamHealth()
         cancelReconnect()
         clearRecoveryErrorMessage()
+        catchup = CatchupPlayback(
+            timeline: timeline,
+            loadedStart: clampedStart,
+            programID: programID,
+            isSwitching: true
+        )
+        armCatchupSwitchTimeout()
         noteExpectedStopIfReplacingCurrentItem()
         player.setMute(false)
         player.loadURL(url, autoplay: true)
+    }
+
+    /// Move the catchup playhead to a wall-clock target. Seeks inside the
+    /// already-loaded clip when mpv can (cheap), otherwise reloads the
+    /// archive URL at the new offset.
+    func seekCatchup(toWallClock target: Date) {
+        guard let current = catchup, let window = channel.archiveWindow() else { return }
+        let clamped = clampCatchupStart(target, window: window, timeline: current.timeline)
+
+        let clipOffset = clamped.timeIntervalSince(current.loadedStart)
+        if clipOffset >= 0, player.isSeekable, clipOffset < player.duration - 5 {
+            player.seek(to: clipOffset)
+            return
+        }
+        playCatchup(from: clamped, timeline: current.timeline, programID: current.programID)
+    }
+
+    /// Leave the archive and reconnect the live stream.
+    func returnToLive() {
+        guard isCatchup else { return }
+        loadLive()
+    }
+
+    private func clampCatchupStart(_ start: Date, window: DateInterval, timeline: DateInterval) -> Date {
+        // Keep a safety margin inside both edges: providers 404 on requests
+        // at the exact archive boundary, and near-live requests race the
+        // archiver.
+        let earliest = max(window.start.addingTimeInterval(60), timeline.start)
+        let latest = window.end.addingTimeInterval(-30)
+        return min(max(start, earliest), latest)
+    }
+
+    private func armCatchupSwitchTimeout() {
+        catchupSwitchTimeout?.cancel()
+        catchupSwitchTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled else { return }
+            self?.catchup?.isSwitching = false
+        }
+    }
+
+    private func endCatchupSwitching() {
+        catchupSwitchTimeout?.cancel()
+        catchupSwitchTimeout = nil
+        if catchup?.isSwitching == true {
+            catchup?.isSwitching = false
+        }
     }
 
     func seekOnNextOnDemandLoad(to seconds: Double) {
@@ -740,11 +861,18 @@ final class PlayerSlot: Identifiable {
 
     private func loadOnDemand() {
         playbackMode = .onDemand
+        clearCatchupState()
         playbackStreamHealth = StreamHealth()
         cancelReconnect()
         clearRecoveryErrorMessage()
         noteExpectedStopIfReplacingCurrentItem()
         player.loadURL(channel.streamURL, autoplay: true)
+    }
+
+    private func clearCatchupState() {
+        catchupSwitchTimeout?.cancel()
+        catchupSwitchTimeout = nil
+        catchup = nil
     }
 }
 
@@ -754,6 +882,14 @@ final class PlayerSession {
     private(set) var slots: [PlayerSlot] = []
     private(set) var focusedSlotID: UUID
     var layout: MultiViewLayout
+
+    /// The NSWindow hosting this session's PlayerView. Registered by the
+    /// view so `PlayerSessionRegistry.deliver(_:)` can raise the window when
+    /// it hands a new request to an already-open session.
+    @ObservationIgnored weak var hostWindow: NSWindow?
+    /// A request delivered while this session's window is already open.
+    /// PlayerView observes and consumes it.
+    var externalRequest: PlaybackRequest?
 
     private var started = false
 

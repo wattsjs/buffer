@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 import NukeUI
-import OSLog
 
 enum MediaInfoDisplay: String, CaseIterable {
     case expanded
@@ -59,6 +58,9 @@ struct PlayerView: View {
     let mode: Mode
     /// Present only in channel mode — recordings don't need EPG lookups.
     let viewModel: EPGViewModel?
+    /// What to do on first appear (channel mode): tune live, start archive
+    /// playback, or resume an on-demand position.
+    private let initialIntent: PlaybackRequest.Intent
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
@@ -76,25 +78,13 @@ struct PlayerView: View {
     @State private var streamProbeService = StreamProbeService.shared
 
     /// Recording-mode primary scrub position override while the user drags
-    /// the bottom scrubber. Also reused by channel mode's HLS-seekbar.
+    /// the bottom scrubber. Also reused by the channel-mode transport bars.
     @State private var scrubPosition: Double? = nil
 
-    /// Catchup step-slider scrub override (channel mode only).
-    @State private var catchupScrubOffset: Double? = nil
-    /// Wall-clock start time of the currently loaded catchup clip. `nil`
-    /// means we're on the live source (or it's a recording).
-    @State private var catchupStartDate: Date? = nil
-    /// Wall-clock start and duration used by the visible catchup scrubber.
-    /// mpv can report nonsense duration for Xtream .ts timeshift responses,
-    /// so the UI must use the EPG/requested window instead.
-    @State private var catchupTimelineStartDate: Date? = nil
-    @State private var catchupTimelineDuration: TimeInterval = 2 * 60 * 60
-    /// True between the moment a catchup load is kicked off and the
-    /// moment playback of the new clip actually begins.
-    @State private var isSeekingCatchup: Bool = false
-    @State private var seekingTimeoutTask: Task<Void, Never>? = nil
     @State private var liveReconciliationTask: Task<Void, Never>? = nil
-    private let defaultCatchupClipDuration: TimeInterval = 2 * 60 * 60
+    /// Counts catchup clips that ended almost immediately, so a broken
+    /// archive doesn't auto-advance in a tight load loop.
+    @State private var consecutiveInstantCatchupEOFs = 0
 
     /// Sticky live indicator. Starts true for any source that has a live
     /// concept (channel + in-progress recording) and false for completed
@@ -106,20 +96,22 @@ struct PlayerView: View {
 
     // MARK: - Init
 
-    init(channel: Channel, currentProgram: EPGProgram?, viewModel: EPGViewModel) {
+    init(request: PlaybackRequest, viewModel: EPGViewModel) {
         self.mode = .channel
         self.viewModel = viewModel
+        self.initialIntent = request.intent
         _channelSession = State(initialValue: PlayerSession(
-            initialChannel: channel,
-            currentProgram: currentProgram
+            initialChannel: request.channel,
+            currentProgram: viewModel.currentProgram(for: request.channel)
         ))
         _recordingPlayback = State(initialValue: nil)
-        _liveLatched = State(initialValue: !channel.isOnDemand)
+        _liveLatched = State(initialValue: !request.channel.isOnDemand)
     }
 
     init(recording: Recording) {
         self.mode = .recording
         self.viewModel = nil
+        self.initialIntent = .live
         _channelSession = State(initialValue: nil)
         _recordingPlayback = State(initialValue: RecordingPlayback(recording: recording))
         _liveLatched = State(initialValue: recording.status == .recording)
@@ -163,15 +155,14 @@ struct PlayerView: View {
         return !s.isMulti && (channel?.supportsRewind ?? false)
     }
 
-    private var isCatchup: Bool { catchupStartDate != nil }
+    private var slotCatchup: CatchupPlayback? { session?.focusedSlot.catchup }
+    private var isCatchup: Bool { slotCatchup != nil }
+    private var isSwitchingCatchup: Bool { slotCatchup?.isSwitching ?? false }
 
     /// Wall-clock time the user is currently watching in catchup mode. For
     /// live / recording it's just "now".
     private var effectiveWallClock: Date {
-        if let start = catchupStartDate {
-            return start.addingTimeInterval(player.timePos)
-        }
-        return Date()
+        session?.focusedSlot.catchupWallClock ?? Date()
     }
 
     private var displayedProgram: EPGProgram? {
@@ -199,7 +190,7 @@ struct PlayerView: View {
             return nil
         }
         if isCatchup {
-            return max(0, -catchupCurrentOffset)
+            return max(0, Date().timeIntervalSince(effectiveWallClock))
         }
         if supportsRewind || player.canReplay {
             return max(0, player.duration - player.timePos - player.preferredLiveDelay)
@@ -216,7 +207,7 @@ struct PlayerView: View {
 
     /// Chrome state the LIVE pill renders from: sticky, computed off the
     /// latch instead of off the instantaneous offset.
-    private var isDisplayedLive: Bool { liveLatched && !isCatchup && !isSeekingCatchup }
+    private var isDisplayedLive: Bool { liveLatched && !isCatchup && !isSwitchingCatchup }
 
     /// Whether the LIVE button should be actionable (i.e. we're not
     /// already at live). Keeps the button disabled while the latch is
@@ -345,12 +336,18 @@ struct PlayerView: View {
         .frame(minWidth: 640, minHeight: 360)
         .onAppear { handleOnAppear() }
         .onDisappear { handleOnDisappear() }
+        .onChange(of: session?.externalRequest) { _, request in
+            guard let request, let s = session else { return }
+            s.externalRequest = nil
+            apply(request)
+        }
         .background(WindowAccessor(
             showChrome: $showChrome,
             isPinned: chromeState.isPinned,
             videoSize: isMulti
                 ? .zero
-                : CGSize(width: player.mediaInfo.width, height: player.mediaInfo.height)
+                : CGSize(width: player.mediaInfo.width, height: player.mediaInfo.height),
+            onWindow: { window in session?.hostWindow = window }
         ))
         .background(
             PlayerKeyboardMonitor { command, window in
@@ -363,26 +360,26 @@ struct PlayerView: View {
 
     private func handleOnAppear() {
         if let s = session {
-            // Consume any pending catchup BEFORE the session issues its
-            // default live load. Otherwise mpv briefly opens the live
-            // proxy URL, tears it down, then opens the catchup URL —
-            // visible as a blank player + a redundant probe on the live
-            // connection.
-            let pendingCatchup = channel.flatMap { PendingCatchup.consume(channelID: $0.id) }
-            let willCatchup = pendingCatchup != nil && supportsRewind
-            if let resumePosition = channel.flatMap({ PendingVODResume.consume(channelID: $0.id) }),
-               resumePosition > 0 {
-                s.focusedSlot.seekOnNextOnDemandLoad(to: resumePosition)
+            s.focusedSlot.onCatchupClipEnded = { handleCatchupClipEnded() }
+            switch initialIntent {
+            case .live:
+                s.start()
+            case .resume(let positionSeconds):
+                if positionSeconds > 0 {
+                    s.focusedSlot.seekOnNextOnDemandLoad(to: positionSeconds)
+                }
+                s.start()
+            case .catchup(let start):
+                // Skip the default live load when we're about to issue the
+                // archive load — otherwise mpv briefly opens the live URL,
+                // tears it down, then opens the catchup URL.
+                let willCatchup = supportsRewind
+                s.start(skipInitialLoad: willCatchup)
+                if willCatchup {
+                    startCatchup(at: start)
+                }
             }
-            s.start(skipInitialLoad: willCatchup)
             PlayerSessionRegistry.shared.setActive(s)
-            if let context = pendingCatchup, willCatchup {
-                loadCatchup(
-                    startingAt: context.start,
-                    timelineStart: context.start,
-                    duration: context.duration
-                )
-            }
         }
         if let p = playback {
             Task { @MainActor in
@@ -402,6 +399,7 @@ struct PlayerView: View {
         if let s = session {
             PlayerSessionRegistry.shared.unregister(s)
             for slot in s.slots {
+                slot.onCatchupClipEnded = nil
                 slot.player.pause()
                 slot.unregisterFromRegistry()
             }
@@ -760,18 +758,19 @@ struct PlayerView: View {
             volumeButton
 
             // Source-specific middle section. Recording mode always gets
-            // a full scrubber. Channel-rewind gets step controls. Plain
-            // live gets the compact live-status group with optional
-            // HLS-DVR seek bar.
+            // a full scrubber. Rewind-capable channels get the program
+            // transport (one bar that works both at live and in the
+            // archive). Plain live gets the compact live-status group with
+            // optional HLS-DVR seek bar.
             if isRecordingMode {
                 Divider().frame(height: 18)
                 recordingTransport
-            } else if isOnDemandMode || isCatchup {
+            } else if isOnDemandMode {
                 Divider().frame(height: 18)
                 playbackTimelineBar
-            } else if supportsRewind {
+            } else if supportsRewind || isCatchup {
                 Divider().frame(height: 18)
-                catchupStepControls
+                programTransport
             } else {
                 Divider().frame(height: 18)
                 liveStatusGroup
@@ -791,77 +790,119 @@ struct PlayerView: View {
         liveButton
     }
 
-    // MARK: - Catchup (channel-rewind) controls
+    // MARK: - Program transport (rewind-capable channels)
 
-    private var catchupCurrentOffset: Double {
-        -max(0, Date().timeIntervalSince(effectiveWallClock))
+    /// The wall-clock span the transport bar represents: the catchup
+    /// timeline while in the archive, else the live program's interval,
+    /// else a rolling 2-hour window ending now.
+    private var transportTimeline: DateInterval {
+        if let c = slotCatchup { return c.timeline }
+        if let live = liveProgram { return DateInterval(start: live.start, end: live.end) }
+        let now = Date()
+        return DateInterval(start: now.addingTimeInterval(-2 * 3600), end: now)
     }
 
-    private var catchupWindowSeconds: Double {
-        Double(max(channel?.catchup?.days ?? 0, 1)) * 86400
+    /// Seconds into `transportTimeline` currently being watched.
+    private var transportPosition: Double {
+        let timeline = transportTimeline
+        return effectiveWallClock.timeIntervalSince(timeline.start)
+            .clamped(to: 0...timeline.duration)
     }
 
-    private static let catchupSeekChunkSeconds: Double = 5 * 60
-
+    /// One bar that works at live and in the archive: it always shows the
+    /// current program's wall-clock span. Scrubbing back starts (or moves)
+    /// archive playback; scrubbing to the right edge returns to live.
     @ViewBuilder
-    private var catchupStepControls: some View {
-        let offset = catchupCurrentOffset
+    private var programTransport: some View {
+        let timeline = transportTimeline
+        let total = max(timeline.duration, 1)
+        let position = (scrubPosition ?? transportPosition).clamped(to: 0...total)
+
         HStack(spacing: 10) {
-            catchupMiniSeekBar
-            catchupStatusPill(offset: offset)
-        }
-    }
+            skipBackButton(timeline: timeline)
 
-    @ViewBuilder
-    private var catchupMiniSeekBar: some View {
-        let window = catchupWindowSeconds
-        let displayedOffset = catchupScrubOffset ?? catchupCurrentOffset
-        let segment = catchupSeekSegment(for: displayedOffset)
-        let segmentMax = min(Double(segment) * Self.catchupSeekChunkSeconds, window)
-        let displayOffset = displayedOffset.clamped(to: -segmentMax...0)
-
-        HStack(spacing: 8) {
-            Text(offsetLabel(-segmentMax))
+            Text(Self.wallTime(timeline.start))
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(.white.opacity(0.55))
-                .frame(width: 34, alignment: .trailing)
+                .foregroundStyle(.white.opacity(0.7))
 
-            Slider(
-                value: Binding(
-                    get: { displayOffset },
-                    set: { catchupScrubOffset = $0 }
-                ),
-                in: -segmentMax...0,
-                onEditingChanged: { editing in
-                    if !editing, let offset = catchupScrubOffset {
-                        commitCatchupScrub(offset: offset)
-                        catchupScrubOffset = nil
-                    }
+            ScrubBar(
+                value: position,
+                total: total,
+                onScrub: { scrubPosition = $0 },
+                onCommit: { target in
+                    scrubPosition = nil
+                    seekTransport(toWallClock: timeline.start.addingTimeInterval(target.clamped(to: 0...total)))
                 }
             )
-            .tint(.white)
-            .controlSize(.mini)
-            .frame(width: 90)
-        }
-        .help("Seek further back in 5 minute steps")
-    }
+            .frame(minWidth: 140, idealWidth: 240, maxWidth: 320)
 
-    private func catchupSeekSegment(for offset: Double) -> Int {
-        let behind = max(0, -offset)
-        let chunk = Self.catchupSeekChunkSeconds
-        return max(1, Int(ceil(behind / chunk)) + 1)
+            Text(Self.wallTime(timeline.end))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.7))
+
+            if isCatchup {
+                skipForwardButton(timeline: timeline)
+            }
+
+            archiveStatusPill
+        }
     }
 
     @ViewBuilder
-    private func catchupStatusPill(offset: Double) -> some View {
+    private func skipBackButton(timeline: DateInterval) -> some View {
+        let canRestart = channel?.archiveContains(timeline.start) ?? false
+        let previous = archivedProgram(before: timeline.start)
+        Button {
+            // More than 90 s in: restart the current program. Near its
+            // start: jump to the previous archived program.
+            if transportPosition > 90, canRestart {
+                seekTransport(toWallClock: timeline.start)
+            } else if let previous {
+                playArchive(program: previous)
+            } else if canRestart {
+                seekTransport(toWallClock: timeline.start)
+            }
+        } label: {
+            Image(systemName: "backward.end.fill")
+                .font(.caption)
+                .frame(width: 18, height: 18)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(canRestart || previous != nil ? 0.9 : 0.3))
+        .disabled(!(canRestart || previous != nil))
+        .help("Play from start · press again for previous program")
+    }
+
+    @ViewBuilder
+    private func skipForwardButton(timeline: DateInterval) -> some View {
+        let next = archivedProgram(after: timeline.end)
+        Button {
+            if let next {
+                playArchive(program: next)
+            } else {
+                seekTransport(toWallClock: Date())
+            }
+        } label: {
+            Image(systemName: "forward.end.fill")
+                .font(.caption)
+                .frame(width: 18, height: 18)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.9))
+        .help(next != nil ? "Next program" : "Back to live")
+    }
+
+    @ViewBuilder
+    private var archiveStatusPill: some View {
         let atLive = isDisplayedLive
+        let offset = -(secondsBehindLive ?? 0)
         Button {
             if !atLive {
-                returnToLive()
+                seekTransport(toWallClock: Date())
             }
         } label: {
             HStack(spacing: 5) {
-                if isSeekingCatchup {
+                if isSwitchingCatchup {
                     ProgressView()
                         .controlSize(.mini)
                         .tint(.white)
@@ -890,8 +931,8 @@ struct PlayerView: View {
             )
         }
         .buttonStyle(.plain)
-        .disabled(atLive || isSeekingCatchup)
-        .help(atLive ? "Live + buffer" : "Jump to live + buffer")
+        .disabled(atLive || isSwitchingCatchup)
+        .help(atLive ? "Live + buffer" : "Jump to live")
     }
 
     private func offsetLabel(_ offset: Double) -> String {
@@ -901,6 +942,18 @@ struct PlayerView: View {
         let hours = Int(behind / 3600)
         let mins = Int(behind.truncatingRemainder(dividingBy: 3600) / 60)
         return mins == 0 ? "-\(hours)h" : "-\(hours)h\(mins)m"
+    }
+
+    private static let wallTimeFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "h:mma"
+        fmt.amSymbol = "am"
+        fmt.pmSymbol = "pm"
+        return fmt
+    }()
+
+    private static func wallTime(_ date: Date) -> String {
+        wallTimeFormatter.string(from: date)
     }
 
     // MARK: - Recording transport (scrubber + LIVE pill)
@@ -1163,7 +1216,8 @@ struct PlayerView: View {
                 in: 0...maxPos,
                 onEditingChanged: { editing in
                     if !editing, let pos = scrubPosition {
-                        seekPlaybackTimeline(to: pos, maxPosition: maxPos)
+                        player.seek(to: min(pos, maxPos))
+                        scrubPosition = nil
                     }
                 }
             )
@@ -1203,7 +1257,8 @@ struct PlayerView: View {
                 total: maxPos,
                 onScrub: { scrubPosition = $0 },
                 onCommit: { target in
-                    seekPlaybackTimeline(to: target, maxPosition: maxPos)
+                    player.seek(to: min(target, maxPos))
+                    scrubPosition = nil
                 }
             )
             .frame(width: 170)
@@ -1213,24 +1268,15 @@ struct PlayerView: View {
                 .foregroundStyle(.white.opacity(0.65))
                 .frame(width: 45, alignment: .leading)
         }
-        .help(isCatchup ? "Catchup playback position" : "Playback position")
+        .help("Playback position")
     }
 
     private var playbackTimelineDuration: Double {
-        if isCatchup {
-            return catchupTimelineDuration
-        }
-        return player.duration
+        player.duration
     }
 
     private var playbackTimelinePosition: Double {
-        if isCatchup,
-           let timelineStart = catchupTimelineStartDate,
-           let loadedStart = catchupStartDate {
-            let loadedOffset = loadedStart.timeIntervalSince(timelineStart)
-            return (loadedOffset + player.timePos).clamped(to: 0...max(catchupTimelineDuration, 0))
-        }
-        return player.timePos
+        player.timePos
     }
 
     // MARK: - Bottom-right: media info
@@ -1603,109 +1649,121 @@ struct PlayerView: View {
 
     // MARK: - Rewind / catchup (channel mode)
 
-    private func commitCatchupScrub(offset: Double) {
-        if offset >= -30 {
-            returnToLive()
-            return
-        }
-        loadCatchup(startingAt: Date().addingTimeInterval(offset))
-    }
-
-    private func returnToLive() {
-        guard isCatchup else { return }
+    /// Route a wall-clock target to the right playback primitive: near-live
+    /// targets reconnect the live stream, targets in the past start or move
+    /// archive playback.
+    private func seekTransport(toWallClock target: Date) {
         guard let slot = session?.focusedSlot else { return }
-        beginSeeking()
-        catchupStartDate = nil
-        catchupTimelineStartDate = nil
-        catchupTimelineDuration = defaultCatchupClipDuration
-        // Live playback now reconnects directly to the provider URL. Active
-        // recordings keep running on their own separate stream.
-        slot.loadLive()
-        liveLatched = true
-    }
-
-    private func loadCatchup(
-        startingAt start: Date,
-        timelineStart: Date? = nil,
-        duration: TimeInterval? = nil
-    ) {
-        guard let c = channel else { return }
-        let clamped = clampedCatchupStart(for: c, requested: start)
-        let visibleStart = timelineStart ?? clamped
-        let visibleDuration = max(duration ?? catchupTimelineDuration, 60)
-
-        guard let url = catchupURL(
-            for: c,
-            start: clamped,
-            timelineStart: visibleStart,
-            timelineDuration: visibleDuration
-        ) else {
+        if target >= Date().addingTimeInterval(-30) {
+            slot.returnToLive()
+            liveLatched = true
             return
         }
-
-        beginSeeking()
-        catchupStartDate = clamped
-        catchupTimelineStartDate = visibleStart
-        catchupTimelineDuration = visibleDuration
-        let loadedOffset = max(0, clamped.timeIntervalSince(visibleStart))
-        let remainingDuration = max(visibleDuration - loadedOffset, 60)
-        AppLog.playback.info("Loading catchup channel=\(c.name, privacy: .public) offset=\(loadedOffset, privacy: .public) duration=\(visibleDuration, privacy: .public) remaining=\(remainingDuration, privacy: .public)")
-        if let slot = session?.focusedSlot {
-            slot.loadCatchup(url)
+        if isCatchup {
+            slot.seekCatchup(toWallClock: target)
+        } else {
+            startCatchup(at: target)
         }
         liveLatched = false
     }
 
-    private func clampedCatchupStart(for channel: Channel, requested start: Date) -> Date {
-        let maxBack = TimeInterval((channel.catchup?.days ?? 0) * 86400)
-        let earliest = Date().addingTimeInterval(-maxBack + 60)
-        return max(start, earliest)
+    /// Begin archive playback at `start`, anchoring the transport timeline
+    /// to the EPG program airing at that moment (or an ad-hoc 2 h window
+    /// when no guide data matches).
+    private func startCatchup(at start: Date) {
+        guard let slot = session?.focusedSlot else { return }
+        let timeline = catchupTimeline(containing: start)
+        slot.playCatchup(from: start, timeline: timeline.interval, programID: timeline.programID)
+        liveLatched = false
     }
 
-    private func catchupURL(
-        for channel: Channel,
-        start: Date,
-        timelineStart: Date,
-        timelineDuration: TimeInterval
-    ) -> URL? {
-        let timelineEnd = timelineStart.addingTimeInterval(timelineDuration)
-        let remainingDuration = max(timelineEnd.timeIntervalSince(start), 60)
-        return CatchupURLBuilder.url(
-            for: channel,
-            start: start,
-            duration: remainingDuration
+    private func playArchive(program: EPGProgram) {
+        guard let slot = session?.focusedSlot else { return }
+        slot.playCatchup(
+            from: program.start,
+            timeline: DateInterval(start: program.start, end: program.end),
+            programID: program.id
         )
+        liveLatched = false
     }
 
-    private func seekPlaybackTimeline(to target: Double, maxPosition: Double) {
-        let clamped = min(target, maxPosition)
-        if isCatchup, let timelineStart = catchupTimelineStartDate {
-            loadCatchup(
-                startingAt: timelineStart.addingTimeInterval(clamped),
-                timelineStart: timelineStart,
-                duration: catchupTimelineDuration
-            )
+    private func catchupTimeline(containing date: Date) -> (interval: DateInterval, programID: String?) {
+        if let c = channel, let vm = viewModel, let program = vm.program(for: c, at: date) {
+            return (DateInterval(start: program.start, end: program.end), program.id)
+        }
+        return (DateInterval(start: date, duration: 2 * 3600), nil)
+    }
+
+    /// The last program ending at or before `date` that is still replayable.
+    private func archivedProgram(before date: Date) -> EPGProgram? {
+        guard let c = channel, let vm = viewModel,
+              let program = vm.program(for: c, at: date.addingTimeInterval(-60)),
+              c.canReplay(program) else { return nil }
+        return program
+    }
+
+    /// The program starting at or after `date`, when it has already begun
+    /// airing (so its archive request can succeed).
+    private func archivedProgram(after date: Date) -> EPGProgram? {
+        guard let c = channel, let vm = viewModel,
+              let program = vm.program(for: c, at: date.addingTimeInterval(60)),
+              c.canReplay(program) else { return nil }
+        return program
+    }
+
+    /// A catchup clip reached its end: continue seamlessly with the next
+    /// program's archive, or return to live once we've caught up.
+    private func handleCatchupClipEnded() {
+        guard let slot = session?.focusedSlot, let c = slot.catchup else { return }
+
+        // Broken archives can EOF instantly on every clip; after a few
+        // consecutive duds stop walking program-by-program toward live.
+        if slot.player.timePos < 5 {
+            consecutiveInstantCatchupEOFs += 1
         } else {
-            player.seek(to: clamped)
+            consecutiveInstantCatchupEOFs = 0
         }
-        scrubPosition = nil
+
+        if consecutiveInstantCatchupEOFs >= 3 || c.timeline.end >= Date().addingTimeInterval(-90) {
+            consecutiveInstantCatchupEOFs = 0
+            slot.returnToLive()
+            liveLatched = true
+            return
+        }
+        if let next = archivedProgram(after: c.timeline.end) {
+            // The next program may have started before this clip's timeline
+            // ended (ad-hoc windows aren't program-aligned) — continue from
+            // where the user left off, never backwards.
+            slot.playCatchup(
+                from: max(next.start, c.timeline.end),
+                timeline: DateInterval(start: next.start, end: next.end),
+                programID: next.id
+            )
+            liveLatched = false
+        } else {
+            // No guide data past the clip — keep going with an ad-hoc window.
+            startCatchup(at: c.timeline.end)
+        }
     }
 
-    private func beginSeeking() {
-        isSeekingCatchup = true
-        seekingTimeoutTask?.cancel()
-        seekingTimeoutTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(6))
-            guard !Task.isCancelled else { return }
-            isSeekingCatchup = false
+    /// Handles a request delivered to this already-open window (user clicked
+    /// the channel or a program somewhere in the main window).
+    private func apply(_ request: PlaybackRequest) {
+        guard let slot = session?.focusedSlot else { return }
+        switch request.intent {
+        case .live:
+            if isCatchup {
+                slot.returnToLive()
+                liveLatched = true
+            }
+        case .catchup(let start):
+            guard supportsRewind else { return }
+            startCatchup(at: start)
+        case .resume(let positionSeconds):
+            if isOnDemandMode, positionSeconds > 0 {
+                slot.player.seek(to: positionSeconds)
+            }
         }
-    }
-
-    private func endSeekingIfPlaying() {
-        guard isSeekingCatchup else { return }
-        guard player.timePos > 0.25 || !player.isBuffering else { return }
-        isSeekingCatchup = false
-        seekingTimeoutTask?.cancel()
     }
 
     private func startLiveReconciliationLoop() {
@@ -1718,7 +1776,6 @@ struct PlayerView: View {
                     try? await Task.sleep(for: .seconds(5))
                     continue
                 }
-                endSeekingIfPlaying()
                 reconcileLiveLatch()
                 try? await Task.sleep(for: .milliseconds(250))
             }
@@ -1782,14 +1839,12 @@ struct PlayerView: View {
             player.seek(to: target)
             return
         }
-        if supportsRewind {
-            if isCatchup {
-                let target = (playbackTimelinePosition + delta).clamped(to: 0...max(playbackTimelineDuration, 0))
-                seekPlaybackTimeline(to: target, maxPosition: playbackTimelineDuration)
-            } else {
-                let nextOffset = (catchupCurrentOffset + delta).clamped(to: -catchupWindowSeconds...0)
-                commitCatchupScrub(offset: nextOffset)
-            }
+        if supportsRewind || isCatchup {
+            let target = effectiveWallClock.addingTimeInterval(delta)
+            // From live, a forward step or a tiny back step is a no-op —
+            // reloading the stream for a sub-30 s jump isn't worth it.
+            if !isCatchup && target >= Date().addingTimeInterval(-30) { return }
+            seekTransport(toWallClock: target)
             return
         }
 
@@ -2042,6 +2097,9 @@ struct WindowAccessor: NSViewRepresentable {
     @Binding var showChrome: Bool
     var isPinned: Bool
     var videoSize: CGSize
+    /// Reports the hosting NSWindow once resolved (and again on later
+    /// updates) so owners can register it, e.g. for request delivery.
+    var onWindow: ((NSWindow) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -2053,7 +2111,8 @@ struct WindowAccessor: NSViewRepresentable {
             view: view,
             showChrome: showChrome,
             isPinned: isPinned,
-            videoSize: videoSize
+            videoSize: videoSize,
+            onWindow: onWindow
         )
         return view
     }
@@ -2063,7 +2122,8 @@ struct WindowAccessor: NSViewRepresentable {
             view: nsView,
             showChrome: showChrome,
             isPinned: isPinned,
-            videoSize: videoSize
+            videoSize: videoSize,
+            onWindow: onWindow
         )
     }
 
@@ -2072,16 +2132,24 @@ struct WindowAccessor: NSViewRepresentable {
             let showChrome: Bool
             let isPinned: Bool
             let videoSize: CGSize
+            let onWindow: ((NSWindow) -> Void)?
         }
 
         private var pendingState: PendingState?
         private var updateScheduled = false
 
-        func scheduleUpdate(view: NSView, showChrome: Bool, isPinned: Bool, videoSize: CGSize) {
+        func scheduleUpdate(
+            view: NSView,
+            showChrome: Bool,
+            isPinned: Bool,
+            videoSize: CGSize,
+            onWindow: ((NSWindow) -> Void)? = nil
+        ) {
             pendingState = PendingState(
                 showChrome: showChrome,
                 isPinned: isPinned,
-                videoSize: videoSize
+                videoSize: videoSize,
+                onWindow: onWindow
             )
             requestFlush(for: view)
         }
@@ -2108,6 +2176,7 @@ struct WindowAccessor: NSViewRepresentable {
                 return
             }
 
+            state.onWindow?(window)
             window.level = state.isPinned ? .floating : .normal
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden

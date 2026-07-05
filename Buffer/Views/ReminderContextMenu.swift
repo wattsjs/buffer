@@ -1,48 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// Transparent overlay that lets all regular events pass through but grabs
-/// right-clicks (secondary button) and reports their local coordinates. Used
-/// to add a contextual menu to the Canvas-rendered EPG grid where SwiftUI's
-/// per-item `.contextMenu` modifier can't reach.
-struct RightClickCatcher: NSViewRepresentable {
-    let onRightClick: (CGPoint, NSEvent, NSView) -> Void
-
-    func makeNSView(context: Context) -> Catcher {
-        let view = Catcher()
-        view.onRightClick = onRightClick
-        return view
-    }
-
-    func updateNSView(_ nsView: Catcher, context: Context) {
-        nsView.onRightClick = onRightClick
-    }
-
-    final class Catcher: NSView {
-        var onRightClick: ((CGPoint, NSEvent, NSView) -> Void)?
-
-        override var isFlipped: Bool { true }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            // Only claim the click when the current event is a secondary
-            // click; otherwise return nil so left-clicks, hovers and gestures
-            // flow through to the SwiftUI views below.
-            guard let event = NSApp.currentEvent else { return nil }
-            switch event.type {
-            case .rightMouseDown, .rightMouseUp:
-                return self
-            default:
-                return nil
-            }
-        }
-
-        override func rightMouseDown(with event: NSEvent) {
-            let local = convert(event.locationInWindow, from: nil)
-            onRightClick?(local, event, self)
-        }
-    }
-}
-
 /// NSMenuItem variant that fires a Swift closure when chosen. Avoids the
 /// target/selector dance for one-off contextual menus.
 final class ClosureMenuItem: NSMenuItem {
@@ -77,13 +35,15 @@ enum ReminderMenuBuilder {
         channel: Channel,
         event: NSEvent,
         in view: NSView,
-        onPlay: @escaping () -> Void
+        onPlay: @escaping () -> Void,
+        onPlayFromStart: (() -> Void)? = nil
     ) {
         let menu = buildMenu(
             playlistID: playlistID,
             program: program,
             channel: channel,
-            onPlay: onPlay
+            onPlay: onPlay,
+            onPlayFromStart: onPlayFromStart
         )
         NSMenu.popUpContextMenu(menu, with: event, for: view)
     }
@@ -92,7 +52,8 @@ enum ReminderMenuBuilder {
         playlistID: UUID,
         program: EPGProgram,
         channel: Channel,
-        onPlay: @escaping () -> Void
+        onPlay: @escaping () -> Void,
+        onPlayFromStart: (() -> Void)? = nil
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -126,6 +87,9 @@ enum ReminderMenuBuilder {
         addRecordingItems(to: menu, playlistID: playlistID, program: program, channel: channel)
 
         menu.addItem(.separator())
+        if let onPlayFromStart {
+            menu.addItem(ClosureMenuItem(title: "Play from Start", symbol: "gobackward", handler: onPlayFromStart))
+        }
         menu.addItem(ClosureMenuItem(title: "Play Channel", symbol: "play.fill", handler: onPlay))
         return menu
     }

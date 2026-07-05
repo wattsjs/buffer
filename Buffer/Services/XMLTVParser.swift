@@ -14,8 +14,7 @@ nonisolated struct XMLTVParser {
             if url.isFileURL {
                 data = try Data(contentsOf: url)
             } else {
-                let (fetched, _) = try await URLSession.shared.data(from: url)
-                data = fetched
+                data = try await fetchRemoteGuideData(from: url)
             }
             return parse(data: data)
         }.value
@@ -56,6 +55,34 @@ nonisolated struct XMLTVParser {
 
         return context.programs
     }
+}
+
+private extension XMLTVParser {
+    static func fetchRemoteGuideData(from url: URL) async throws -> Data {
+        var request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+            timeoutInterval: 90
+        )
+        request.setValue("no-cache, no-store, max-age=0", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+
+        let (data, response) = try await guideSession.data(for: request)
+        if let http = response as? HTTPURLResponse,
+           !(200..<400).contains(http.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+        return data
+    }
+
+    static let guideSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 90
+        config.timeoutIntervalForResource = 180
+        return URLSession(configuration: config)
+    }()
 }
 
 // MARK: - libxml2 parser options (subset we care about)

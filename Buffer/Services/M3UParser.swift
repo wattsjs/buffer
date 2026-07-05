@@ -82,14 +82,12 @@ nonisolated struct M3UParser {
     static func parseContent(from url: URL) async throws -> PlaylistContent {
         // For local files, perform the (potentially large) read inside the
         // detached task so we never block the main thread (Agent 03 Critical).
-        // Network still uses URLSession on the async path.
         return try await Task.detached(priority: .userInitiated) {
             let data: Data
             if url.isFileURL {
                 data = try Data(contentsOf: url)
             } else {
-                let (fetched, _) = try await URLSession.shared.data(from: url)
-                data = fetched
+                data = try await fetchRemotePlaylistData(from: url)
             }
             guard let content = String(data: data, encoding: .utf8) else {
                 return PlaylistContent(channels: [], vodItems: [])
@@ -215,4 +213,32 @@ nonisolated struct M3UParser {
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
     }
+}
+
+private extension M3UParser {
+    static func fetchRemotePlaylistData(from url: URL) async throws -> Data {
+        var request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+            timeoutInterval: 60
+        )
+        request.setValue("no-cache, no-store, max-age=0", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+
+        let (data, response) = try await playlistSession.data(for: request)
+        if let http = response as? HTTPURLResponse,
+           !(200..<400).contains(http.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+        return data
+    }
+
+    static let playlistSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 120
+        return URLSession(configuration: config)
+    }()
 }

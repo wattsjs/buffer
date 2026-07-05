@@ -60,7 +60,10 @@ class EPGViewModel {
     var vodItemDetailLoadErrors: [String: String] = [:]
     var loadingVODItemIDs: Set<String> = []
     var vodResumeEntries: [VODResumeEntry] = []
-    var programs: [String: [EPGProgram]] = [:] // keyed by channel epgID
+    private(set) var guideVersion = 0
+    var programs: [String: [EPGProgram]] = [:] { // keyed by channel epgID
+        didSet { guideVersion &+= 1 }
+    }
 
     /// Pre-bucketed programs by hour (unix hour since 1970) per channel.
     /// Enables fast visible-range / timeline-window queries without scanning full per-channel program lists
@@ -135,6 +138,7 @@ class EPGViewModel {
     private var epgSchedulerTask: Task<Void, Never>?
     private var activeSyncTask: Task<Void, Never>?
     private var hydrationTask: Task<Void, Never>?
+    private var catchupGuideSyncKeys: Set<String> = []
 
     init() {
         loadConfig()
@@ -562,6 +566,8 @@ class EPGViewModel {
         let started = ContinuousClock.now
         let cacheKey = DataCache.cacheKey(for: config)
         var syncedStatus = ServerAccountStatus.initial(for: config, cacheKey: DataCache.preferenceKey(for: config))
+        var refreshedGuide = false
+        var refreshedCatalog = false
 
         if !silent {
             isRefreshing = true
@@ -580,10 +586,11 @@ class EPGViewModel {
         }
 
         do {
-            // For non-Stalker configs with full sync, the EPG fetch is independent
-            // of channels/VOD. Launch it early so both run concurrently.
+            // M3U EPG fetch is independent of channel metadata. Xtream XMLTV
+            // needs channel catchup durations to request the full previous-days
+            // window, so it must wait until channels are loaded/refreshed.
             let prefetchedEPG: Task<[EPGProgram], any Error>?
-            if scope == .all, config.type != .stalker, let epgURL = epgURL(for: config) {
+            if scope == .all, config.type == .m3u, let epgURL = epgURL(for: config) {
                 prefetchedEPG = Task { try await XMLTVParser.parse(from: epgURL) }
             } else {
                 prefetchedEPG = nil
@@ -608,6 +615,7 @@ class EPGViewModel {
                 if !freshChannels.isEmpty {
                     channels = freshChannels
                     rebuildSearchIndex()
+                    refreshedCatalog = true
 
                     Task.detached(priority: .utility) {
                         DataCache.saveChannels(freshChannels, key: cacheKey)
@@ -690,6 +698,7 @@ class EPGViewModel {
                     rebuildProgramHourBuckets()
                     rebuildSearchIndex()
                     syncedStatus.guideStatus = "Reachable"
+                    refreshedGuide = true
 
                     let mergedPrograms = programs
                     Task.detached(priority: .utility) {
@@ -713,16 +722,67 @@ class EPGViewModel {
                         allPrograms = try await XMLTVParser.parse(from: epgURL)
                     }
                     if !silent { loadingStage = "Organizing guide…" }
-                    let organized = await Task.detached(priority: .userInitiated) {
+                    var organized = await Task.detached(priority: .userInitiated) {
                         Self.organize(allPrograms)
                     }.value
-                    programs = organized
+
+                    if config.type == .xtream,
+                       catchupGuideNeedsHistory(for: channels, now: Date()),
+                       let lookbackURL = xtreamLookbackEPGURL(for: config) {
+                        if !silent { loadingStage = "Loading lookback guide…" }
+                        do {
+                            let lookbackPrograms = try await XMLTVParser.parse(from: lookbackURL)
+                            if !lookbackPrograms.isEmpty {
+                                if !silent { loadingStage = "Organizing lookback guide…" }
+                                let lookbackOrganized = await Task.detached(priority: .userInitiated) {
+                                    Self.organize(lookbackPrograms)
+                                }.value
+                                organized = Self.mergePartialPrograms(existing: organized, incoming: lookbackOrganized)
+                            }
+                        } catch {
+                            AppLog.sync.error("Xtream lookback XMLTV fetch failed error=\(error.localizedDescription, privacy: .public)")
+                        }
+                    }
+
+                    var finalPrograms = config.type == .xtream
+                        ? Self.mergePartialPrograms(existing: programs, incoming: organized)
+                        : organized
+
+                    if config.type == .xtream {
+                        let catchupChannels = channels.filter { $0.supportsRewind && $0.epgChannelID != nil }
+                        if !catchupChannels.isEmpty,
+                           catchupGuideNeedsHistory(in: finalPrograms, for: catchupChannels, now: Date()) {
+                            if !silent { loadingStage = "Loading catchup guide…" }
+                            do {
+                                let requiredStart = catchupChannels
+                                    .compactMap { requiredCatchupGuideStart(for: $0, now: Date()) }
+                                    .min()
+                                let catchupPrograms = try await XtreamClient(config: config).fetchCatchupEPG(
+                                    for: catchupChannels,
+                                    since: requiredStart
+                                )
+                                if !catchupPrograms.isEmpty {
+                                    if !silent { loadingStage = "Organizing catchup guide…" }
+                                    let catchupOrganized = await Task.detached(priority: .userInitiated) {
+                                        Self.organize(catchupPrograms)
+                                    }.value
+                                    finalPrograms = Self.mergePartialPrograms(existing: finalPrograms, incoming: catchupOrganized)
+                                    AppLog.sync.info("Xtream catchup EPG backfilled channels=\(catchupChannels.count, privacy: .public) programs=\(catchupPrograms.count, privacy: .public)")
+                                }
+                            } catch {
+                                AppLog.sync.error("Xtream catchup EPG backfill failed error=\(error.localizedDescription, privacy: .public)")
+                            }
+                        }
+                    }
+
+                    programs = finalPrograms
                     rebuildProgramHourBuckets()
                     rebuildSearchIndex()
                     syncedStatus.guideStatus = "Reachable"
+                    refreshedGuide = true
 
                     Task.detached(priority: .utility) {
-                        DataCache.savePrograms(organized, key: cacheKey)
+                        DataCache.savePrograms(finalPrograms, key: cacheKey)
                     }
                 } catch {
                     AppLog.sync.error("EPG fetch failed error=\(error.localizedDescription, privacy: .public)")
@@ -732,7 +792,9 @@ class EPGViewModel {
                 syncedStatus.guideStatus = "Not configured"
             }
 
-            lastUpdated = Date()
+            if refreshedGuide || (scope == .all && refreshedCatalog && syncedStatus.guideStatus == "Not configured") {
+                lastUpdated = Date()
+            }
             updateServerStatus(syncedStatus)
             let elapsed = started.duration(to: .now).components.seconds
             AppLog.sync.info("Sync finished scope=\(String(describing: scope), privacy: .public) silent=\(silent, privacy: .public) seconds=\(elapsed, privacy: .public) channels=\(self.channels.count, privacy: .public) groups=\(self.groups.count, privacy: .public)")
@@ -861,28 +923,73 @@ class EPGViewModel {
         sync(scope: .epg)
     }
 
+    func syncCatchupGuideIfNeeded(for visibleChannels: [Channel], now: Date = Date()) {
+        guard activePlaylist != nil,
+              !visibleChannels.isEmpty else { return }
+
+        let catchupChannels = visibleChannels.filter { $0.supportsRewind && $0.epgChannelID != nil }
+        guard !catchupChannels.isEmpty,
+              catchupGuideNeedsHistory(for: catchupChannels, now: now) else { return }
+
+        let key = catchupGuideSyncKey(for: catchupChannels, now: now)
+        guard catchupGuideSyncKeys.insert(key).inserted else { return }
+
+        sync(scope: .epg)
+    }
+
+    private func catchupGuideNeedsHistory(for visibleChannels: [Channel], now: Date) -> Bool {
+        catchupGuideNeedsHistory(in: programs, for: visibleChannels, now: now)
+    }
+
+    private func catchupGuideNeedsHistory(
+        in programStore: [String: [EPGProgram]],
+        for visibleChannels: [Channel],
+        now: Date
+    ) -> Bool {
+        let catchupChannels = visibleChannels.filter { $0.supportsRewind && $0.epgChannelID != nil }
+        guard !catchupChannels.isEmpty else { return false }
+
+        for channel in catchupChannels {
+            guard let epgID = channel.epgChannelID,
+                  let requiredStart = requiredCatchupGuideStart(for: channel, now: now) else { continue }
+            let channelPrograms = programStore[epgID] ?? []
+            guard let earliestProgramStart = channelPrograms.first?.start else { return true }
+            if earliestProgramStart > requiredStart.addingTimeInterval(3600) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func requiredCatchupGuideStart(for channel: Channel, now: Date) -> Date? {
+        guard let archiveWindow = channel.archiveWindow(now: now) else { return nil }
+        guard let limitHours = CatchupLookbackSetting
+            .stored(rawValue: UserDefaults.standard.integer(forKey: CatchupLookbackSetting.appStorageKey))
+            .limitHours else { return archiveWindow.start }
+        return max(archiveWindow.start, now.addingTimeInterval(-Double(limitHours) * 3600))
+    }
+
+    private func catchupGuideSyncKey(for visibleChannels: [Channel], now: Date) -> String {
+        let ids = visibleChannels
+            .filter(\.supportsRewind)
+            .map(\.id)
+            .sorted()
+            .joined(separator: ",")
+        let setting = CatchupLookbackSetting.stored(
+            rawValue: UserDefaults.standard.integer(forKey: CatchupLookbackSetting.appStorageKey)
+        ).rawValue
+        let requiredHour = visibleChannels
+            .compactMap { requiredCatchupGuideStart(for: $0, now: now) }
+            .map { Int($0.timeIntervalSince1970 / 3600) }
+            .min() ?? 0
+        return "\(activePlaylistID?.uuidString ?? "")|\(setting)|\(requiredHour)|\(ids)"
+    }
+
     private func guideNeedsInitialLoad(now: Date = Date()) -> Bool {
         guard Self.programsCoverCurrentWindow(programs, now: now) else { return true }
 
-        // Only Stalker supports requesting a wider EPG window via the period
-        // parameter. For Xtream/M3U, the full XMLTV is downloaded regardless —
-        // re-downloading won't add more past data than the server provides.
-        guard serverConfig?.type == .stalker else { return false }
-
-        let rewindEPGIDs = Set(channels.filter(\.supportsRewind).compactMap(\.epgChannelID))
-        guard !rewindEPGIDs.isEmpty else { return false }
-
-        let lookbackHours = epgLookbackHours(for: channels)
-        guard lookbackHours > 24 else { return false }
-
-        let requiredStart = now.addingTimeInterval(-Double(max(0, lookbackHours - 1)) * 3600)
-        var earliestRewindProgram: Date?
-        for epgID in rewindEPGIDs {
-            guard let firstStart = programs[epgID]?.first?.start else { continue }
-            earliestRewindProgram = min(earliestRewindProgram ?? firstStart, firstStart)
-        }
-        guard let earliestRewindProgram else { return true }
-        return earliestRewindProgram > requiredStart
+        guard !channels.isEmpty else { return false }
+        return catchupGuideNeedsHistory(for: channels, now: now)
     }
 
     private static func programsCoverCurrentWindow(_ programs: [String: [EPGProgram]], now: Date = Date()) -> Bool {
@@ -1121,12 +1228,37 @@ class EPGViewModel {
     private func epgURL(for config: ServerConfig) -> URL? {
         switch config.type {
         case .xtream:
-            return config.xtreamEPGURL
+            return xtreamEPGURL(for: config, previousDays: 1)
         case .stalker:
             return nil
         case .m3u:
             return config.epgSourceURL
         }
+    }
+
+    private func xtreamLookbackEPGURL(for config: ServerConfig) -> URL? {
+        xtreamEPGURL(for: config, previousDays: xtreamLookbackDays())
+    }
+
+    private func xtreamLookbackDays() -> Int {
+        let lookbackHours = max(24, epgLookbackHours(for: channels))
+        return max(1, Int(ceil(Double(lookbackHours) / 24.0)))
+    }
+
+    private func xtreamEPGURL(for config: ServerConfig, previousDays: Int) -> URL? {
+        guard let baseURL = config.xtreamEPGURL,
+              var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            return config.xtreamEPGURL
+        }
+
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll { item in
+            item.name == "prev_days" || item.name == "next_days"
+        }
+        queryItems.append(URLQueryItem(name: "prev_days", value: "\(max(1, previousDays))"))
+        queryItems.append(URLQueryItem(name: "next_days", value: "1"))
+        components.queryItems = queryItems
+        return components.url
     }
 
     func resolveVODItemForPlayback(_ item: VODItem) async throws -> VODItem {
@@ -1276,9 +1408,10 @@ class EPGViewModel {
         return organized
     }
 
-    /// Merges `incoming` programs into `existing`, preferring incoming data
-    /// for duplicate program IDs. Each channel's programs stay sorted by start
-    /// time. Channels that only exist in one source are preserved as-is.
+    /// Merges `incoming` programs into `existing`, replacing the fetched time
+    /// window with fresh provider data. Stalker guide rows can be revised or
+    /// reissued with new IDs, so ID-only dedupe leaves stale programs visible.
+    /// Programs outside the fetched window are preserved for catch-up history.
     nonisolated private static func mergePrograms(
         existing: [String: [EPGProgram]],
         incoming: [String: [EPGProgram]]
@@ -1286,25 +1419,70 @@ class EPGViewModel {
         guard !existing.isEmpty else { return incoming }
         guard !incoming.isEmpty else { return existing }
 
-        var merged = existing
+        var incomingStart: Date?
+        var incomingEnd: Date?
+        for program in incoming.values.flatMap({ $0 }) {
+            incomingStart = min(incomingStart ?? program.start, program.start)
+            incomingEnd = max(incomingEnd ?? program.end, program.end)
+        }
+        guard let incomingStart, let incomingEnd, incomingEnd > incomingStart else { return existing }
+
+        var merged: [String: [EPGProgram]] = [:]
+        let channelIDs = Set(existing.keys).union(incoming.keys)
         for (channelID, incomingPrograms) in incoming {
             guard !incomingPrograms.isEmpty else { continue }
+            let incomingIDs = Set(incomingPrograms.map(\.id))
+            var channelPrograms = (existing[channelID] ?? []).filter {
+                ($0.end <= incomingStart || $0.start >= incomingEnd) && !incomingIDs.contains($0.id)
+            }
+            channelPrograms.append(contentsOf: incomingPrograms)
+            channelPrograms.sort { $0.start < $1.start }
+            merged[channelID] = channelPrograms
+        }
 
-            if var existingChannelPrograms = merged[channelID] {
-                // Build a set of incoming IDs for fast lookup, then remove
-                // any existing programs that overlap with incoming (prefer
-                // the fresh data).
-                let incomingIDs = Set(incomingPrograms.map(\.id))
-                existingChannelPrograms.removeAll { incomingIDs.contains($0.id) }
-                existingChannelPrograms.append(contentsOf: incomingPrograms)
-                existingChannelPrograms.sort { $0.start < $1.start }
-                merged[channelID] = existingChannelPrograms
-            } else {
-                merged[channelID] = incomingPrograms
+        for channelID in channelIDs where incoming[channelID] == nil {
+            let channelPrograms = (existing[channelID] ?? []).filter {
+                $0.end <= incomingStart || $0.start >= incomingEnd
+            }
+            if !channelPrograms.isEmpty {
+                merged[channelID] = channelPrograms
             }
         }
         return merged
     }
+    /// Merges partial provider responses into existing guide data. Unlike
+    /// `mergePrograms`, channels absent from `incoming` are preserved as-is;
+    /// Xtream lookback/current XMLTV responses can omit channels depending on
+    /// panel settings, and absence must not erase their current guide rows.
+    nonisolated private static func mergePartialPrograms(
+        existing: [String: [EPGProgram]],
+        incoming: [String: [EPGProgram]]
+    ) -> [String: [EPGProgram]] {
+        guard !existing.isEmpty else { return incoming }
+        guard !incoming.isEmpty else { return existing }
+
+        var incomingStart: Date?
+        var incomingEnd: Date?
+        for program in incoming.values.flatMap({ $0 }) {
+            incomingStart = min(incomingStart ?? program.start, program.start)
+            incomingEnd = max(incomingEnd ?? program.end, program.end)
+        }
+        guard let incomingStart, let incomingEnd, incomingEnd > incomingStart else { return existing }
+
+        var merged = existing
+        for (channelID, incomingPrograms) in incoming {
+            guard !incomingPrograms.isEmpty else { continue }
+            let incomingIDs = Set(incomingPrograms.map(\.id))
+            var channelPrograms = (existing[channelID] ?? []).filter {
+                ($0.end <= incomingStart || $0.start >= incomingEnd) && !incomingIDs.contains($0.id)
+            }
+            channelPrograms.append(contentsOf: incomingPrograms)
+            channelPrograms.sort { $0.start < $1.start }
+            merged[channelID] = channelPrograms
+        }
+        return merged
+    }
+
 
     // MARK: - Playlist CRUD
 

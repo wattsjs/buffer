@@ -411,6 +411,42 @@ actor XtreamClient {
         }
     }
 
+    private struct XtreamEPGEnvelope: Decodable {
+        let listings: [XtreamEPGListing]
+
+        enum CodingKeys: String, CodingKey {
+            case epgListings = "epg_listings"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            listings = try container.decodeIfPresent([XtreamEPGListing].self, forKey: .epgListings) ?? []
+        }
+    }
+
+    private struct XtreamEPGListing: Decodable {
+        let id: String?
+        let title: String?
+        let description: String?
+        let startTimestamp: String?
+        let stopTimestamp: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id, title, description
+            case startTimestamp = "start_timestamp"
+            case stopTimestamp = "stop_timestamp"
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.flexStringIfPresent(forKey: .id)
+            title = try c.decodeIfPresent(String.self, forKey: .title)
+            description = try c.decodeIfPresent(String.self, forKey: .description)
+            startTimestamp = try c.flexStringIfPresent(forKey: .startTimestamp)
+            stopTimestamp = try c.flexStringIfPresent(forKey: .stopTimestamp)
+        }
+    }
+
     private struct XtreamAuthEnvelope: Decodable {
         let userInfo: XtreamUserInfo?
 
@@ -506,6 +542,51 @@ actor XtreamClient {
         }
         return channels
     }
+
+    func fetchCatchupEPG(for channels: [Channel], since minimumStart: Date? = nil) async throws -> [EPGProgram] {
+        var programs: [EPGProgram] = []
+        var firstError: Error?
+
+        for channel in channels {
+            guard let epgID = channel.epgChannelID else { continue }
+
+            do {
+                let target = try xtreamURL(with: [
+                    URLQueryItem(name: "username", value: config.username),
+                    URLQueryItem(name: "password", value: config.password),
+                    URLQueryItem(name: "action", value: "get_simple_data_table"),
+                    URLQueryItem(name: "stream_id", value: channel.id)
+                ])
+                let data = try await fetchData(from: target)
+                let envelope = try JSONDecoder().decode(XtreamEPGEnvelope.self, from: data)
+
+                for listing in envelope.listings {
+                    guard let start = Self.date(fromEpochString: listing.startTimestamp),
+                          let end = Self.date(fromEpochString: listing.stopTimestamp),
+                          end > start else { continue }
+                    if let minimumStart, end <= minimumStart { continue }
+
+                    let listingID = nonEmpty(listing.id) ?? "\(Int(start.timeIntervalSince1970))-\(Int(end.timeIntervalSince1970))"
+                    programs.append(EPGProgram(
+                        id: "xtream-simple-\(channel.id)-\(listingID)",
+                        channelID: epgID,
+                        title: Self.decodedEPGText(listing.title) ?? "No Event Today",
+                        description: Self.decodedEPGText(listing.description) ?? "",
+                        start: start,
+                        end: end
+                    ))
+                }
+            } catch {
+                firstError = firstError ?? error
+            }
+        }
+
+        if programs.isEmpty, let firstError {
+            throw firstError
+        }
+        return programs
+    }
+
 
     func fetchVODItems() async throws -> [VODItem] {
         let target = try xtreamURL(with: [
@@ -793,6 +874,17 @@ actor XtreamClient {
             throw URLError(.badServerResponse)
         }
         return data
+    }
+
+    private static func decodedEPGText(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return nil }
+        if let data = Data(base64Encoded: trimmed),
+           let decoded = String(data: data, encoding: .utf8) {
+            let clean = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty { return clean }
+        }
+        return trimmed
     }
 
     private static func date(fromEpochString value: String?) -> Date? {

@@ -216,13 +216,9 @@ struct BufferApp: App {
             }
         }
 
-        WindowGroup("Player", for: Channel.self) { $channel in
-            if let channel {
-                PlayerView(
-                    channel: channel,
-                    currentProgram: viewModel.currentProgram(for: channel),
-                    viewModel: viewModel
-                )
+        WindowGroup("Player", for: PlaybackRequest.self) { $request in
+            if let request {
+                PlayerView(request: request, viewModel: viewModel)
             }
         }
         .windowStyle(.hiddenTitleBar)
