@@ -267,7 +267,7 @@ struct PlayerView: View {
                     infoStack
                         .padding(16)
                         .allowsHitTesting(false)
-                        .transition(.opacity)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
                 }
             }
             .overlay(alignment: .topTrailing) {
@@ -275,21 +275,21 @@ struct PlayerView: View {
                     chromeButtons
                         .padding(.top, 4)
                         .padding(.trailing, 8)
-                        .transition(.opacity)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)))
                 }
             }
             .overlay(alignment: .bottomLeading) {
                 if showChrome && !isMulti {
                     controlsBar
                         .padding(16)
-                        .transition(.opacity)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .bottomLeading)))
                 }
             }
             .overlay(alignment: .bottomTrailing) {
                 if showChrome && !isMulti {
                     mediaInfoCard(maxStatsPanelHeight: statsPanelMaxHeight(for: viewport.size))
                         .padding(16)
-                        .transition(.opacity)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .bottomTrailing)))
                 }
             }
             .overlay {
@@ -329,7 +329,7 @@ struct PlayerView: View {
             .onChange(of: player.duration) { _, _ in
                 saveVODProgressIfNeeded(force: true)
             }
-            .animation(.easeInOut(duration: 0.2), value: showChrome)
+            .animation(BufferMotion.chrome, value: showChrome)
         }
         .preferredColorScheme(.dark)
         .environment(\.colorScheme, .dark)
@@ -914,7 +914,7 @@ struct PlayerView: View {
                         .frame(width: 6, height: 6)
                 }
                 Text(offsetLabel(offset))
-                    .font(.system(size: 10, weight: .bold))
+                    .font(BufferFont.microBadge)
                     .tracking(0.6)
                     .foregroundStyle(atLive ? Color.red.opacity(0.95) : .white.opacity(0.75))
                     .monospacedDigit()
@@ -1027,7 +1027,7 @@ struct PlayerView: View {
                     .fill(showRed ? Color.red : Color.white.opacity(inProgress ? 0.35 : 0.18))
                     .frame(width: 6, height: 6)
                 Text("LIVE")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(BufferFont.microBadge)
                     .tracking(0.6)
                     .foregroundStyle(
                         showRed
@@ -1367,7 +1367,7 @@ struct PlayerView: View {
                     .monospacedDigit()
 
                 Button {
-                    withAnimation(.spring(duration: 0.24, bounce: 0.18)) {
+                    withAnimation(BufferMotion.panel) {
                         showStatsForNerds.toggle()
                     }
                     if showStatsForNerds {
@@ -1385,7 +1385,7 @@ struct PlayerView: View {
                 .foregroundStyle(showStatsForNerds ? Color.accentColor : .white.opacity(0.8))
                 .help(showStatsForNerds ? "Hide stats for nerds" : "Show stats for nerds")
                 .accessibilityLabel(showStatsForNerds ? "Hide stats for nerds" : "Show stats for nerds")
-                .animation(.easeInOut(duration: 0.14), value: showStatsForNerds)
+                .animation(BufferMotion.focus, value: showStatsForNerds)
             }
             .padding(.horizontal, prominent ? 10 : 12)
             .padding(.vertical, prominent ? 7 : 6)
@@ -1816,7 +1816,8 @@ struct PlayerView: View {
         case .seekForward:
             seekByShortcut(10)
         case .toggleStatsForNerds:
-            withAnimation(.spring(duration: 0.24, bounce: 0.18)) {
+            // Keyboard-driven — keep motion minimal so it never lags the key.
+            withAnimation(BufferMotion.panel) {
                 showStatsForNerds.toggle()
             }
             if showStatsForNerds {

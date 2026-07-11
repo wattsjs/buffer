@@ -237,7 +237,7 @@ struct EPGGridView: View {
                 },
                 cornerContent: { cornerLabel }
             )
-            .background(Color(nsColor: .textBackgroundColor))
+            .bufferPageBackground()
             .onChange(of: channels.map(\.id)) { _, _ in
                 resetTimelineWindow(for: channels, now: Date())
                 requestCatchupGuideIfNeeded(for: channels)
@@ -281,8 +281,7 @@ struct EPGGridView: View {
             guard width > 2 else { return }
             blocks.append(ChannelLabelBlockData(
                 rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                timeRange: nil,
-                title: nil
+                timeRange: nil
             ))
         }
 
@@ -298,8 +297,7 @@ struct EPGGridView: View {
             guard width > 2 else { continue }
             blocks.append(ChannelLabelBlockData(
                 rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))",
-                title: p.title.isEmpty ? "No Event Today" : p.title
+                timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))"
             ))
             cursor = p.end
         }
@@ -315,14 +313,14 @@ struct EPGGridView: View {
     private var cornerLabel: some View {
         HStack(spacing: 6) {
             Text("TV Guide")
-                .font(.system(size: 13, weight: .semibold))
+                .font(BufferFont.cardTitle)
                 .foregroundStyle(.primary)
             Spacer(minLength: 0)
             Button {
                 resetToCurrentTimeline()
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(BufferFont.captionSemibold)
             }
             .buttonStyle(.borderless)
             .controlSize(.small)
@@ -383,7 +381,7 @@ private struct ChannelCell: View {
             .overlay(alignment: .topTrailing) {
                 if isFavorite {
                     Image(systemName: "star.fill")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(BufferFont.tinyBold)
                         .foregroundStyle(.yellow)
                         .padding(3)
                         .background(Circle().fill(.black.opacity(0.35)))
@@ -393,7 +391,7 @@ private struct ChannelCell: View {
             .overlay(alignment: .bottomTrailing) {
                 if channel.supportsRewind {
                     Image(systemName: "gobackward")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(BufferFont.tinyBold)
                         .foregroundStyle(.white)
                         .padding(3)
                         .background(Circle().fill(.black.opacity(0.4)))
@@ -533,7 +531,7 @@ private struct ProgramCanvasLayer: View, Equatable {
               lhs.reminderProgramIDs == rhs.reminderProgramIDs,
               lhs.programs.count == rhs.programs.count else { return false }
         for (a, b) in zip(lhs.programs, rhs.programs) {
-            if a.id != b.id || a.start != b.start || a.end != b.end { return false }
+            if a.id != b.id || a.start != b.start || a.end != b.end || a.title != b.title { return false }
         }
         return true
     }
@@ -672,6 +670,15 @@ private final class ProgramBlocksView: NSView {
     }
 
     private static let blockStrokeColor = NSColor(calibratedWhite: 0.72, alpha: 0.55)
+    private static let titleFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+    private static let titleParagraph: NSParagraphStyle = {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        paragraph.minimumLineHeight = EPGStickyLabelMetrics.titleRowHeight
+        paragraph.maximumLineHeight = EPGStickyLabelMetrics.titleRowHeight
+        return paragraph
+    }()
 
     override func draw(_ dirtyRect: NSRect) {
         let strokeColor = Self.blockStrokeColor
@@ -687,24 +694,57 @@ private final class ProgramBlocksView: NSView {
             path.lineWidth = 0.5
             path.stroke()
 
-            guard block.hasReminder, let bell = Self.bellImage else { continue }
+            guard let program = block.program else { continue }
             NSGraphicsContext.saveGraphicsState()
             path.addClip()
-            let titleY = max(inset.minY, EPGStickyLabelMetrics.titleRowY)
-            let size = bell.size
-            bell.draw(
-                in: NSRect(
-                    x: inset.maxX - size.width - 6,
-                    y: titleY + 1,
-                    width: size.width,
-                    height: size.height
-                ),
-                from: .zero,
-                operation: .sourceOver,
-                fraction: 1,
-                respectFlipped: true,
-                hints: nil
+
+            // Title lives only here (canvas), never in the sticky overlay.
+            // Coordinates are block-local so the title scrolls with its card
+            // and hard-clips at both block edges via path.addClip() above.
+            let title = program.title.isEmpty ? "No Event Today" : program.title
+            let titleX = inset.minX + EPGStickyLabelMetrics.x
+            let titleY = max(inset.minY + 2, EPGStickyLabelMetrics.titleRowY)
+            let reminderReserve: CGFloat
+            if block.hasReminder, let bell = Self.bellImage {
+                let size = bell.size
+                reminderReserve = size.width + EPGStickyLabelMetrics.titleTrailingReserve
+                bell.draw(
+                    in: NSRect(
+                        x: inset.maxX - size.width - 6,
+                        y: titleY + 1,
+                        width: size.width,
+                        height: size.height
+                    ),
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: 1,
+                    respectFlipped: true,
+                    hints: nil
+                )
+            } else {
+                reminderReserve = EPGStickyLabelMetrics.x
+            }
+
+            let titleWidth = min(
+                EPGStickyLabelMetrics.titleMaxWidth,
+                inset.maxX - reminderReserve - titleX
             )
+            if titleWidth > 8 {
+                (title as NSString).draw(
+                    in: NSRect(
+                        x: titleX,
+                        y: titleY,
+                        width: titleWidth,
+                        height: EPGStickyLabelMetrics.titleRowHeight
+                    ),
+                    withAttributes: [
+                        .font: Self.titleFont,
+                        .foregroundColor: NSColor(calibratedWhite: 0.04, alpha: 1),
+                        .paragraphStyle: Self.titleParagraph,
+                    ]
+                )
+            }
+
             NSGraphicsContext.restoreGraphicsState()
         }
     }
@@ -786,30 +826,33 @@ struct ProgramDetailPopover: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(program.title.isEmpty ? "No Event" : program.title)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(BufferFont.title)
                         .lineLimit(2)
                     if program.isNowPlaying {
-                        Text("LIVE")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.red, in: Capsule())
+                        HStack(spacing: 4) {
+                            LiveIndicatorDot(size: 5)
+                            Text("LIVE")
+                                .font(BufferFont.tinyBold)
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.red, in: Capsule())
                     }
                     if existingReminder != nil {
                         Image(systemName: "bell.fill")
-                            .font(.system(size: 10, weight: .bold))
+                            .font(BufferFont.microBadge)
                             .foregroundStyle(.orange)
                     }
                 }
                 Text("\(timeRange) · \(durationText)")
-                    .font(.system(size: 12))
+                    .font(BufferFont.caption)
                     .foregroundStyle(.secondary)
             }
 
             if !program.description.isEmpty {
                 Text(program.description)
-                    .font(.system(size: 12))
+                    .font(BufferFont.caption)
                     .foregroundStyle(.primary)
                     .lineLimit(8)
                     .fixedSize(horizontal: false, vertical: true)
@@ -863,7 +906,7 @@ struct ProgramDetailPopover: View {
                 recordingManager.cancel(id: existing.id)
             } label: {
                 Image(systemName: isRec ? "stop.circle.fill" : "record.circle.fill")
-                    .font(.system(size: 18))
+                    .font(BufferFont.iconLarge)
             }
             .controlSize(.large)
             .buttonStyle(.bordered)
@@ -874,7 +917,7 @@ struct ProgramDetailPopover: View {
                 scheduleRecording()
             } label: {
                 Image(systemName: "record.circle")
-                    .font(.system(size: 18))
+                    .font(BufferFont.iconLarge)
             }
             .controlSize(.large)
             .buttonStyle(.bordered)

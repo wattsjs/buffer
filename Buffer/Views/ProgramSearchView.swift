@@ -338,23 +338,22 @@ struct ProgramSearchResultsPage: View {
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            if controller.hasQuery {
-                Text("\u{201C}\(controller.query)\u{201D}")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+        BufferFilterBar {
+            HStack(spacing: 8) {
+                if controller.hasQuery {
+                    Text("\u{201C}\(controller.query)\u{201D}")
+                        .font(BufferFont.bodyMedium)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                headerTrailing
             }
-            Spacer()
-            headerTrailing
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .background(.bar)
     }
 
     @ViewBuilder
@@ -362,7 +361,7 @@ struct ProgramSearchResultsPage: View {
         let total = controller.totalResultCount
         if total > 0 {
             Text("\(total) result\(total == 1 ? "" : "s")")
-                .font(.system(size: 11, weight: .medium))
+                .font(BufferFont.metaMedium)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         } else if controller.isSearching {
@@ -400,7 +399,7 @@ struct ProgramSearchResultsPage: View {
     private var channelsStrip: some View {
         VStack(alignment: .leading, spacing: 6) {
             sectionLabel("CHANNELS", count: controller.channelResults.count)
-                .padding(.horizontal, 18)
+                .padding(.horizontal, BufferLayout.content)
                 .padding(.top, 12)
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -414,7 +413,7 @@ struct ProgramSearchResultsPage: View {
                         )
                     }
                 }
-                .padding(.horizontal, 18)
+                .padding(.horizontal, BufferLayout.content)
             }
             .frame(height: 74)
             .padding(.bottom, 12)
@@ -427,7 +426,7 @@ struct ProgramSearchResultsPage: View {
     private var vodStrip: some View {
         VStack(alignment: .leading, spacing: 6) {
             sectionLabel("ON DEMAND", count: controller.vodResults.count)
-                .padding(.horizontal, 18)
+                .padding(.horizontal, BufferLayout.content)
                 .padding(.top, 12)
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -441,7 +440,7 @@ struct ProgramSearchResultsPage: View {
                         )
                     }
                 }
-                .padding(.horizontal, 18)
+                .padding(.horizontal, BufferLayout.content)
             }
             .frame(height: 122)
             .padding(.bottom, 12)
@@ -543,13 +542,13 @@ struct ProgramSearchResultsPage: View {
     private var programsList: some View {
         VStack(alignment: .leading, spacing: 0) {
             sectionLabel("PROGRAMS", count: controller.programResults.count)
-                .padding(.horizontal, 18)
+                .padding(.horizontal, BufferLayout.content)
                 .padding(.top, 12)
                 .padding(.bottom, 6)
 
             if controller.programResults.isEmpty {
                 Text("No matching programs")
-                    .font(.system(size: 12))
+                    .font(BufferFont.caption)
                     .foregroundStyle(.tertiary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                     .padding(.vertical, 40)
@@ -574,7 +573,7 @@ struct ProgramSearchResultsPage: View {
                             }
                         }
                     }
-                    .padding(.horizontal, 18)
+                    .padding(.horizontal, BufferLayout.content)
                     .padding(.bottom, 14)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -584,43 +583,24 @@ struct ProgramSearchResultsPage: View {
     }
 
     private func programGroupHeader(_ group: ProgramTimeGroup, count: Int) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: group.icon)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(group.accentColor)
-                .frame(width: 14)
-            Text(group.title)
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.6)
-                .foregroundStyle(.secondary)
-            Text("\(count)")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.tertiary)
-                .monospacedDigit()
-            Spacer()
-        }
-        .padding(.vertical, 7)
-        .padding(.horizontal, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(.bar)
+        BufferPinnedSectionHeader(
+            icon: group.icon,
+            title: group.title,
+            count: count,
+            accent: group.accentColor,
+            forceUppercase: false
         )
     }
 
     // MARK: Section label
 
     private func sectionLabel(_ title: String, count: Int) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.6)
-                .foregroundStyle(.secondary)
-            Text("\(count)")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.tertiary)
-                .monospacedDigit()
-            Spacer()
-        }
+        BufferPinnedSectionHeader(
+            title: title,
+            count: count,
+            forceUppercase: false,
+            pinnedChrome: false
+        )
     }
 
     // MARK: Empty states
@@ -628,13 +608,13 @@ struct ProgramSearchResultsPage: View {
     private var emptyState: some View {
         VStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 32, weight: .light))
+                .font(BufferFont.emptyIcon)
                 .foregroundStyle(.tertiary)
             Text("Search programs & channels")
-                .font(.system(size: 14))
+                .font(BufferFont.emptyTitle)
                 .foregroundStyle(.secondary)
             Text("\(totalIndexed.formatted()) programs indexed, plus VOD")
-                .font(.system(size: 11))
+                .font(BufferFont.meta)
                 .foregroundStyle(.tertiary)
                 .monospacedDigit()
         }
@@ -644,13 +624,13 @@ struct ProgramSearchResultsPage: View {
     private var noResults: some View {
         VStack(spacing: 8) {
             Image(systemName: "questionmark.circle")
-                .font(.system(size: 32, weight: .light))
+                .font(BufferFont.emptyIcon)
                 .foregroundStyle(.tertiary)
             Text("No matches for \u{201C}\(controller.query)\u{201D}")
-                .font(.system(size: 14))
+                .font(BufferFont.emptyTitle)
                 .foregroundStyle(.secondary)
             Text("Searched programs, channels, and VOD")
-                .font(.system(size: 11))
+                .font(BufferFont.meta)
                 .foregroundStyle(.tertiary)
                 .monospacedDigit()
         }
@@ -662,7 +642,7 @@ struct ProgramSearchResultsPage: View {
             ProgressView()
                 .controlSize(.small)
             Text("Searching…")
-                .font(.system(size: 12))
+                .font(BufferFont.caption)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -710,21 +690,19 @@ private struct ChannelCompactCard: View {
                 .frame(width: 48, height: 48)
             VStack(alignment: .leading, spacing: 2) {
                 Text(highlighted(channel.name, query: query))
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(BufferFont.captionSemibold)
                     .lineLimit(1)
                 if !channel.group.isEmpty {
                     Text(channel.group)
-                        .font(.system(size: 10))
+                        .font(BufferFont.micro)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 if let nowPlaying {
                     HStack(spacing: 4) {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 4, height: 4)
+                        LiveIndicatorDot(size: 4)
                         Text(nowPlaying.title)
-                            .font(.system(size: 10))
+                            .font(BufferFont.micro)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -734,16 +712,17 @@ private struct ChannelCompactCard: View {
         }
         .padding(10)
         .frame(width: 240, height: 72, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(hovered ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(hovered ? Color.accentColor.opacity(0.4) : Color.black.opacity(0.08), lineWidth: 0.75)
+        .bufferHoverHighlight(
+            isHovering: hovered,
+            cornerRadius: BufferLayout.compactRadius,
+            idleFill: Color(nsColor: .controlBackgroundColor),
+            hoverFill: Color.accentColor.opacity(0.14),
+            idleStroke: Color.black.opacity(0.08),
+            hoverStroke: Color.accentColor.opacity(0.4),
+            elevated: true
         )
         .contentShape(Rectangle())
-        .onHover { hovered = $0 }
+        .bufferHoverTracking($hovered)
         .onTapGesture(perform: onSelect)
         .contextMenu {
             Button(action: onSelect) {
@@ -778,16 +757,16 @@ private struct VODSearchCompactCard: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text(highlighted(result.entry.title, query: query))
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(BufferFont.captionSemibold)
                         .lineLimit(2)
 
                     Text(result.entry.series == nil ? "Movie" : "Series")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(BufferFont.microMedium)
                         .foregroundStyle(.tertiary)
 
                     if !result.entry.subtitle.isEmpty {
                         Text(result.entry.subtitle)
-                            .font(.system(size: 10))
+                            .font(BufferFont.micro)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -796,18 +775,19 @@ private struct VODSearchCompactCard: View {
             }
             .padding(10)
             .frame(width: 270, height: 102, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(hovered ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(hovered ? Color.accentColor.opacity(0.4) : Color.black.opacity(0.08), lineWidth: 0.75)
+            .bufferHoverHighlight(
+                isHovering: hovered,
+                cornerRadius: BufferLayout.compactRadius,
+                idleFill: Color(nsColor: .controlBackgroundColor),
+                hoverFill: Color.accentColor.opacity(0.14),
+                idleStroke: Color.black.opacity(0.08),
+                hoverStroke: Color.accentColor.opacity(0.4),
+                elevated: true
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 }
+        .buttonStyle(BufferPressStyle())
+        .bufferHoverTracking($hovered)
     }
 }
 
@@ -836,7 +816,7 @@ private struct VODSearchPoster: View {
 
     private var fallbackIcon: some View {
         Image(systemName: fallbackSystemImage)
-            .font(.system(size: 22, weight: .regular))
+            .font(BufferFont.posterFallback)
             .foregroundStyle(.tertiary)
     }
 }
@@ -889,7 +869,7 @@ private struct ProgramResultRow: View {
                 .overlay(alignment: .bottomTrailing) {
                     if result.channel.supportsRewind {
                         Image(systemName: "gobackward")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(BufferFont.tinyBold)
                             .foregroundStyle(.white)
                             .padding(3)
                             .background(Circle().fill(.black.opacity(0.5)))
@@ -902,11 +882,11 @@ private struct ProgramResultRow: View {
         .frame(height: 80)
         .padding(4)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: BufferLayout.cardRadius, style: .continuous)
                 .fill(hovered ? Color.accentColor.opacity(0.08) : Color.clear)
         )
         .contentShape(Rectangle())
-        .onHover { hovered = $0 }
+        .bufferHoverTracking($hovered)
         .onTapGesture(perform: activate)
         .popover(isPresented: $showPopover, arrowEdge: .top) {
             ProgramDetailPopover(
@@ -1017,12 +997,12 @@ private struct ProgramResultRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(highlighted(result.program.title.isEmpty ? "Untitled" : result.program.title, query: query))
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(BufferFont.cardTitleMedium)
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                 if result.program.isNowPlaying {
                     Text("NOW")
-                        .font(.system(size: 9, weight: .heavy))
+                        .font(BufferFont.tinyHeavy)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 2)
                         .background(Capsule().fill(Color.red))
@@ -1030,25 +1010,25 @@ private struct ProgramResultRow: View {
                 }
                 Spacer(minLength: 8)
                 Text(formatWhen(program: result.program))
-                    .font(.system(size: 11, weight: .medium))
+                    .font(BufferFont.metaMedium)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                     .fixedSize(horizontal: true, vertical: false)
             }
             HStack(spacing: 6) {
                 Text(result.channel.name)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(BufferFont.captionMedium)
                     .foregroundStyle(.secondary)
                 Text("·")
                     .foregroundStyle(Color.secondary.opacity(0.6))
                 Text(timeRange(for: result.program))
-                    .font(.system(size: 12))
+                    .font(BufferFont.caption)
                     .foregroundStyle(Color.secondary.opacity(0.85))
                     .monospacedDigit()
             }
             .lineLimit(1)
             Text(result.program.description.isEmpty ? " " : result.program.description)
-                .font(.system(size: 11))
+                .font(BufferFont.meta)
                 .foregroundStyle(Color.secondary.opacity(0.75))
                 .lineLimit(1)
         }

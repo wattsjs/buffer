@@ -22,7 +22,7 @@ struct SportsView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
         .task {
             // Data sync and auto-refresh are managed by ContentView;
             // just trigger a refresh when the Sports page appears so
@@ -36,57 +36,55 @@ struct SportsView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 8) {
-            sportFilters
+        BufferFilterBar {
+            HStack(spacing: 8) {
+                sportFilters
 
-            if viewModel.liveCount > 0 {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 6, height: 6)
-                    Text("\(viewModel.liveCount) Live")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.red)
+                if viewModel.liveCount > 0 {
+                    HStack(spacing: 4) {
+                        LiveIndicatorDot(size: 6)
+                        Text("\(viewModel.liveCount) Live")
+                            .font(BufferFont.badge)
+                            .foregroundStyle(.red)
+                    }
                 }
-            }
 
-            Spacer()
+                Spacer()
 
-            if let last = viewModel.lastRefreshed {
-                Text("Updated \(last, style: .relative) ago")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-            }
+                if let last = viewModel.lastRefreshed {
+                    Text("Updated \(last, style: .relative) ago")
+                        .font(BufferFont.micro)
+                        .foregroundStyle(.tertiary)
+                }
 
-            Button {
-                viewModel.refresh()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 11))
-            }
-            .buttonStyle(.borderless)
-            .disabled(viewModel.isLoading)
+                Button {
+                    viewModel.refresh()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(BufferFont.meta)
+                }
+                .buttonStyle(.borderless)
+                .disabled(viewModel.isLoading)
 
-            Toggle(isOn: Binding(
-                get: { viewModel.hideFinished },
-                set: { viewModel.hideFinished = $0 }
-            )) {
-                Text("Hide finished")
-                    .font(.system(size: 11))
+                Toggle(isOn: Binding(
+                    get: { viewModel.hideFinished },
+                    set: { viewModel.hideFinished = $0 }
+                )) {
+                    Text("Hide finished")
+                        .font(BufferFont.meta)
+                }
+                .toggleStyle(.checkbox)
             }
-            .toggleStyle(.checkbox)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .background(.bar)
     }
 
     private var sportFilters: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(viewModel.availableSports) { sport in
-                    SportFilterChip(
-                        sport: sport,
+                    BufferFilterChip(
+                        title: sport.rawValue,
+                        systemImage: sport.icon,
                         isSelected: viewModel.selectedSports.contains(sport)
                     ) {
                         viewModel.toggleSport(sport)
@@ -97,7 +95,7 @@ struct SportsView: View {
                     Button("Clear") {
                         viewModel.selectedSports.removeAll()
                     }
-                    .font(.system(size: 10, weight: .medium))
+                    .font(BufferFont.microMedium)
                     .foregroundStyle(.secondary)
                     .buttonStyle(.borderless)
                 }
@@ -130,32 +128,17 @@ struct SportsView: View {
                     }
                 }
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, BufferLayout.content)
             .padding(.vertical, 12)
         }
     }
 
     private func sectionHeader(_ group: SportTimeGroup, count: Int) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: group.icon)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(colorForGroup(group))
-                .frame(width: 14)
-            Text(group.title.uppercased())
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.6)
-                .foregroundStyle(.secondary)
-            Text("\(count)")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.tertiary)
-                .monospacedDigit()
-            Spacer()
-        }
-        .padding(.vertical, 7)
-        .padding(.horizontal, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(.bar)
+        BufferPinnedSectionHeader(
+            icon: group.icon,
+            title: group.title,
+            count: count,
+            accent: colorForGroup(group)
         )
     }
 
@@ -177,7 +160,7 @@ struct SportsView: View {
             ProgressView()
                 .controlSize(.regular)
             Text("Fetching live sports…")
-                .font(.system(size: 13))
+                .font(BufferFont.body)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -196,37 +179,6 @@ struct SportsView: View {
         }
     }
 
-}
-
-// MARK: - Sport filter chip
-
-private struct SportFilterChip: View {
-    let sport: Sport
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: sport.icon)
-                    .font(.system(size: 9))
-                Text(sport.rawValue)
-                    .font(.system(size: 11, weight: .medium))
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(
-                Capsule()
-                    .fill(isSelected ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
-            )
-            .overlay(
-                Capsule()
-                    .strokeBorder(isSelected ? Color.accentColor : Color.primary.opacity(0.1), lineWidth: 0.5)
-            )
-            .foregroundStyle(isSelected ? .white : .primary)
-        }
-        .buttonStyle(.plain)
-    }
 }
 
 // MARK: - Event card
@@ -271,13 +223,6 @@ private struct SportEventCard: View {
         default:
             return event.startDate.timeIntervalSinceNow <= 15 * 60
         }
-    }
-
-    private var cardFill: Color {
-        if event.status.isLive {
-            return Color.red.opacity(hovered ? 0.1 : 0.05)
-        }
-        return Color(nsColor: .controlBackgroundColor).opacity(hovered ? 1 : 0.7)
     }
 
     /// Synthetic EPGProgram used for reminder + recording integrations.
@@ -339,18 +284,18 @@ private struct SportEventCard: View {
             // Top bar: league + time
             HStack(spacing: 6) {
                 Image(systemName: event.sport.icon)
-                    .font(.system(size: 10))
+                    .font(BufferFont.micro)
                     .foregroundStyle(.secondary)
                 Text(event.league.shortName)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(BufferFont.metaMedium)
                     .foregroundStyle(.secondary)
                 if let tournament = event.tournamentName,
                    event.awayTeam != nil, event.homeTeam != nil {
                     Text("·")
-                        .font(.system(size: 11))
+                        .font(BufferFont.meta)
                         .foregroundStyle(.tertiary)
                     Text(tournament)
-                        .font(.system(size: 11))
+                        .font(BufferFont.meta)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -368,11 +313,11 @@ private struct SportEventCard: View {
             } else {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(event.title)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(BufferFont.cardTitleMedium)
                         .lineLimit(2)
                     if let subtitle = tournamentSubtitle {
                         Text(subtitle)
-                            .font(.system(size: 11))
+                            .font(BufferFont.meta)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -381,23 +326,12 @@ private struct SportEventCard: View {
                 .frame(height: 54, alignment: .center)
             }
         }
-        .padding(14)
+        .padding(BufferLayout.cardPadding)
         .frame(minHeight: 100)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(cardFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(
-                    event.status.isLive
-                        ? Color.red.opacity(0.3)
-                        : Color(nsColor: .separatorColor).opacity(0.5),
-                    lineWidth: 0.5
-                )
-        )
+        .bufferCardSurface(isHovering: hovered, isLive: event.status.isLive)
         .contentShape(Rectangle())
-        .onHover { hovered = $0 }
+        .scaleEffect(hovered ? 1.01 : 1)
+        .bufferHoverTracking($hovered)
         .onTapGesture {
             handleTap()
         }
@@ -455,13 +389,13 @@ private struct SportEventCard: View {
             )
 
             Text(team.displayName)
-                .font(.system(size: 13, weight: .semibold))
+                .font(BufferFont.cardTitle)
                 .lineLimit(1)
 
             if hasScore, let score = team.score {
                 Spacer()
                 Text(score)
-                    .font(.system(size: 15, weight: .bold))
+                    .font(BufferFont.score)
                     .monospacedDigit()
                     .foregroundStyle(event.status.isLive ? .red : .primary)
             }
@@ -475,37 +409,35 @@ private struct SportEventCard: View {
         switch event.status {
         case .live(let detail):
             HStack(spacing: 4) {
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 6, height: 6)
+                LiveIndicatorDot(size: 6)
                 Text(detail ?? "LIVE")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(BufferFont.microBadge)
                     .foregroundStyle(.red)
             }
         case .halftime:
             Text("HT")
-                .font(.system(size: 10, weight: .bold))
+                .font(BufferFont.microBadge)
                 .foregroundStyle(.orange)
         case .final_(let detail):
             Text(detail ?? "Final")
-                .font(.system(size: 10, weight: .semibold))
+                .font(BufferFont.microSemibold)
                 .foregroundStyle(.secondary)
         case .scheduled:
             Text(formatTime(event.startDate))
-                .font(.system(size: 11, weight: .medium))
+                .font(BufferFont.metaMedium)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         case .postponed:
             Text("PPD")
-                .font(.system(size: 10, weight: .bold))
+                .font(BufferFont.microBadge)
                 .foregroundStyle(.orange)
         case .delayed:
             Text("DLY")
-                .font(.system(size: 10, weight: .bold))
+                .font(BufferFont.microBadge)
                 .foregroundStyle(.orange)
         case .canceled:
             Text("CXL")
-                .font(.system(size: 10, weight: .bold))
+                .font(BufferFont.microBadge)
                 .foregroundStyle(.secondary)
                 .strikethrough()
         }

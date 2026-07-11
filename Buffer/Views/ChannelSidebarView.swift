@@ -63,15 +63,7 @@ struct ChannelSidebarView: View {
             Label("Reminders", systemImage: "bell")
             Spacer()
             if !notificationManager.reminders.isEmpty {
-                Text("\(notificationManager.reminders.count)")
-                    .font(.system(size: 11, weight: .semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(
-                        Capsule().fill(Color.secondary.opacity(0.15))
-                    )
+                SidebarCountBadge(count: notificationManager.reminders.count)
             }
         }
         .tag(SidebarSelection.reminders)
@@ -83,15 +75,7 @@ struct ChannelSidebarView: View {
             Label("Recordings", systemImage: "record.circle")
             Spacer()
             if activeRecordingCount > 0 {
-                Text("\(activeRecordingCount)")
-                    .font(.system(size: 11, weight: .semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(
-                        Capsule().fill(Color.red)
-                    )
+                SidebarCountBadge(count: activeRecordingCount, emphasized: true)
             }
         }
         .tag(SidebarSelection.recordings)
@@ -166,15 +150,7 @@ struct ChannelSidebarView: View {
             HStack {
                 Label("Favorites", systemImage: "star.fill")
                 Spacer()
-                Text("\(viewModel.favoriteChannelIDs.count)")
-                    .font(.system(size: 11, weight: .semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 1)
-                    .background(
-                        Capsule().fill(Color.secondary.opacity(0.15))
-                    )
+                SidebarCountBadge(count: viewModel.favoriteChannelIDs.count)
             }
             .tag(SidebarSelection.favorites)
         }
@@ -201,15 +177,7 @@ struct ChannelSidebarView: View {
         HStack {
             Label("Movies", systemImage: "film")
             Spacer()
-            Text("\(viewModel.movieItems.count)")
-                .font(.system(size: 11, weight: .semibold))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 1)
-                .background(
-                    Capsule().fill(Color.secondary.opacity(0.15))
-                )
+            SidebarCountBadge(count: viewModel.movieItems.count)
         }
         .tag(SidebarSelection.movies)
 
@@ -224,15 +192,7 @@ struct ChannelSidebarView: View {
         HStack {
             Label("TV Shows", systemImage: "rectangle.stack")
             Spacer()
-            Text("\(viewModel.vodSeries.count)")
-                .font(.system(size: 11, weight: .semibold))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 1)
-                .background(
-                    Capsule().fill(Color.secondary.opacity(0.15))
-                )
+            SidebarCountBadge(count: viewModel.vodSeries.count)
         }
         .tag(SidebarSelection.series)
 
@@ -258,13 +218,16 @@ private struct SidebarSectionHeader: View {
 
     var body: some View {
         Button {
-            isExpanded.toggle()
+            withAnimation(BufferMotion.focus) {
+                isExpanded.toggle()
+            }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(BufferFont.tinySemibold)
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
                     .frame(width: 10)
+                    .animation(BufferMotion.focus, value: isExpanded)
                 Text(title)
             }
             .contentShape(Rectangle())
@@ -283,7 +246,7 @@ private struct PlaylistPickerLabel: View {
                 .truncationMode(.tail)
             Spacer()
             Image(systemName: "chevron.up.chevron.down")
-                .font(.system(size: 10, weight: .semibold))
+                .font(BufferFont.microSemibold)
                 .foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())

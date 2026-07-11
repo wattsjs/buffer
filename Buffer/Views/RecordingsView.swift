@@ -228,7 +228,7 @@ private struct RecordingRow: View {
                 .scaleEffect(0.7)
                 .frame(width: 8, height: 8)
             Text("STARTING")
-                .font(.system(size: 9, weight: .heavy))
+                .font(BufferFont.tinyHeavy)
                 .tracking(0.6)
                 .foregroundStyle(.white)
         }
@@ -241,13 +241,16 @@ private struct RecordingRow: View {
     /// the ugly Unicode "ᴸⁱᵛᵉ" tokens that EPG data often carries.
     @ViewBuilder
     private var liveBadge: some View {
-        Text("LIVE")
-            .font(.system(size: 9, weight: .heavy))
-            .tracking(0.6)
-            .foregroundStyle(.white)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1.5)
-            .background(Color.red, in: Capsule())
+        HStack(spacing: 4) {
+            LiveIndicatorDot(size: 5)
+            Text("LIVE")
+                .font(BufferFont.tinyHeavy)
+                .tracking(0.6)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(Color.red, in: Capsule())
     }
 
     /// Second line of details: live stats while recording, final stats once

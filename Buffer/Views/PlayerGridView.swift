@@ -38,7 +38,7 @@ struct PlayerGridView: View {
                     // Smooth position/size transitions on focus, add/remove, layout switch.
                     // Eliminates the "teleport" / snap that occurred on rect recompute
                     // after pool/reuse work (addresses Agent 04 P0 + Master Tier 0 #5).
-                    .animation(.spring(response: 0.28, dampingFraction: 0.82), value: rect)
+                    .animation(BufferMotion.layout, value: rect)
                 }
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)

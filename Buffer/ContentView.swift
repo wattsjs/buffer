@@ -382,20 +382,30 @@ struct ContentView: View {
                         if viewModel.isRefreshing {
                             AppFeedbackBanner(message: .sync(stage: viewModel.loadingStage))
                                 .allowsHitTesting(false)
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                                .transition(
+                                    .asymmetric(
+                                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                                        removal: .opacity
+                                    )
+                                )
                         }
 
                         if let toast = appFeedback.toast {
                             AppFeedbackBanner(message: toast) {
                                 appFeedback.dismiss()
                             }
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                            .transition(
+                                .asymmetric(
+                                    insertion: .move(edge: .bottom).combined(with: .opacity),
+                                    removal: .opacity
+                                )
+                            )
                         }
                     }
                     .padding(.bottom, 16)
                 }
-                .animation(.spring(duration: 0.35, bounce: 0.15), value: viewModel.isRefreshing)
-                .animation(.spring(duration: 0.35, bounce: 0.15), value: appFeedback.toast)
+                .animation(BufferMotion.bannerIn, value: viewModel.isRefreshing)
+                .animation(BufferMotion.bannerIn, value: appFeedback.toast)
         }
         .searchable(
             text: Binding(
@@ -432,12 +442,12 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
 
                 Text("Xtream Codes, Stalker/MAG, and M3U supported")
-                    .font(.caption)
+                    .font(BufferFont.meta)
                     .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
     }
 
     private func updateSearchIndex() {

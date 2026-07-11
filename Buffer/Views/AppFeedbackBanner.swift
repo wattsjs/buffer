@@ -86,7 +86,8 @@ final class AppFeedbackCenter {
 
     func show(_ message: AppFeedbackMessage, autoDismissAfter duration: Duration = .seconds(5)) {
         dismissTask?.cancel()
-        withAnimation(.spring(duration: 0.35, bounce: 0.15)) {
+        // Critically damped — banners should settle, not bounce.
+        withAnimation(BufferMotion.bannerIn) {
             toast = message
         }
 
@@ -102,7 +103,7 @@ final class AppFeedbackCenter {
     func dismiss() {
         dismissTask?.cancel()
         dismissTask = nil
-        withAnimation(.spring(duration: 0.3, bounce: 0.1)) {
+        withAnimation(BufferMotion.bannerOut) {
             toast = nil
         }
     }
@@ -149,16 +150,16 @@ struct AppFeedbackBanner: View {
                     Image(systemName: message.symbol)
                 }
             }
-            .font(.system(size: 13, weight: .semibold))
+            .font(BufferFont.cardTitle)
             .foregroundStyle(message.tone.accent)
             .padding(.top, message.title == nil ? 1 : 2)
 
             if let title = message.title {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(BufferFont.captionSemibold)
                     Text(message.message)
-                        .font(.system(size: 11))
+                        .font(BufferFont.meta)
                         .foregroundStyle(.secondary)
                 }
             } else {
@@ -172,7 +173,7 @@ struct AppFeedbackBanner: View {
 
                 Button(action: onDismiss) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(BufferFont.microSemibold)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.tertiary)
@@ -182,5 +183,6 @@ struct AppFeedbackBanner: View {
         .padding(.vertical, 9)
         .frame(maxWidth: 520, alignment: .leading)
         .glassEffect(.regular, in: .capsule)
+        .shadow(color: .black.opacity(0.12), radius: 16, y: 6)
     }
 }

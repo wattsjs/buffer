@@ -128,13 +128,13 @@ private struct SourcesSettingsTab: View {
         }
         .onAppear { ensureSelectionIsValid() }
         .onChange(of: viewModel.playlists.map(\.id)) { _, _ in ensureSelectionIsValid() }
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
     }
 
     private var firstRunView: some View {
         VStack(spacing: 16) {
             Image(systemName: "tv.badge.wifi")
-                .font(.system(size: 40))
+                .font(BufferFont.settingsHero)
                 .foregroundStyle(.secondary)
             Text("Add a source")
                 .font(.title3.weight(.semibold))
@@ -994,7 +994,7 @@ private struct SetupFeedbackCard: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(BufferFont.cardTitle)
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.secondary)

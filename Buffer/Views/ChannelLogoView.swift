@@ -37,7 +37,7 @@ struct ChannelLogoView: View {
         ZStack {
             Color.clear
             Image(systemName: fallbackSystemImage)
-                .font(.system(size: 18, weight: .regular))
+                .font(BufferFont.iconLarge)
                 .foregroundStyle(.secondary)
         }
     }

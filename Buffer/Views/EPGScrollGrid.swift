@@ -16,6 +16,7 @@ enum EPGStickyLabelMetrics {
     static let titleMaxWidth: CGFloat = 360
     static let titleTrailingReserve: CGFloat = 24
     static let viewportTrailingPadding: CGFloat = 10
+    /// Clear separation between the pinned channel name and program time.
     static let metadataCollisionGap: CGFloat = 10
 
     static func labelWidth(for viewportWidth: CGFloat, maxWidth: CGFloat) -> CGFloat {
@@ -798,8 +799,6 @@ struct ChannelLabelBlockData {
     let rect: CGRect
     /// Nil time denotes an intentional guide gap; the sticky metadata clips out there.
     let timeRange: String?
-    /// Nil title denotes an intentional guide gap with no sticky text.
-    let title: String?
 }
 
 struct ChannelLabelRowData {
@@ -826,100 +825,82 @@ final class ChannelLabelOverlayView: NSView {
         NSBezierPath(rect: bounds).addClip()
 
         let metadataParagraph = Self.truncatingParagraph(lineHeight: EPGStickyLabelMetrics.topRowHeight)
-        let titleParagraph = Self.truncatingParagraph(lineHeight: EPGStickyLabelMetrics.titleRowHeight)
         let metadataMaxWidth = EPGStickyLabelMetrics.labelWidth(
             for: bounds.width,
             maxWidth: EPGStickyLabelMetrics.metadataMaxWidth
         )
-        let titleMaxWidth = EPGStickyLabelMetrics.labelWidth(
-            for: bounds.width,
-            maxWidth: EPGStickyLabelMetrics.titleMaxWidth
-        )
-        guard metadataMaxWidth > 24 || titleMaxWidth > 24 else { return }
+        guard metadataMaxWidth > 24 else { return }
 
         let firstVisibleRow = max(0, Int(floor(scrollOffsetY / rowHeight)))
         let visibleRowCount = Int(ceil(bounds.height / rowHeight)) + 2
         let lastVisibleRow = firstVisibleRow + visibleRowCount
 
-        let metadataCollisionGap = EPGStickyLabelMetrics.metadataCollisionGap
         for row in firstVisibleRow...lastVisibleRow {
-            guard let data = rowDataByIndex[row] else { continue }
-            guard !data.blocks.isEmpty else { continue }
+            guard let data = rowDataByIndex[row], !data.blocks.isEmpty else { continue }
             let rowY = CGFloat(row) * rowHeight - scrollOffsetY
             guard rowY < bounds.maxY, rowY + rowHeight > bounds.minY else { continue }
 
             let channelName = data.channelName.trimmingCharacters(in: .whitespacesAndNewlines)
-            let channelTrailingX: CGFloat
-            if !channelName.isEmpty {
-                let channelText = channelNameString(channelName, paragraph: metadataParagraph)
-                channelTrailingX = drawPinnedChannelName(
-                    channelText,
-                    rowY: rowY,
-                    height: EPGStickyLabelMetrics.topRowHeight,
-                    maxWidth: metadataMaxWidth
-                ) ?? EPGStickyLabelMetrics.x
-            } else {
-                channelTrailingX = EPGStickyLabelMetrics.x
-            }
+            let channelText = channelName.isEmpty
+                ? nil
+                : channelNameString(channelName, paragraph: metadataParagraph)
+            let channelWidth = channelText.map { min(measuredWidth(of: $0), metadataMaxWidth) } ?? 0
+            let timeLeadingX = EPGStickyLabelMetrics.x
+                + channelWidth
+                + (channelWidth > 0 ? EPGStickyLabelMetrics.metadataCollisionGap : 0)
 
-            let collidingTimeLeadingX = channelTrailingX + metadataCollisionGap
-
+            // Times are constrained to begin after the pinned channel name.
+            // As an outgoing block narrows, its time truncates and disappears;
+            // it never slides left underneath the channel label.
             for block in data.blocks {
+                guard let timeRange = block.timeRange, !timeRange.isEmpty else { continue }
+
                 let blockScreenMinX = block.rect.minX - scrollOffsetX
                 let blockScreenMaxX = block.rect.maxX - scrollOffsetX
                 guard blockScreenMaxX > 0, blockScreenMinX < bounds.width else { continue }
 
-                let clipInset: CGFloat = 2
-                let blockClipMinX = max(0, blockScreenMinX + clipInset)
-                let blockClipMaxX = min(bounds.width, blockScreenMaxX - clipInset)
-                guard blockClipMaxX > blockClipMinX + 12 else { continue }
+                let textX = max(blockScreenMinX, timeLeadingX)
+                let availableWidth = min(bounds.width, blockScreenMaxX) - textX
+                guard availableWidth > 4 else { continue }
+
+                let timeText = timeRangeString(timeRange, paragraph: metadataParagraph)
+                let labelWidth = min(measuredWidth(of: timeText), metadataMaxWidth, availableWidth)
+                guard labelWidth > 4 else { continue }
 
                 let blockClipRect = NSRect(
-                    x: blockClipMinX,
+                    x: blockScreenMinX,
                     y: rowY,
-                    width: blockClipMaxX - blockClipMinX,
+                    width: blockScreenMaxX - blockScreenMinX,
                     height: rowHeight
                 )
 
                 NSGraphicsContext.saveGraphicsState()
                 NSBezierPath(rect: blockClipRect).addClip()
-
-                if let timeRange = block.timeRange, !timeRange.isEmpty {
-                    let metadata = timeRangeString(timeRange, paragraph: metadataParagraph)
-                    drawStickyText(
-                        metadata,
-                        rowY: rowY,
-                        blockScreenMinX: blockScreenMinX,
-                        blockScreenMaxX: blockScreenMaxX,
-                        yOffset: EPGStickyLabelMetrics.topRowY,
-                        height: EPGStickyLabelMetrics.topRowHeight,
-                        maxWidth: metadataMaxWidth,
-                        leadingClampX: blockScreenMinX < collidingTimeLeadingX ? collidingTimeLeadingX : EPGStickyLabelMetrics.x
-                    )
-                }
-
-                if let title = block.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
-                    let titleText = titleString(title, paragraph: titleParagraph)
-                    drawStickyText(
-                        titleText,
-                        rowY: rowY,
-                        blockScreenMinX: blockScreenMinX,
-                        blockScreenMaxX: blockScreenMaxX,
-                        yOffset: EPGStickyLabelMetrics.titleRowY,
-                        height: EPGStickyLabelMetrics.titleRowHeight,
-                        maxWidth: titleMaxWidth,
-                        trailingReserve: EPGStickyLabelMetrics.titleTrailingReserve
-                    )
-                }
-
+                timeText.draw(
+                    with: NSRect(
+                        x: textX,
+                        y: rowY + EPGStickyLabelMetrics.topRowY,
+                        width: labelWidth,
+                        height: EPGStickyLabelMetrics.topRowHeight
+                    ),
+                    options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine]
+                )
                 NSGraphicsContext.restoreGraphicsState()
+            }
+
+            if let channelText {
+                drawPinnedChannelName(
+                    channelText,
+                    rowY: rowY,
+                    height: EPGStickyLabelMetrics.topRowHeight,
+                    maxWidth: metadataMaxWidth
+                )
             }
         }
     }
 
-    private static let channelFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+    private static let channelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
     private static let timeRangeFont = NSFont.systemFont(ofSize: 10, weight: .regular)
-    private static let titleFont = NSFont.systemFont(ofSize: 13, weight: .medium)
 
     private static func truncatingParagraph(lineHeight: CGFloat) -> NSMutableParagraphStyle {
         let paragraph = NSMutableParagraphStyle()
@@ -952,17 +933,6 @@ final class ChannelLabelOverlayView: NSView {
         )
     }
 
-    private func titleString(_ title: String, paragraph: NSParagraphStyle) -> NSAttributedString {
-        NSAttributedString(
-            string: title,
-            attributes: [
-                .font: Self.titleFont,
-                .foregroundColor: NSColor(calibratedWhite: 0.04, alpha: 1),
-                .paragraphStyle: paragraph,
-            ]
-        )
-    }
-
     @discardableResult
     private func drawPinnedChannelName(
         _ text: NSAttributedString,
@@ -977,10 +947,11 @@ final class ChannelLabelOverlayView: NSView {
         let textWidth = min(measuredWidth(of: text), availableWidth)
         guard textWidth > 4 else { return nil }
 
+        let textY = rowY + EPGStickyLabelMetrics.topRowY
         text.draw(
             with: NSRect(
                 x: labelX,
-                y: rowY + EPGStickyLabelMetrics.topRowY,
+                y: textY,
                 width: textWidth,
                 height: height
             ),
@@ -988,45 +959,6 @@ final class ChannelLabelOverlayView: NSView {
         )
 
         return labelX + textWidth
-    }
-
-    private func drawStickyText(
-        _ text: NSAttributedString,
-        rowY: CGFloat,
-        blockScreenMinX: CGFloat,
-        blockScreenMaxX: CGFloat,
-        yOffset: CGFloat,
-        height: CGFloat,
-        maxWidth: CGFloat,
-        trailingReserve: CGFloat = 0,
-        leadingClampX: CGFloat = EPGStickyLabelMetrics.x
-    ) {
-        let textInset = EPGStickyLabelMetrics.x
-        let contentMinX = blockScreenMinX + textInset
-        let contentMaxX = blockScreenMaxX - textInset - trailingReserve
-        guard contentMaxX > contentMinX + 8, maxWidth > 8 else { return }
-
-        let labelX = max(contentMinX, leadingClampX)
-        guard contentMaxX > labelX + 8 else { return }
-
-        let availableWidth = min(maxWidth, contentMaxX - labelX)
-        guard availableWidth > 8 else { return }
-
-        let textWidth = min(measuredWidth(of: text), availableWidth)
-        guard textWidth > 4 else { return }
-
-        let drawWidth = min(availableWidth, contentMaxX - labelX)
-        guard drawWidth > 8 else { return }
-
-        text.draw(
-            with: NSRect(
-                x: labelX,
-                y: rowY + yOffset,
-                width: drawWidth,
-                height: height
-            ),
-            options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine]
-        )
     }
 
     private func measuredWidth(of text: NSAttributedString) -> CGFloat {

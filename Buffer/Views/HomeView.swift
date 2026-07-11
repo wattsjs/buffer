@@ -41,7 +41,7 @@ struct HomeView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: BufferLayout.section) {
                 if !inProgressVOD.isEmpty {
                     continueWatchingSection
                 }
@@ -66,10 +66,10 @@ struct HomeView: View {
                     sectionPlaceholder(title: "Favorites", icon: "heart")
                 }
             }
-            .padding(24)
+            .padding(BufferLayout.page)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
     }
 
     // MARK: - Continue Watching
@@ -78,12 +78,12 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: "play.rectangle.on.rectangle")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(BufferFont.bodyMedium)
                     .foregroundStyle(.secondary)
                 Text("Continue Watching")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(BufferFont.sectionTitle)
                 Text("\(inProgressVOD.count)")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(BufferFont.bodyMedium)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
@@ -107,13 +107,11 @@ struct HomeView: View {
     private var liveSportsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 8, height: 8)
+                LiveIndicatorDot(size: 8)
                 Text("Live Sport")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(BufferFont.sectionTitle)
                 Text("\(liveEvents.count)")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(BufferFont.bodyMedium)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
@@ -139,7 +137,7 @@ struct HomeView: View {
                     .fill(Color.red.opacity(0.3))
                     .frame(width: 8, height: 8)
                 Text("Live Sport")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(BufferFont.sectionTitle)
                     .foregroundStyle(.secondary)
                 Spacer()
                 if sportsViewModel.isLoading && !sportsViewModel.hasLoadedOnce {
@@ -149,12 +147,12 @@ struct HomeView: View {
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
+                HStack(spacing: BufferLayout.cardGap) {
                     ForEach(0..<3, id: \.self) { _ in
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        RoundedRectangle(cornerRadius: BufferLayout.cardRadius, style: .continuous)
                             .fill(Color.red.opacity(0.03))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                RoundedRectangle(cornerRadius: BufferLayout.cardRadius, style: .continuous)
                                     .strokeBorder(Color.red.opacity(0.15), lineWidth: 0.5)
                             )
                             .frame(width: 260, height: 100)
@@ -168,19 +166,19 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 12))
+                    .font(BufferFont.caption)
                     .foregroundStyle(.quaternary)
                 Text(title)
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(BufferFont.sectionTitle)
                     .foregroundStyle(.secondary)
             }
 
             HStack(spacing: 16) {
                 ForEach(0..<3, id: \.self) { _ in
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    RoundedRectangle(cornerRadius: BufferLayout.compactRadius, style: .continuous)
                         .fill(Color.primary.opacity(0.03))
                         .overlay(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            RoundedRectangle(cornerRadius: BufferLayout.compactRadius, style: .continuous)
                                 .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
                         )
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
@@ -193,7 +191,7 @@ struct HomeView: View {
     private func section(title: String, channels: [Channel]) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title)
-                .font(.system(size: 18, weight: .semibold))
+                .font(BufferFont.sectionTitle)
             LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(channels) { channel in
                     RecentChannelCard(
@@ -228,13 +226,13 @@ private struct HomeVODProgressCard: View {
 
             VStack(alignment: .leading, spacing: 7) {
                 Text(entry.item.name)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(BufferFont.cardTitleMedium)
                     .foregroundStyle(.primary)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 Text(subtitle)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(BufferFont.metaMedium)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
@@ -245,7 +243,7 @@ private struct HomeVODProgressCard: View {
 
                 if !entry.item.group.isEmpty {
                     Text(entry.item.genre ?? entry.item.group)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(BufferFont.microMedium)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
@@ -254,31 +252,35 @@ private struct HomeVODProgressCard: View {
         }
         .padding(10)
         .frame(width: 300, height: 128, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(isHovering ? 0.9 : 0.65))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(isHovering ? 0.22 : 0.08), lineWidth: 1)
+        .bufferHoverHighlight(
+            isHovering: isHovering,
+            cornerRadius: BufferLayout.compactRadius,
+            idleFill: Color(nsColor: .controlBackgroundColor).opacity(0.65),
+            hoverFill: Color(nsColor: .controlBackgroundColor).opacity(0.95),
+            idleStroke: Color.primary.opacity(0.08),
+            hoverStroke: Color.primary.opacity(0.22),
+            lineWidth: 1,
+            elevated: true
         )
         .overlay(alignment: .topTrailing) {
             Button(action: onRemove) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(BufferFont.microBadge)
                     .frame(width: 22, height: 22)
                     .contentShape(Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(BufferPressStyle(scale: 0.92))
             .background(.thinMaterial, in: Circle())
             .foregroundStyle(.secondary)
             .padding(7)
             .help("Remove from Continue Watching")
         }
-        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: BufferLayout.compactRadius, style: .continuous))
+        .scaleEffect(isHovering ? 1.01 : 1)
+        .animation(BufferMotion.hover, value: isHovering)
         .onTapGesture(perform: onTap)
         .help("Play \(entry.item.name)")
-        .onHover { isHovering = $0 }
+        .bufferHoverTracking($isHovering)
         .contextMenu {
             Button(action: onRemove) {
                 Label("Remove from Continue Watching", systemImage: "xmark.circle")
@@ -308,7 +310,7 @@ private struct HomeVODProgressCard: View {
 
     private var fallbackIcon: some View {
         Image(systemName: entry.item.kind == .seriesEpisode ? "play.rectangle" : "film")
-            .font(.system(size: 24))
+            .font(BufferFont.heroIcon)
             .foregroundStyle(.tertiary)
     }
 }
@@ -339,7 +341,7 @@ private struct RecentChannelCard: View {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(bgColor)
                     ChannelLogoView(url: channel.logoURL) { color in
-                        withAnimation(.easeInOut(duration: 0.25)) {
+                        withAnimation(BufferMotion.color) {
                             bgColor = Color(nsColor: color)
                         }
                     }
@@ -347,8 +349,14 @@ private struct RecentChannelCard: View {
                 }
                 .aspectRatio(16.0 / 9.0, contentMode: .fit)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    RoundedRectangle(cornerRadius: BufferLayout.compactRadius, style: .continuous)
                         .strokeBorder(Color.primary.opacity(isHovering ? 0.25 : 0.08), lineWidth: 1)
+                        .animation(BufferMotion.hover, value: isHovering)
+                )
+                .shadow(
+                    color: isHovering ? BufferLayout.cardShadow : .clear,
+                    radius: BufferLayout.cardShadowRadius,
+                    y: BufferLayout.cardShadowY
                 )
                 .overlay(alignment: .bottomLeading) {
                     StreamProbeBadge(channelID: channel.id, style: .compact)
@@ -357,16 +365,16 @@ private struct RecentChannelCard: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(channel.name)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(BufferFont.cardTitle)
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     Text(program?.title ?? " ")
-                        .font(.system(size: 11))
+                        .font(BufferFont.meta)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     if !channel.group.isEmpty {
                         Text(channel.group)
-                            .font(.system(size: 10, weight: .medium))
+                            .font(BufferFont.microMedium)
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)
                             .padding(.top, 1)
@@ -376,9 +384,9 @@ private struct RecentChannelCard: View {
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(BufferPressStyle())
         .help(channel.name)
-        .onHover { isHovering = $0 }
+        .bufferHoverTracking($isHovering)
         .requestStreamProbe(for: channel)
         .fadeIfStreamDead(channelID: channel.id)
         .contextMenu {
@@ -424,10 +432,10 @@ private struct HomeLiveEventCard: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: event.sport.icon)
-                    .font(.system(size: 10))
+                    .font(BufferFont.micro)
                     .foregroundStyle(.secondary)
                 Text(event.league.shortName)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(BufferFont.metaMedium)
                     .foregroundStyle(.secondary)
                 Spacer()
                 statusBadge
@@ -441,11 +449,11 @@ private struct HomeLiveEventCard: View {
             } else {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(event.title)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(BufferFont.cardTitle)
                         .lineLimit(2)
                     if let subtitle = tournamentSubtitle {
                         Text(subtitle)
-                            .font(.system(size: 11))
+                            .font(BufferFont.meta)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -454,19 +462,13 @@ private struct HomeLiveEventCard: View {
                 .frame(height: 52, alignment: .center)
             }
         }
-        .padding(14)
+        .padding(BufferLayout.cardPadding)
         .frame(width: 260)
         .frame(minHeight: 100)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.red.opacity(hovered ? 0.1 : 0.05))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color.red.opacity(0.3), lineWidth: 0.5)
-        )
+        .bufferCardSurface(isHovering: hovered, isLive: true)
         .contentShape(Rectangle())
-        .onHover { hovered = $0 }
+        .scaleEffect(hovered ? 1.015 : 1)
+        .bufferHoverTracking($hovered)
         .onTapGesture {
             handleTap()
         }
@@ -507,13 +509,13 @@ private struct HomeLiveEventCard: View {
             )
 
             Text(team.displayName)
-                .font(.system(size: 13, weight: .semibold))
+                .font(BufferFont.cardTitle)
                 .lineLimit(1)
 
             if let score = team.score {
                 Spacer()
                 Text(score)
-                    .font(.system(size: 15, weight: .bold))
+                    .font(BufferFont.score)
                     .monospacedDigit()
                     .foregroundStyle(.red)
             }
@@ -525,16 +527,14 @@ private struct HomeLiveEventCard: View {
         switch event.status {
         case .live(let detail):
             HStack(spacing: 4) {
-                Circle()
-                    .fill(Color.red)
-                    .frame(width: 6, height: 6)
+                LiveIndicatorDot(size: 6)
                 Text(detail ?? "LIVE")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(BufferFont.microBadge)
                     .foregroundStyle(.red)
             }
         case .halftime:
             Text("HT")
-                .font(.system(size: 10, weight: .bold))
+                .font(BufferFont.microBadge)
                 .foregroundStyle(.orange)
         default:
             EmptyView()

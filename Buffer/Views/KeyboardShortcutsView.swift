@@ -22,7 +22,7 @@ struct KeyboardShortcutsView: View {
                     ]
                 )
             }
-            .padding(24)
+            .padding(BufferLayout.page)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(minWidth: 380, minHeight: 260)
@@ -53,7 +53,7 @@ private struct ShortcutKeyCaps: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .font(BufferFont.keycap)
             .foregroundStyle(.primary)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)

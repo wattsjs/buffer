@@ -41,26 +41,26 @@ struct StreamMatchesPopover: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(event.displayTitle)
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(BufferFont.cardTitleMedium)
                     .lineLimit(1)
                 HStack(spacing: 6) {
                     Text(event.league.fullName)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(BufferFont.captionMedium)
                         .foregroundStyle(.secondary)
                     if let reminderHint {
                         Text("·")
                             .foregroundStyle(.tertiary)
                         Text(reminderHint)
-                            .font(.system(size: 11))
+                            .font(BufferFont.meta)
                             .foregroundStyle(.tertiary)
                     }
                 }
                 HStack(spacing: 5) {
                     Image(systemName: "clock")
-                        .font(.system(size: 10))
+                        .font(BufferFont.micro)
                         .foregroundStyle(.tertiary)
                     Text(timeRange)
-                        .font(.system(size: 11))
+                        .font(BufferFont.meta)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
@@ -78,7 +78,7 @@ struct StreamMatchesPopover: View {
                             .controlSize(.small)
                     }
                     Text(unavailableMessage ?? "No matching streams found")
-                        .font(.system(size: 12))
+                        .font(BufferFont.caption)
                         .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity)
@@ -124,11 +124,11 @@ private struct StreamMatchPopoverRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(match.channel.name)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(BufferFont.cardTitle)
                         .lineLimit(1)
                     if isFavorite {
                         Image(systemName: "heart.fill")
-                            .font(.system(size: 8))
+                            .font(BufferFont.hairline)
                             .foregroundStyle(.pink)
                     }
                     Spacer(minLength: 0)
@@ -137,21 +137,21 @@ private struct StreamMatchPopoverRow: View {
 
                 if !metaLine.isEmpty {
                     Text(metaLine)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(BufferFont.microMedium)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
 
                 if let title = match.programTitle, !title.isEmpty {
                     Text(title)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(BufferFont.metaMedium)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
 
                 if let details = programDetails, !details.isEmpty {
                     Text(details)
-                        .font(.system(size: 10))
+                        .font(BufferFont.micro)
                         .foregroundStyle(.tertiary)
                         .lineLimit(2)
                 }
@@ -166,7 +166,7 @@ private struct StreamMatchPopoverRow: View {
                     if let onRecord {
                         Button(action: onRecord) {
                             Image(systemName: "record.circle")
-                                .font(.system(size: 14))
+                                .font(BufferFont.emptyTitle)
                                 .foregroundStyle(.red)
                                 .frame(width: 26, height: 26)
                         }
@@ -177,7 +177,7 @@ private struct StreamMatchPopoverRow: View {
                     if let onPlay {
                         Button(action: onPlay) {
                             Image(systemName: "play.fill")
-                                .font(.system(size: 12, weight: .semibold))
+                                .font(BufferFont.captionSemibold)
                                 .frame(width: 26, height: 26)
                         }
                         .buttonStyle(.borderless)
@@ -185,7 +185,7 @@ private struct StreamMatchPopoverRow: View {
                     } else if let onRemind {
                         Button(action: onRemind) {
                             Image(systemName: "bell.fill")
-                                .font(.system(size: 12))
+                                .font(BufferFont.caption)
                                 .frame(width: 26, height: 26)
                         }
                         .buttonStyle(.borderless)
@@ -197,11 +197,15 @@ private struct StreamMatchPopoverRow: View {
         .padding(.vertical, 8)
         .padding(.horizontal, 10)
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(hovered ? Color.white.opacity(0.06) : Color.white.opacity(0.025))
+            RoundedRectangle(cornerRadius: BufferLayout.compactRadius, style: .continuous)
+                .fill(hovered ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: BufferLayout.compactRadius, style: .continuous)
+                .strokeBorder(hovered ? Color.accentColor.opacity(0.28) : Color.clear, lineWidth: 0.75)
         )
         .contentShape(Rectangle())
-        .onHover { hovered = $0 }
+        .bufferHoverTracking($hovered)
         .onTapGesture {
             if let onPlay {
                 onPlay()

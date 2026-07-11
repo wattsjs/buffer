@@ -109,7 +109,7 @@ struct VODLibraryView: View {
                 }
             }
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
         .onChange(of: items.count) { _, _ in
             if selectedGenre != "All" && !genres.contains(selectedGenre) {
                 selectedGenre = "All"
@@ -211,7 +211,7 @@ struct SeriesLibraryView: View {
                 }
             }
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
         .onChange(of: series.count) { _, _ in
             if selectedGenre != "All" && !genres.contains(selectedGenre) {
                 selectedGenre = "All"
@@ -230,31 +230,30 @@ private struct VODFilterBar: View {
     @Binding var sortOrder: VODSortOrder
 
     var body: some View {
-        HStack(spacing: 12) {
-            Text("\(count) title\(count == 1 ? "" : "s")")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+        BufferFilterBar {
+            HStack(spacing: 12) {
+                Text("\(count) title\(count == 1 ? "" : "s")")
+                    .font(BufferFont.captionMedium)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
 
-            Spacer()
+                Spacer()
 
-            Picker("Genre", selection: $selectedGenre) {
-                ForEach(genres, id: \.self) { genre in
-                    Text(genre).tag(genre)
+                Picker("Genre", selection: $selectedGenre) {
+                    ForEach(genres, id: \.self) { genre in
+                        Text(genre).tag(genre)
+                    }
                 }
-            }
-            .frame(width: 190)
+                .frame(width: 190)
 
-            Picker("Sort", selection: $sortOrder) {
-                ForEach(VODSortOrder.allCases) { order in
-                    Text(order.rawValue).tag(order)
+                Picker("Sort", selection: $sortOrder) {
+                    ForEach(VODSortOrder.allCases) { order in
+                        Text(order.rawValue).tag(order)
+                    }
                 }
+                .frame(width: 120)
             }
-            .frame(width: 120)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
-        .background(.bar)
     }
 }
 
@@ -276,11 +275,19 @@ private struct VODPosterCard: View {
                     .overlay(
                         RoundedRectangle(cornerRadius: VODPosterMetrics.cornerRadius, style: .continuous)
                             .strokeBorder(Color.primary.opacity(isHovering ? 0.25 : 0.08), lineWidth: 1)
+                            .animation(BufferMotion.hover, value: isHovering)
                     )
+                    .shadow(
+                        color: isHovering ? BufferLayout.cardShadow : .clear,
+                        radius: BufferLayout.cardShadowRadius,
+                        y: BufferLayout.cardShadowY
+                    )
+                    .scaleEffect(isHovering ? 1.02 : 1)
+                    .animation(BufferMotion.hover, value: isHovering)
                     .overlay(alignment: .bottomTrailing) {
                         if let badge, !badge.isEmpty {
                             Text(badge)
-                                .font(.system(size: 10, weight: .semibold))
+                                .font(BufferFont.microSemibold)
                                 .monospaced()
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 3)
@@ -300,19 +307,19 @@ private struct VODPosterCard: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(BufferFont.cardTitle)
                         .foregroundStyle(.primary)
                         .lineLimit(2)
                         .frame(height: VODPosterMetrics.titleHeight, alignment: .topLeading)
 
                     Text(subtitle)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(BufferFont.metaMedium)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .frame(height: VODPosterMetrics.subtitleHeight, alignment: .topLeading)
                     if let resumeEntry {
                         Text(resumeText(for: resumeEntry))
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(BufferFont.microSemibold)
                             .foregroundStyle(Color.accentColor)
                             .lineLimit(1)
                     }
@@ -321,9 +328,9 @@ private struct VODPosterCard: View {
             .frame(width: VODPosterMetrics.width, height: VODPosterMetrics.cardHeight, alignment: .topLeading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(BufferPressStyle())
         .help(title)
-        .onHover { isHovering = $0 }
+        .bufferHoverTracking($isHovering)
     }
 }
 
@@ -377,10 +384,10 @@ struct VODItemDetailPage: View {
                 VStack(alignment: .leading, spacing: 18) {
                     VStack(alignment: .leading, spacing: 5) {
                         Text(item.name)
-                            .font(.system(size: 30, weight: .semibold))
+                            .font(BufferFont.display)
                             .lineLimit(3)
                         Text(item.genre ?? item.group)
-                            .font(.system(size: 15, weight: .medium))
+                            .font(BufferFont.titleMedium)
                             .foregroundStyle(.secondary)
                     }
 
@@ -437,7 +444,7 @@ struct VODItemDetailPage: View {
                 VODHeaderBackButton(title: backTitle, action: onBack)
             }
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
     }
 }
 
@@ -469,10 +476,10 @@ struct SeriesDetailPage: View {
                     VStack(alignment: .leading, spacing: 16) {
                         VStack(alignment: .leading, spacing: 5) {
                             Text(series.name)
-                                .font(.system(size: 30, weight: .semibold))
+                                .font(BufferFont.display)
                                 .lineLimit(3)
                             Text(series.group)
-                                .font(.system(size: 15, weight: .medium))
+                                .font(BufferFont.titleMedium)
                                 .foregroundStyle(.secondary)
                         }
 
@@ -546,7 +553,7 @@ struct SeriesDetailPage: View {
                 VODHeaderBackButton(title: backTitle, action: onBack)
             }
         }
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
     }
 }
 
@@ -557,9 +564,9 @@ private struct VODResumeProgress: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(BufferFont.metaMedium)
                 Text(resumeText(for: entry))
-                    .font(.system(size: 12, weight: .medium))
+                    .font(BufferFont.captionMedium)
                     .lineLimit(1)
             }
             .foregroundStyle(.secondary)
@@ -578,7 +585,7 @@ private struct VODHeaderBackButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: "chevron.left")
-                .font(.system(size: 14, weight: .semibold))
+                .font(BufferFont.cardTitleMedium)
                 .frame(width: 28, height: 28)
                 .contentShape(Rectangle())
         }
@@ -609,7 +616,7 @@ private struct EpisodeRow: View {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(episode.name)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(BufferFont.cardTitleMedium)
                         .lineLimit(2)
                     Spacer()
                     Button {
@@ -632,7 +639,7 @@ private struct EpisodeRow: View {
 
                 if let summary = episode.summary, !summary.isEmpty {
                     Text(summary)
-                        .font(.system(size: 12))
+                        .font(BufferFont.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
@@ -640,27 +647,21 @@ private struct EpisodeRow: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: BufferLayout.compactRadius, style: .continuous))
         .onTapGesture {
             onPlay(resumeEntry?.positionSeconds)
         }
-        .onHover { hovering in
-            isHovering = hovering
-            if hovering {
-                NSCursor.pointingHand.push()
-            } else {
-                NSCursor.pop()
-            }
-        }
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isHovering ? Color.accentColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor))
+        .bufferHoverTracking($isHovering)
+        .bufferHoverHighlight(
+            isHovering: isHovering,
+            cornerRadius: BufferLayout.compactRadius,
+            idleFill: Color(nsColor: .controlBackgroundColor),
+            hoverFill: Color.accentColor.opacity(0.10),
+            idleStroke: Color.primary.opacity(0.08),
+            hoverStroke: Color.accentColor.opacity(0.35),
+            lineWidth: 1,
+            elevated: true
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(isHovering ? Color.accentColor.opacity(0.35) : Color.primary.opacity(0.08), lineWidth: 1)
-        )
-        .animation(.easeOut(duration: 0.12), value: isHovering)
         .accessibilityAddTraits(.isButton)
         .help("\(resumeEntry == nil ? "Play" : "Resume") \(episode.name)")
     }
@@ -702,7 +703,7 @@ private struct EpisodeMetadataBadge: View {
 
     var body: some View {
         Text(value)
-            .font(.system(size: 11, weight: .medium))
+            .font(BufferFont.metaMedium)
             .foregroundStyle(.secondary)
             .lineLimit(1)
             .padding(.horizontal, 7)

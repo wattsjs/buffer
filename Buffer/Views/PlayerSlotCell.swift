@@ -50,7 +50,7 @@ struct PlayerSlotCell: View {
                 slotLabel
                     .padding(8)
                     .allowsHitTesting(false)
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .topLeading)))
             }
         }
         .overlay(alignment: .topTrailing) {
@@ -62,17 +62,17 @@ struct PlayerSlotCell: View {
                         .frame(width: 22, height: 22)
                         .background(.black.opacity(0.6), in: Circle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(BufferPressStyle(scale: 0.92))
                 .padding(8)
                 .help("Remove from multi-view")
-                .transition(.opacity)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)))
             }
         }
         .overlay(alignment: .bottomLeading) {
             if showCellChrome && (isHovering || isFocused) {
                 slotControls
                     .padding(8)
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottomLeading)))
             }
         }
         .overlay {
@@ -85,11 +85,11 @@ struct PlayerSlotCell: View {
             }
         }
         .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.12)) {
+            withAnimation(BufferMotion.hover) {
                 isHovering = hovering
             }
         }
-        .animation(.easeInOut(duration: 0.15), value: isFocused)
+        .animation(BufferMotion.focus, value: isFocused)
     }
 
     @ViewBuilder
@@ -105,7 +105,7 @@ struct PlayerSlotCell: View {
                 .foregroundStyle(.white)
             if !slot.player.isMuted && slot.player.volume > 0 {
                 Image(systemName: volumeIconName)
-                    .font(.system(size: 9))
+                    .font(BufferFont.tiny)
                     .foregroundStyle(.white.opacity(0.9))
             }
         }
@@ -120,7 +120,7 @@ struct PlayerSlotCell: View {
                 slot.player.togglePause()
             } label: {
                 Image(systemName: slot.player.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(BufferFont.control)
                     .frame(width: 22, height: 22)
             }
             .buttonStyle(.plain)
@@ -131,7 +131,7 @@ struct PlayerSlotCell: View {
                 slot.player.toggleMute()
             } label: {
                 Image(systemName: volumeIconName)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(BufferFont.control)
                     .frame(width: 22, height: 22)
             }
             .buttonStyle(.plain)

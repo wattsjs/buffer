@@ -65,16 +65,16 @@ struct StreamProbeBadge: View {
             VStack(alignment: .leading, spacing: 1) {
                 if !probe.resolutionLabel.isEmpty {
                     Text(probe.resolutionLabel)
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(BufferFont.microSemibold)
                 }
                 if !probe.fpsLabel.isEmpty {
                     Text(probe.fpsLabel)
-                        .font(.system(size: 9))
+                        .font(BufferFont.tiny)
                         .foregroundStyle(.secondary)
                 }
                 if !probe.codecLabel.isEmpty {
                     Text(probe.codecLabel)
-                        .font(.system(size: 9))
+                        .font(BufferFont.tiny)
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -96,10 +96,10 @@ struct StreamProbeBadge: View {
         HStack(spacing: 3) {
             if audioOnly {
                 Image(systemName: "speaker.wave.2.fill")
-                    .font(.system(size: 8, weight: .bold))
+                    .font(BufferFont.hairlineBold)
             }
             Text(text)
-                .font(.system(size: 9, weight: .bold))
+                .font(BufferFont.tinyBold)
                 .monospacedDigit()
         }
         .foregroundStyle(.white)
@@ -112,10 +112,10 @@ struct StreamProbeBadge: View {
     private func statusBadge(symbol: String, tint: Color, text: String) -> some View {
         HStack(spacing: 3) {
             Image(systemName: symbol)
-                .font(.system(size: 8, weight: .bold))
+                .font(BufferFont.hairlineBold)
             if !text.isEmpty {
                 Text(text)
-                    .font(.system(size: 9, weight: .bold))
+                    .font(BufferFont.tinyBold)
             }
         }
         .foregroundStyle(.white)

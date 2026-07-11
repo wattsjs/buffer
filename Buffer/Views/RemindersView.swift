@@ -21,7 +21,7 @@ struct RemindersView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
+        .bufferPageBackground()
         .task {
             // Keep relative times fresh. Cheap 30s tick.
             while !Task.isCancelled {
@@ -61,7 +61,7 @@ struct RemindersView: View {
     private var sectionHeader: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text("\(upcoming.count) upcoming")
-                .font(.system(size: 13, weight: .medium))
+                .font(BufferFont.bodyMedium)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
             Spacer()
@@ -155,29 +155,29 @@ private struct ReminderRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(reminder.programTitle.isEmpty ? "Program" : reminder.programTitle)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(BufferFont.cardTitleMedium)
                         .lineLimit(1)
                     Spacer(minLength: 8)
                     Text(firesIn)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(BufferFont.metaMedium)
                         .foregroundStyle(.orange)
                         .monospacedDigit()
                 }
                 HStack(spacing: 6) {
                     Text(reminder.channelName)
-                        .font(.system(size: 12, weight: .medium))
+                        .font(BufferFont.captionMedium)
                         .foregroundStyle(.secondary)
                     Text("·")
                         .foregroundStyle(Color.secondary.opacity(0.6))
                     Text(startsWhen)
-                        .font(.system(size: 12))
+                        .font(BufferFont.caption)
                         .foregroundStyle(Color.secondary.opacity(0.9))
                         .monospacedDigit()
                 }
                 .lineLimit(1)
                 if !reminder.programDescription.isEmpty {
                     Text(reminder.programDescription)
-                        .font(.system(size: 11))
+                        .font(BufferFont.meta)
                         .foregroundStyle(Color.secondary.opacity(0.75))
                         .lineLimit(2)
                 }
@@ -196,11 +196,11 @@ private struct ReminderRow: View {
         }
         .padding(4)
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: BufferLayout.cardRadius, style: .continuous)
                 .fill(hovered ? Color.accentColor.opacity(0.08) : Color.clear)
         )
         .contentShape(Rectangle())
-        .onHover { hovered = $0 }
+        .bufferHoverTracking($hovered)
         .contextMenu {
             Button {
                 onPlay()
