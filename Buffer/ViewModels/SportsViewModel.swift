@@ -39,6 +39,8 @@ final class SportsViewModel {
     private var autoRefreshTask: Task<Void, Never>?
     private var indexRebuildTask: Task<Void, Never>?
     private var indexBuildGeneration = 0
+    @ObservationIgnored private var lastGuideWaitLogAt: Date?
+    @ObservationIgnored private var lastGuideWaitChannelCount = 0
 
     // External data for stream matching — set by the view
     var channels: [Channel] = []
@@ -127,7 +129,14 @@ final class SportsViewModel {
             if searchIndex.entries.isEmpty {
                 isStreamIndexBuilding = true
             }
-            AppLog.sports.info("Sports stream index waiting for guide data channels=\(ch.count, privacy: .public)")
+            let now = Date()
+            let shouldLog = lastGuideWaitChannelCount != ch.count
+                || lastGuideWaitLogAt.map { now.timeIntervalSince($0) >= 30 } ?? true
+            if shouldLog {
+                lastGuideWaitLogAt = now
+                lastGuideWaitChannelCount = ch.count
+                AppLog.sports.info("Sports stream index waiting for guide data channels=\(ch.count, privacy: .public)")
+            }
             return
         }
 
@@ -146,15 +155,15 @@ final class SportsViewModel {
                 AppLog.sportsSignposter.endInterval("SportsStreamIndexBuild", signpostState)
             }
             let index = StreamMatcher.buildIndex(channels: ch, programs: pr, hiddenGroups: hidden)
+            let buildMs = AppLog.elapsedMilliseconds(since: start)
+            let preparedAt = ContinuousClock.now
 
             await MainActor.run { [weak self] in
                 guard let self, self.indexBuildGeneration == generation else { return }
                 self.searchIndex = index
                 self.isStreamIndexBuilding = false
                 self.searchIndexVersion &+= 1
-                let elapsed = start.duration(to: .now).components
-                let milliseconds = (elapsed.seconds * 1_000) + (elapsed.attoseconds / 1_000_000_000_000_000)
-                AppLog.sports.info("Sports stream index ready generation=\(generation, privacy: .public) entries=\(index.entries.count, privacy: .public) programKeys=\(index.programKeyCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) buildMs=\(milliseconds, privacy: .public)")
+                AppLog.sports.info("Sports stream index ready generation=\(generation, privacy: .public) entries=\(index.entries.count, privacy: .public) programKeys=\(index.programKeyCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) buildMs=\(buildMs, privacy: .public) mainWaitMs=\(AppLog.elapsedMilliseconds(since: preparedAt), privacy: .public)")
             }
         }
     }

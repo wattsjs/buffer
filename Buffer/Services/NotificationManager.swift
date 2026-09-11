@@ -52,6 +52,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
     /// reminders whose programs have already aired.
     func bootstrap() async {
         await refreshAuthorizationStatus()
+        AppLog.notifications.info("Notification bootstrap status=\(self.authorizationStatus.rawValue, privacy: .public)")
         if authorizationStatus == .notDetermined {
             await requestAuthorization()
         }
@@ -66,9 +67,11 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
             _ = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])
         } catch {
-            AppLog.notifications.error("Notification auth failed error=\(error.localizedDescription, privacy: .public)")
+            let nsError = error as NSError
+            AppLog.notifications.error("Notification auth failed domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) error=\(nsError.localizedDescription, privacy: .public)")
         }
         await refreshAuthorizationStatus()
+        AppLog.notifications.info("Notification auth status=\(self.authorizationStatus.rawValue, privacy: .public)")
     }
 
     func refreshAuthorizationStatus() async {

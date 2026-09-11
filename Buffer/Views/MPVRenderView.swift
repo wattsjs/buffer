@@ -353,7 +353,6 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         }
 
         CGLSetCurrentContext(ctx)
-
         // Query the FBO + viewport that CoreAnimation set up for this layer.
         // This auto-tracks the layer's current pixel dimensions.
         var fbo: GLint = 0

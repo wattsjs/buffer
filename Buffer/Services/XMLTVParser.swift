@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SwiftLibxml2
 
 /// XMLTV parser built directly on libxml2's push SAX API. NSXMLParser was
@@ -10,13 +11,18 @@ nonisolated struct XMLTVParser {
         // Perform local file reads inside the detached task (Agent 03) so
         // large XMLTV guides never block the main thread on import/switch.
         return try await Task.detached(priority: .userInitiated) {
+            let fetchStarted = ContinuousClock.now
             let data: Data
             if url.isFileURL {
                 data = try Data(contentsOf: url)
             } else {
                 data = try await fetchRemoteGuideData(from: url)
             }
-            return parse(data: data)
+            let fetchMs = AppLog.elapsedMilliseconds(since: fetchStarted)
+            let parseStarted = ContinuousClock.now
+            let programs = parse(data: data)
+            AppLog.sync.info("XMLTV loaded bytes=\(data.count, privacy: .public) fetchMs=\(fetchMs, privacy: .public) parseMs=\(AppLog.elapsedMilliseconds(since: parseStarted), privacy: .public) programs=\(programs.count, privacy: .public)")
+            return programs
         }.value
     }
 

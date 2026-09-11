@@ -97,7 +97,10 @@ class EPGViewModel {
     }
     var hasLoadedOnce = false
     var isRefreshing = false
-    var loadingStage: String? = nil
+    @ObservationIgnored private var loadingStageStartedAt: ContinuousClock.Instant?
+    var loadingStage: String? = nil {
+        didSet { recordLoadingStageTransition(from: oldValue, to: loadingStage) }
+    }
     var errorMessage: String?
     var playlists: [ServerConfig] = []
     var activePlaylistID: UUID?
@@ -482,6 +485,7 @@ class EPGViewModel {
             return
         }
         let key = DataCache.cacheKey(for: config)
+        let started = ContinuousClock.now
 
         let channelsCache = await Task.detached(priority: .userInitiated) {
             DataCache.loadChannels(key: key)
@@ -509,18 +513,37 @@ class EPGViewModel {
         searchIndexVersion &+= 1
         hasLoadedOnce = true
 
-        let programsCache = await Task.detached(priority: .userInitiated) {
+        if let programsCache = await Task.detached(priority: .userInitiated, operation: {
             DataCache.loadPrograms(key: key)
-        }.value
-        if let programsCache {
+        }).value {
             if Self.programsCoverCurrentWindow(programsCache.programs) {
-                programs = programsCache.programs
-                rebuildProgramHourBuckets()
-                rebuildSearchIndex()
+                let loadedPrograms = programsCache.programs
+                let snapshot = await Task.detached(priority: .userInitiated) {
+                    Self.prepareGuideSnapshot(programs: loadedPrograms)
+                }.value
+                publishPreparedGuide(snapshot)
             } else {
                 AppLog.sync.info("Skipping stale guide cache savedAt=\(programsCache.savedAt, privacy: .public)")
             }
         }
+        AppLog.sync.info("Hydration finished channels=\(self.channels.count, privacy: .public) programKeys=\(self.programs.count, privacy: .public) elapsedMs=\(AppLog.elapsedMilliseconds(since: started), privacy: .public)")
+    }
+
+    private func recordLoadingStageTransition(from previousStage: String?, to nextStage: String?) {
+#if DEBUG
+        guard previousStage != nextStage else { return }
+        let now = ContinuousClock.now
+        if let previousStage, let loadingStageStartedAt {
+            AppLog.performance.info("content stage-finished stage=\(previousStage, privacy: .public) elapsedMs=\(AppLog.elapsedMilliseconds(since: loadingStageStartedAt, now: now), privacy: .public) channels=\(self.channels.count, privacy: .public) vod=\(self.vodItems.count, privacy: .public) series=\(self.vodSeries.count, privacy: .public) programKeys=\(self.programs.count, privacy: .public)")
+        }
+
+        if let nextStage {
+            loadingStageStartedAt = now
+            AppLog.performance.info("content stage-start stage=\(nextStage, privacy: .public)")
+        } else {
+            loadingStageStartedAt = nil
+        }
+#endif
     }
 
     // MARK: - Sync
@@ -542,6 +565,7 @@ class EPGViewModel {
 
         // Coalesce: if a sync is already running, leave it be.
         if let active = activeSyncTask, !active.isCancelled {
+            AppLog.sync.info("Sync skipped already running scope=\(String(describing: scope), privacy: .public)")
             return
         }
 
@@ -563,6 +587,7 @@ class EPGViewModel {
             id: signpostID,
             "scope=\(String(describing: scope), privacy: .public) silent=\(silent, privacy: .public)"
         )
+        AppLog.sync.info("Sync started scope=\(String(describing: scope), privacy: .public) silent=\(silent, privacy: .public) type=\(config.type.rawValue, privacy: .public) channels=\(self.channels.count, privacy: .public) programKeys=\(self.programs.count, privacy: .public)")
         let started = ContinuousClock.now
         let cacheKey = DataCache.cacheKey(for: config)
         var syncedStatus = ServerAccountStatus.initial(for: config, cacheKey: DataCache.preferenceKey(for: config))
@@ -688,19 +713,25 @@ class EPGViewModel {
                     }
 
                     if !silent { loadingStage = "Organizing guide…" }
-                    let organized = await Task.detached(priority: .userInitiated) {
-                        Self.organize(allPrograms)
+                    let existingPrograms = programs
+                    let snapshot = await Task.detached(priority: .userInitiated) {
+                        let organizeStarted = ContinuousClock.now
+                        let organized = Self.organize(allPrograms)
+                        let organizeMs = AppLog.elapsedMilliseconds(since: organizeStarted)
+                        let mergeStarted = ContinuousClock.now
+                        let merged = Self.mergePrograms(existing: existingPrograms, incoming: organized)
+                        let mergeMs = AppLog.elapsedMilliseconds(since: mergeStarted)
+                        return Self.prepareGuideSnapshot(
+                            programs: merged,
+                            organizeMs: organizeMs,
+                            mergeMs: mergeMs
+                        )
                     }.value
-
-                    // Merge into existing programs so we never lose
-                    // current/future data that was already in memory.
-                    programs = Self.mergePrograms(existing: programs, incoming: organized)
-                    rebuildProgramHourBuckets()
-                    rebuildSearchIndex()
+                    publishPreparedGuide(snapshot)
                     syncedStatus.guideStatus = "Reachable"
                     refreshedGuide = true
 
-                    let mergedPrograms = programs
+                    let mergedPrograms = snapshot.programs
                     Task.detached(priority: .utility) {
                         DataCache.savePrograms(mergedPrograms, key: cacheKey)
                     }
@@ -722,9 +753,11 @@ class EPGViewModel {
                         allPrograms = try await XMLTVParser.parse(from: epgURL)
                     }
                     if !silent { loadingStage = "Organizing guide…" }
+                    let organizeStarted = ContinuousClock.now
                     var organized = await Task.detached(priority: .userInitiated) {
                         Self.organize(allPrograms)
                     }.value
+                    AppLog.sync.info("Guide organized incoming=\(allPrograms.count, privacy: .public) organizeMs=\(AppLog.elapsedMilliseconds(since: organizeStarted), privacy: .public)")
 
                     if config.type == .xtream,
                        catchupGuideNeedsHistory(for: channels, now: Date()),
@@ -734,19 +767,30 @@ class EPGViewModel {
                             let lookbackPrograms = try await XMLTVParser.parse(from: lookbackURL)
                             if !lookbackPrograms.isEmpty {
                                 if !silent { loadingStage = "Organizing lookback guide…" }
-                                let lookbackOrganized = await Task.detached(priority: .userInitiated) {
-                                    Self.organize(lookbackPrograms)
+                                let existingOrganized = organized
+                                organized = await Task.detached(priority: .userInitiated) {
+                                    let lookbackOrganized = Self.organize(lookbackPrograms)
+                                    return Self.mergePartialPrograms(existing: existingOrganized, incoming: lookbackOrganized)
                                 }.value
-                                organized = Self.mergePartialPrograms(existing: organized, incoming: lookbackOrganized)
                             }
                         } catch {
                             AppLog.sync.error("Xtream lookback XMLTV fetch failed error=\(error.localizedDescription, privacy: .public)")
                         }
                     }
 
-                    var finalPrograms = config.type == .xtream
-                        ? Self.mergePartialPrograms(existing: programs, incoming: organized)
-                        : organized
+                    let existingPrograms = programs
+                    var finalPrograms = organized
+                    var mergeMs = 0
+                    if config.type == .xtream {
+                        let incoming = organized
+                        let merged = await Task.detached(priority: .userInitiated) {
+                            let mergeStarted = ContinuousClock.now
+                            let programs = Self.mergePartialPrograms(existing: existingPrograms, incoming: incoming)
+                            return (programs, AppLog.elapsedMilliseconds(since: mergeStarted))
+                        }.value
+                        finalPrograms = merged.0
+                        mergeMs = merged.1
+                    }
 
                     if config.type == .xtream {
                         let catchupChannels = channels.filter { $0.supportsRewind && $0.epgChannelID != nil }
@@ -763,11 +807,21 @@ class EPGViewModel {
                                 )
                                 if !catchupPrograms.isEmpty {
                                     if !silent { loadingStage = "Organizing catchup guide…" }
-                                    let catchupOrganized = await Task.detached(priority: .userInitiated) {
-                                        Self.organize(catchupPrograms)
+                                    let currentPrograms = finalPrograms
+                                    let merged = await Task.detached(priority: .userInitiated) {
+                                        let organizeStarted = ContinuousClock.now
+                                        let catchupOrganized = Self.organize(catchupPrograms)
+                                        let mergeStarted = ContinuousClock.now
+                                        let programs = Self.mergePartialPrograms(
+                                            existing: currentPrograms,
+                                            incoming: catchupOrganized
+                                        )
+                                        let catchupMergeMs = AppLog.elapsedMilliseconds(since: mergeStarted)
+                                        AppLog.sync.info("Xtream catchup EPG backfilled channels=\(catchupChannels.count, privacy: .public) programs=\(catchupPrograms.count, privacy: .public) organizeMs=\(AppLog.elapsedMilliseconds(since: organizeStarted), privacy: .public) mergeMs=\(catchupMergeMs, privacy: .public)")
+                                        return (programs, catchupMergeMs)
                                     }.value
-                                    finalPrograms = Self.mergePartialPrograms(existing: finalPrograms, incoming: catchupOrganized)
-                                    AppLog.sync.info("Xtream catchup EPG backfilled channels=\(catchupChannels.count, privacy: .public) programs=\(catchupPrograms.count, privacy: .public)")
+                                    finalPrograms = merged.0
+                                    mergeMs += merged.1
                                 }
                             } catch {
                                 AppLog.sync.error("Xtream catchup EPG backfill failed error=\(error.localizedDescription, privacy: .public)")
@@ -775,14 +829,17 @@ class EPGViewModel {
                         }
                     }
 
-                    programs = finalPrograms
-                    rebuildProgramHourBuckets()
-                    rebuildSearchIndex()
+                    let programsToPublish = finalPrograms
+                    let totalMergeMs = mergeMs
+                    let snapshot = await Task.detached(priority: .userInitiated) {
+                        Self.prepareGuideSnapshot(programs: programsToPublish, mergeMs: totalMergeMs)
+                    }.value
+                    publishPreparedGuide(snapshot)
                     syncedStatus.guideStatus = "Reachable"
                     refreshedGuide = true
 
                     Task.detached(priority: .utility) {
-                        DataCache.savePrograms(finalPrograms, key: cacheKey)
+                        DataCache.savePrograms(programsToPublish, key: cacheKey)
                     }
                 } catch {
                     AppLog.sync.error("EPG fetch failed error=\(error.localizedDescription, privacy: .public)")
@@ -797,7 +854,7 @@ class EPGViewModel {
             }
             updateServerStatus(syncedStatus)
             let elapsed = started.duration(to: .now).components.seconds
-            AppLog.sync.info("Sync finished scope=\(String(describing: scope), privacy: .public) silent=\(silent, privacy: .public) seconds=\(elapsed, privacy: .public) channels=\(self.channels.count, privacy: .public) groups=\(self.groups.count, privacy: .public)")
+            AppLog.sync.info("Sync finished scope=\(String(describing: scope), privacy: .public) silent=\(silent, privacy: .public) seconds=\(elapsed, privacy: .public) channels=\(self.channels.count, privacy: .public) groups=\(self.groups.count, privacy: .public) programKeys=\(self.programs.count, privacy: .public) guide=\(syncedStatus.guideStatus, privacy: .public)")
 
         } catch {
             AppLog.sync.error("Sync failed scope=\(String(describing: scope), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
@@ -1305,6 +1362,7 @@ class EPGViewModel {
         let programsSnapshot = programs
 
         indexBuildTask = Task.detached(priority: .utility) { [weak self, channelsByEPGID, programsSnapshot] in
+            let started = ContinuousClock.now
             var entries: [ProgramSearchEntry] = []
             entries.reserveCapacity(programsSnapshot.values.reduce(0) { $0 + $1.count })
 
@@ -1328,33 +1386,72 @@ class EPGViewModel {
 
             if Task.isCancelled { return }
             let finalEntries = entries
+            let buildMs = AppLog.elapsedMilliseconds(since: started)
+            let preparedAt = ContinuousClock.now
 
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.searchEntries = finalEntries
                 self.searchIndexVersion &+= 1
+                AppLog.sync.info("Program search index ready entries=\(finalEntries.count, privacy: .public) buildMs=\(buildMs, privacy: .public) mainWaitMs=\(AppLog.elapsedMilliseconds(since: preparedAt), privacy: .public)")
             }
         }
     }
 
     // MARK: - Pre-bucketing for fast visible-range queries (Agent 02 / Master Issues)
 
-    private func rebuildProgramHourBuckets() {
-        programHourBuckets.removeAll(keepingCapacity: true)
+    private func publishPreparedGuide(_ snapshot: PreparedGuideSnapshot) {
+        let mainWaitMs = AppLog.elapsedMilliseconds(since: snapshot.preparedAt)
+        programs = snapshot.programs
+        programHourBuckets = snapshot.hourBuckets
+        rebuildSearchIndex()
+        AppLog.sync.info("Guide published programKeys=\(snapshot.programs.count, privacy: .public) organizeMs=\(snapshot.organizeMs, privacy: .public) mergeMs=\(snapshot.mergeMs, privacy: .public) bucketMs=\(snapshot.bucketMs, privacy: .public) mainWaitMs=\(mainWaitMs, privacy: .public)")
+    }
+
+    private struct PreparedGuideSnapshot: Sendable {
+        let programs: [String: [EPGProgram]]
+        let hourBuckets: [String: [Int: [Int]]]
+        let organizeMs: Int
+        let mergeMs: Int
+        let bucketMs: Int
+        let preparedAt: ContinuousClock.Instant
+    }
+
+    nonisolated private static func makeProgramHourBuckets(
+        _ programs: [String: [EPGProgram]]
+    ) -> [String: [Int: [Int]]] {
+        var hourBuckets: [String: [Int: [Int]]] = [:]
+        hourBuckets.reserveCapacity(programs.count)
         for (epgID, progs) in programs {
             var buckets: [Int: [Int]] = [:]
             buckets.reserveCapacity(max(1, progs.count / 8))
             for (programIndex, p) in progs.enumerated() {
-                // A program may span hour boundaries; place in all overlapping buckets so range queries are O(1-ish per hour).
                 let startH = Int(floor(p.start.timeIntervalSince1970 / 3600))
                 let endH = Int(floor((p.end.timeIntervalSince1970 - 0.001) / 3600))
                 for h in startH...max(startH, endH) {
                     buckets[h, default: []].append(programIndex)
                 }
             }
-            // Keep per-bucket lists sorted (inherited from parent channel sort)
-            programHourBuckets[epgID] = buckets
+            hourBuckets[epgID] = buckets
         }
+        return hourBuckets
+    }
+
+    nonisolated private static func prepareGuideSnapshot(
+        programs: [String: [EPGProgram]],
+        organizeMs: Int = 0,
+        mergeMs: Int = 0
+    ) -> PreparedGuideSnapshot {
+        let bucketStarted = ContinuousClock.now
+        let hourBuckets = makeProgramHourBuckets(programs)
+        return PreparedGuideSnapshot(
+            programs: programs,
+            hourBuckets: hourBuckets,
+            organizeMs: organizeMs,
+            mergeMs: mergeMs,
+            bucketMs: AppLog.elapsedMilliseconds(since: bucketStarted),
+            preparedAt: .now
+        )
     }
 
     /// Returns programs for the channel that intersect [start, end).

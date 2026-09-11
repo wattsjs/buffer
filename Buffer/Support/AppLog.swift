@@ -10,8 +10,17 @@ enum AppLog {
     nonisolated static let guide = Logger(subsystem: subsystem, category: "Guide")
     nonisolated static let recording = Logger(subsystem: subsystem, category: "Recording")
     nonisolated static let notifications = Logger(subsystem: subsystem, category: "Notifications")
+    nonisolated static let performance = Logger(subsystem: subsystem, category: "Performance")
 
     nonisolated static let appSignposter = OSSignposter(subsystem: subsystem, category: .pointsOfInterest)
     nonisolated static let syncSignposter = OSSignposter(subsystem: subsystem, category: .pointsOfInterest)
     nonisolated static let sportsSignposter = OSSignposter(subsystem: subsystem, category: .pointsOfInterest)
+
+    nonisolated static func elapsedMilliseconds(
+        since start: ContinuousClock.Instant,
+        now: ContinuousClock.Instant = .now
+    ) -> Int {
+        let elapsed = start.duration(to: now).components
+        return Int((elapsed.seconds * 1_000) + (elapsed.attoseconds / 1_000_000_000_000_000))
+    }
 }

@@ -225,6 +225,7 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var lastReconnectAt: Date?
     @ObservationIgnored private var pendingOnDemandSeekSeconds: Double?
     @ObservationIgnored private var hasRenderedAnyFrame = false
+    @ObservationIgnored private var lastTelemetrySnapshotAt: Date?
 
     /// Tracks whether we have explicitly paused recovery Tasks + player for
     /// system sleep via AppLifecycleCoordinator. Prevents duplicate work on
@@ -255,6 +256,7 @@ final class PlayerSlot: Identifiable {
     /// to a full reload. Above this, ffmpeg's internal retries get to run
     /// while playback continues uninterrupted from the cache.
     @ObservationIgnored private let escalationCacheFloorSeconds: Double = 3
+    @ObservationIgnored private let telemetrySnapshotInterval: TimeInterval = 10
     @ObservationIgnored private let slowRetryFailureWindow: TimeInterval = 60
     @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
 
@@ -521,7 +523,7 @@ final class PlayerSlot: Identifiable {
                     try? await Task.sleep(for: .seconds(4))
                     continue
                 }
-
+                self.emitPlaybackTelemetryIfNeeded()
                 let currentTimePos = self.player.timePos
                 if currentTimePos - self.lastObservedTimePos >= self.playbackProgressEpsilon {
                     self.lastObservedTimePos = currentTimePos
@@ -562,6 +564,18 @@ final class PlayerSlot: Identifiable {
                 return
             }
         }
+    }
+
+    private func emitPlaybackTelemetryIfNeeded() {
+        let now = Date()
+        if let lastTelemetrySnapshotAt,
+           now.timeIntervalSince(lastTelemetrySnapshotAt) < telemetrySnapshotInterval {
+            return
+        }
+        lastTelemetrySnapshotAt = now
+        let health = playbackStreamHealth
+        AppLog.playback.info("telemetry heartbeat channel=\(self.channel.name, privacy: .public) mode=\(String(describing: self.playbackMode), privacy: .public) health=\(health.statusLabel, privacy: .public) reconnects=\(health.reconnectCount, privacy: .public) http509=\(health.http509Count, privacy: .public) recoveryReloads=\(health.recoveryReloadCount, privacy: .public) playlistFails=\(health.playlistReloadFailureCount, privacy: .public)")
+        player.logPlaybackSyncSnapshot("heartbeat")
     }
 
     private func armRecoveryWatchdogs() {

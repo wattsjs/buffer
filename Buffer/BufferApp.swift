@@ -36,9 +36,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, SP
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         startUpdater()
+#if DEBUG
+        PerformanceMonitor.shared.start()
+#endif
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        AppLog.app.info("Buffer launched version=\(version, privacy: .public) build=\(build, privacy: .public)")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+#if DEBUG
+        PerformanceMonitor.shared.stop()
+#endif
         RecordingManager.shared.stopAll()
     }
 

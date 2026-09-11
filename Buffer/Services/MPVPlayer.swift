@@ -351,10 +351,21 @@ final class MPVPlayer {
     @ObservationIgnored private var lastHTTPStatusCode: Int = 0
     @ObservationIgnored private var playbackRequested = false
     @ObservationIgnored private var loadStartedAt: ContinuousClock.Instant?
+    @ObservationIgnored private var bufferingStartedAt: ContinuousClock.Instant?
+    @ObservationIgnored private var bufferingEventCount = 0
+    @ObservationIgnored private var bufferingTotalMilliseconds = 0
     @ObservationIgnored private var loadGeneration = 0
     @ObservationIgnored private var firstRenderedLoadGeneration = 0
     @ObservationIgnored private var displayPowerAssertion = IOPMAssertionID(0)
     @ObservationIgnored private var holdsDisplayPowerAssertion = false
+    @ObservationIgnored private var lastTelemetryFrameDrops: Int64 = 0
+    @ObservationIgnored private var lastTelemetryDecoderDrops: Int64 = 0
+    @ObservationIgnored private var lastTelemetryMistimed: Int64 = 0
+    @ObservationIgnored private var telemetryNetworkWarns: Int = 0
+    @ObservationIgnored private var telemetryDecodeWarns: Int = 0
+    @ObservationIgnored private var lastDrawableWidth: Int = 0
+    @ObservationIgnored private var lastDrawableHeight: Int = 0
+    @ObservationIgnored private var fileLoadedGeneration = 0
 
     /// In-memory cache of resolved CDN URLs. Xtream stream URLs redirect to
     /// CDN edge servers; caching the final URL avoids a ~1s HEAD request on
@@ -424,6 +435,7 @@ final class MPVPlayer {
     func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false) {
         guard let handle else { return }
 
+        updateBufferingState(false, source: "load-replaced")
         loadGeneration &+= 1
         firstRenderedLoadGeneration = 0
         loadStartedAt = ContinuousClock.now
@@ -434,7 +446,8 @@ final class MPVPlayer {
         duration = 0
         isSeekable = false
         cacheSeconds = 0
-        isBuffering = false
+        bufferingEventCount = 0
+        bufferingTotalMilliseconds = 0
         autoPausedForCacheFloor = false
         videoDisabledForBackground = false
         refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
@@ -442,6 +455,14 @@ final class MPVPlayer {
         isPlaying = autoplay
         isLoading = true
         currentURL = url
+        lastTelemetryFrameDrops = 0
+        lastTelemetryDecoderDrops = 0
+        lastTelemetryMistimed = 0
+        telemetryNetworkWarns = 0
+        telemetryDecodeWarns = 0
+        lastDrawableWidth = 0
+        lastDrawableHeight = 0
+        fileLoadedGeneration = 0
         updateDisplayPowerAssertion()
 
         // Fast-probe path is used for known local MPEG-TS sources (recording
@@ -508,12 +529,14 @@ final class MPVPlayer {
     func noteRenderedFrame(width: Int, height: Int) {
         guard currentURL != nil, firstRenderedLoadGeneration != loadGeneration else { return }
         firstRenderedLoadGeneration = loadGeneration
+        lastDrawableWidth = width
+        lastDrawableHeight = height
         let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
         if isLoading {
             isLoading = false
             updateDisplayPowerAssertion()
         }
-        AppLog.playback.info("mpv first-frame generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public) size=\(width, privacy: .public)x\(height, privacy: .public)")
+        AppLog.playback.info("mpv first-frame generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public) vo=\(width, privacy: .public)x\(height, privacy: .public) coded=\(self.mediaInfo.width, privacy: .public)x\(self.mediaInfo.height, privacy: .public) fileLoaded=\(self.fileLoadedGeneration == self.loadGeneration, privacy: .public)")
         // Upgrade readahead to full value now that playback is established.
         if let handle {
             setRuntimeProperty(handle, "demuxer-readahead-secs", "\(Tuning.demuxerReadAheadSeconds(for: bufferSeconds))")
@@ -563,7 +586,18 @@ final class MPVPlayer {
 
     func logPlaybackSyncSnapshot(_ label: String) {
         let stats = playbackStats
-        AppLog.playback.info("mpv sync \(label, privacy: .public) playing=\(self.isPlaying, privacy: .public) muted=\(self.isMuted, privacy: .public) cache=\(self.cacheSeconds, privacy: .public) time=\(self.timePos, privacy: .public) frameDrops=\(stats.frameDrops, privacy: .public) decoderDrops=\(stats.decoderFrameDrops, privacy: .public) delayed=\(stats.delayedFrames, privacy: .public) mistimed=\(stats.mistimedFrames, privacy: .public)")
+        let info = mediaInfo
+        let dropDelta = stats.frameDrops - lastTelemetryFrameDrops
+        let decoderDelta = stats.decoderFrameDrops - lastTelemetryDecoderDrops
+        let mistimedDelta = stats.mistimedFrames - lastTelemetryMistimed
+        lastTelemetryFrameDrops = stats.frameDrops
+        lastTelemetryDecoderDrops = stats.decoderFrameDrops
+        lastTelemetryMistimed = stats.mistimedFrames
+        let networkWarns = telemetryNetworkWarns
+        let decodeWarns = telemetryDecodeWarns
+        telemetryNetworkWarns = 0
+        telemetryDecodeWarns = 0
+        AppLog.playback.info("mpv sync \(label, privacy: .public) playing=\(self.isPlaying, privacy: .public) loading=\(self.isLoading, privacy: .public) buffering=\(self.isBuffering, privacy: .public) cacheFloorPause=\(self.autoPausedForCacheFloor, privacy: .public) muted=\(self.isMuted, privacy: .public) volume=\(self.volume, privacy: .public) cache=\(self.cacheSeconds, privacy: .public) time=\(self.timePos, privacy: .public) coded=\(info.width, privacy: .public)x\(info.height, privacy: .public) vo=\(self.lastDrawableWidth, privacy: .public)x\(self.lastDrawableHeight, privacy: .public) fps=\(info.fps, privacy: .public) vfFps=\(stats.estimatedFps, privacy: .public) vcodec=\(info.videoCodec, privacy: .public) acodec=\(info.audioCodec, privacy: .public) ach=\(info.audioChannels, privacy: .public) hwdec=\(info.hwdec, privacy: .public) vbr=\(stats.videoBitrateBps, privacy: .public) abr=\(stats.audioBitrateBps, privacy: .public) frameDrops=\(stats.frameDrops, privacy: .public) dropDelta=\(dropDelta, privacy: .public) decoderDrops=\(stats.decoderFrameDrops, privacy: .public) decoderDelta=\(decoderDelta, privacy: .public) delayed=\(stats.delayedFrames, privacy: .public) mistimed=\(stats.mistimedFrames, privacy: .public) mistimedDelta=\(mistimedDelta, privacy: .public) netWarns=\(networkWarns, privacy: .public) decodeWarns=\(decodeWarns, privacy: .public)")
     }
 
     func play() {
@@ -585,7 +619,7 @@ final class MPVPlayer {
         playbackRequested = false
         command(handle, ["stop"])
         isPlaying = false
-        isBuffering = false
+        updateBufferingState(false, source: "stop")
         isLoading = false
         loadStartedAt = nil
         firstRenderedLoadGeneration = loadGeneration
@@ -634,7 +668,7 @@ final class MPVPlayer {
         duration = 0
         isSeekable = false
         cacheSeconds = 0
-        isBuffering = false
+        updateBufferingState(false, source: "reuse")
         isLoading = false
         autoPausedForCacheFloor = false
         videoDisabledForBackground = false
@@ -1113,6 +1147,7 @@ final class MPVPlayer {
                 AppLog.playback.debug("mpv start-file")
             case MPV_EVENT_FILE_LOADED:
                 errorMessage = nil
+                fileLoadedGeneration = loadGeneration
                 setState(\.isLoading, false)
                 let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
                 AppLog.playback.info("mpv file-loaded generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
@@ -1141,7 +1176,7 @@ final class MPVPlayer {
 
     private func handleEndFileEvent(_ event: mpv_event_end_file) {
         setState(\.isPlaying, false)
-        setState(\.isBuffering, false)
+        updateBufferingState(false, source: "end-file")
         setState(\.isLoading, false)
         updateDisplayPowerAssertion()
 
@@ -1202,21 +1237,30 @@ final class MPVPlayer {
 
         guard !message.isEmpty else { return }
 
+        let category = Self.streamQualityCategory(for: message)
+        switch category {
+        case "network", "hls", "transport":
+            telemetryNetworkWarns += 1
+        case "decode":
+            telemetryDecodeWarns += 1
+        default:
+            break
+        }
+
+        let key = Self.suppressionKey(for: message)
         let now = Date()
-        if var suppression = mpvLogSuppression[message],
+        if var suppression = mpvLogSuppression[key],
            now.timeIntervalSince(suppression.lastEmittedAt) < 2 {
             suppression.suppressedCount += 1
-            mpvLogSuppression[message] = suppression
+            mpvLogSuppression[key] = suppression
             return
         }
 
-        if let suppression = mpvLogSuppression[message], suppression.suppressedCount > 0 {
-            let category = Self.streamQualityCategory(for: message)
+        if let suppression = mpvLogSuppression[key], suppression.suppressedCount > 0 {
             AppLog.playback.debug("mpv suppressed repeated warning category=\(category, privacy: .public) count=\(suppression.suppressedCount, privacy: .public) message=\(message, privacy: .public)")
         }
 
-        mpvLogSuppression[message] = MPVLogSuppression(lastEmittedAt: now, suppressedCount: 0)
-        let category = Self.streamQualityCategory(for: message)
+        mpvLogSuppression[key] = MPVLogSuppression(lastEmittedAt: now, suppressedCount: 0)
         AppLog.playback.warning("mpv category=\(category, privacy: .public) \(message, privacy: .public)")
 
         if let issue = Self.streamIssue(for: message) {
@@ -1284,9 +1328,19 @@ final class MPVPlayer {
         return nil
     }
 
+    private static func suppressionKey(for message: String) -> String {
+        let lowercased = message.lowercased()
+        if lowercased.contains("stream ends prematurely") {
+            return "https: Stream ends prematurely"
+        }
+        return message
+    }
+
     private static func streamQualityCategory(for message: String) -> String {
         let lowercased = message.lowercased()
-        if lowercased.contains("http error") ||
+        if lowercased.contains("stream ends prematurely") ||
+            lowercased.contains("error reading packet") ||
+            lowercased.contains("http error") ||
             lowercased.contains("server returned") ||
             lowercased.contains("connection") ||
             lowercased.contains("tls:") ||
@@ -1300,12 +1354,17 @@ final class MPVPlayer {
         if lowercased.contains("mpegts:") || lowercased.contains("packet corrupt") || lowercased.contains("invalid audio pts") {
             return "transport"
         }
-        if lowercased.contains("h264:") || lowercased.contains("no frame") || lowercased.contains("non-existing pps") {
+        if lowercased.contains("h264:") ||
+            lowercased.contains("hevc:") ||
+            lowercased.contains("nalu") ||
+            lowercased.contains("no frame") ||
+            lowercased.contains("non-existing pps") {
             return "decode"
         }
         if lowercased.contains("desynchronisation") ||
             lowercased.contains("audio/video") ||
-            lowercased.contains("audio device underrun") {
+            lowercased.contains("audio device underrun") ||
+            lowercased.contains("channel layout") {
             return "av-sync"
         }
         return "mpv"
@@ -1552,7 +1611,7 @@ final class MPVPlayer {
             setApproxState(\.cacheSeconds, cacheSeconds, epsilon: Tuning.cacheEpsilon)
         }
         if let isBuffering = pending.isBuffering {
-            setState(\.isBuffering, isBuffering)
+            updateBufferingState(isBuffering, source: "mpv")
         }
         if let volume = pending.volume {
             setApproxState(\.volume, volume, epsilon: Tuning.stateEpsilon)
@@ -1608,6 +1667,25 @@ final class MPVPlayer {
         updateDisplayPowerAssertion()
     }
 
+    private func updateBufferingState(_ buffering: Bool, source: String) {
+        guard isBuffering != buffering else { return }
+        setState(\.isBuffering, buffering)
+
+        let now = ContinuousClock.now
+        if buffering {
+            bufferingStartedAt = now
+            bufferingEventCount += 1
+            AppLog.playback.warning("buffering begin generation=\(self.loadGeneration, privacy: .public) source=\(source, privacy: .public) event=\(self.bufferingEventCount, privacy: .public) cache=\(self.cacheSeconds, privacy: .public) time=\(self.timePos, privacy: .public) loading=\(self.isLoading, privacy: .public)")
+            return
+        }
+
+        guard let bufferingStartedAt else { return }
+        let elapsedMilliseconds = AppLog.elapsedMilliseconds(since: bufferingStartedAt, now: now)
+        self.bufferingStartedAt = nil
+        bufferingTotalMilliseconds += elapsedMilliseconds
+        AppLog.playback.info("buffering end generation=\(self.loadGeneration, privacy: .public) source=\(source, privacy: .public) durationMs=\(elapsedMilliseconds, privacy: .public) totalMs=\(self.bufferingTotalMilliseconds, privacy: .public) events=\(self.bufferingEventCount, privacy: .public) cache=\(self.cacheSeconds, privacy: .public) time=\(self.timePos, privacy: .public)")
+    }
+
     private func maintainLiveCacheFloor(cacheSeconds: Double) {
         guard currentURL?.isFileURL == false,
               !isLoading,
@@ -1618,7 +1696,7 @@ final class MPVPlayer {
             guard cacheSeconds >= activeCachePauseResumeSeconds else { return }
             autoPausedForCacheFloor = false
             setFlag("pause", false)
-            setState(\.isBuffering, false)
+            updateBufferingState(false, source: "cache-floor")
             refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
             updateDisplayPowerAssertion()
             AppLog.playback.info("cache floor resume cache=\(cacheSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
@@ -1628,7 +1706,7 @@ final class MPVPlayer {
         guard isPlaying, cacheSeconds < activeCachePauseFloorSeconds else { return }
         autoPausedForCacheFloor = true
         setFlag("pause", true)
-        setState(\.isBuffering, true)
+        updateBufferingState(true, source: "cache-floor")
         refreshPlaybackTuningStats(autoPausedForCacheFloor: true)
         updateDisplayPowerAssertion()
         AppLog.playback.warning("cache floor pause cache=\(cacheSeconds, privacy: .public) floor=\(self.activeCachePauseFloorSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
