@@ -15,6 +15,7 @@ struct ContentView: View {
     @State private var sportsMatchingChannels: [Channel] = []
     @State private var sportsMatchingCatalogVersion = 0
     @State private var sportsMatchingUsesSmart = false
+    @State private var sportsMatchingSourceVersion = -1
     @State private var sportsQualityCache: [String: StreamMatchQuality] = [:]
     @State private var sportsQualityProbeVersion = -1
     @State private var sportsQualityCatalogVersion = -1
@@ -135,7 +136,12 @@ struct ContentView: View {
                 activeChannels: viewModel.channels, activePrograms: viewModel.programs,
                 activeCatalogVersion: viewModel.channelCatalogVersion)
             : (channels: viewModel.channels, programs: viewModel.programs)
-        let unchanged = sportsMatchingUsesSmart == viewModel.isSmartSportsActive
+        // Every assignment to an ordinary account's channels bumps its catalog
+        // version, so guide publications skip the per-channel comparison.
+        let sameSourceCatalog = !viewModel.isSmartSportsActive && !sportsMatchingUsesSmart
+            && sportsMatchingSourceVersion == viewModel.channelCatalogVersion
+        sportsMatchingSourceVersion = viewModel.channelCatalogVersion
+        let unchanged = sameSourceCatalog || sportsMatchingUsesSmart == viewModel.isSmartSportsActive
             && sportsMatchingChannels.count == snapshot.channels.count
             && zip(sportsMatchingChannels, snapshot.channels).allSatisfy { lhs, rhs in
                 lhs.id == rhs.id && lhs.name == rhs.name && lhs.group == rhs.group

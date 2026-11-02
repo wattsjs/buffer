@@ -1505,11 +1505,13 @@ class EPGViewModel {
             guard let self else { throw CancellationError() }
             try self.checkSync(id, generation: generation, config: config)
             let base = self.programs
+            let channels = self.channels
             let now = Date()
-            let starts = GuideHistory.retentionStarts(channels: self.channels, now: now)
             let pruneAll = stage == "current"
             let worker = Task.detached(priority: .userInitiated) {
                 let started = ContinuousClock.now
+                // A full channel scan per publication; keep it off the main actor.
+                let starts = GuideHistory.retentionStarts(channels: channels, now: now)
                 let organized = Self.organize(incoming)
                 var delta: [String: [EPGProgram]] = [:]
                 let ids = pruneAll ? Set(base.keys).union(organized.keys) : Set(organized.keys)
@@ -1571,22 +1573,55 @@ class EPGViewModel {
         let started = ContinuousClock.now
         let progress = guideProgressBuffer ?? GuideProgressBuffer()
         guideProgressBuffer = progress
+        // Batches arrive several times a second on the main actor, so the
+        // catalog is indexed once and rewind candidates shrink as guides are
+        // attempted or found covered, instead of rescanning every channel.
+        var indexedCatalogVersion: Int?
+        var guidedChannelsByID: [String: [(offset: Int, channel: Channel)]] = [:]
+        var rewindCandidates: [(offset: Int, channel: Channel)] = []
         while true {
             try checkSync(id, generation: generation, config: config)
+            if indexedCatalogVersion != channelCatalogVersion {
+                indexedCatalogVersion = channelCatalogVersion
+                guidedChannelsByID = [:]
+                rewindCandidates = []
+                for (offset, channel) in channels.enumerated() where channel.epgChannelID != nil {
+                    guidedChannelsByID[channel.id, default: []].append((offset, channel))
+                    if channel.supportsRewind { rewindCandidates.append((offset, channel)) }
+                }
+            }
             let now = Date()
             var priorities = visibleGuidePriorityIDs
             if priorities.isEmpty { priorities.formUnion(filteredChannels.prefix(24).map(\.id)) }
-            let viewportGuideIDs = Set(channels.filter { priorities.contains($0.id) }.compactMap(\.epgChannelID))
+            let viewportGuideIDs = Set(priorities.flatMap { guidedChannelsByID[$0] ?? [] }.compactMap(\.channel.epgChannelID))
             priorities.formUnion(favoriteChannelIDs)
             priorities.formUnion(recentChannelIDs)
-            let priorityGuideIDs = Set(channels.filter { priorities.contains($0.id) }.compactMap(\.epgChannelID))
+            let priorityChannels = priorities.flatMap { guidedChannelsByID[$0] ?? [] }
+            let priorityGuideIDs = Set(priorityChannels.compactMap(\.channel.epgChannelID))
             var byGuide: [String: (offset: Int, channel: Channel)] = [:]
-            for (offset, channel) in channels.enumerated() {
-                guard let epgID = channel.epgChannelID, !attempted.contains(epgID),
-                      !priorityOnly || priorityGuideIDs.contains(epgID),
-                      channel.supportsRewind || priorities.contains(channel.id), needsGuideCoverage(for: channel, now: now) else { continue }
-                if let existing = byGuide[epgID], (existing.channel.catchup?.days ?? 0) >= (channel.catchup?.days ?? 0) { continue }
-                byGuide[epgID] = (offset, channel)
+            // Keeps the earliest channel among those with the longest catchup.
+            func consider(_ candidate: (offset: Int, channel: Channel), guide epgID: String) {
+                if let existing = byGuide[epgID] {
+                    let existingDays = existing.channel.catchup?.days ?? 0
+                    let days = candidate.channel.catchup?.days ?? 0
+                    guard days > existingDays || (days == existingDays && candidate.offset < existing.offset) else { return }
+                }
+                byGuide[epgID] = candidate
+            }
+            rewindCandidates.removeAll { candidate in
+                guard let epgID = candidate.channel.epgChannelID, !attempted.contains(epgID) else { return true }
+                guard !priorityOnly || priorityGuideIDs.contains(epgID) else { return false }
+                guard needsGuideCoverage(for: candidate.channel, now: now) else {
+                    // A failed attempt may become due again during this run.
+                    return guideAttempts[epgID] == nil
+                }
+                consider(candidate, guide: epgID)
+                return false
+            }
+            for candidate in priorityChannels where !candidate.channel.supportsRewind {
+                guard let epgID = candidate.channel.epgChannelID, !attempted.contains(epgID),
+                      needsGuideCoverage(for: candidate.channel, now: now) else { continue }
+                consider(candidate, guide: epgID)
             }
             let ordered = byGuide.values.sorted {
                 let leftID = $0.channel.epgChannelID ?? ""
