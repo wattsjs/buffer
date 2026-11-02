@@ -1,6 +1,7 @@
 import CryptoKit
 import Synchronization
 import Foundation
+import OSLog
 
 nonisolated enum DataCache {
     // Enqueue snapshots at publication time. A detached task per write can
