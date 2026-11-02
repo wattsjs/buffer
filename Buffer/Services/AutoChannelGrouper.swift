@@ -1138,7 +1138,7 @@ nonisolated struct ByteInterner: Sendable {
     mutating func intern(_ bytes: UnsafeBufferPointer<UInt8>) -> UInt32 {
         let h = Self.hash(bytes)
         let tag = UInt32(truncatingIfNeeded: h >> 32)
-        var mask = slots.count - 1
+        let mask = slots.count - 1
         var slot = Int(truncatingIfNeeded: h) & mask
         while true {
             let entry = slots[slot]
@@ -1152,10 +1152,8 @@ nonisolated struct ByteInterner: Sendable {
         offsets.append(UInt32(blob.count))
         hashes.append(tag)
         if hashes.count * 2 > slots.count {
-            grow()
-            mask = slots.count - 1
-            slot = Int(truncatingIfNeeded: h) & mask
-            while slots[slot] != 0 { slot = (slot + 1) & mask }
+            grow()   // rehashes every token, the new one included
+            return token
         }
         slots[slot] = token + 1
         return token

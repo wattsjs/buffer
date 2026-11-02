@@ -97,6 +97,60 @@ import Foundation
         precondition(!SmartChannelFilter(isEnabled: true).allows(region: "US", category: "Sports"), "Unlisted region allowed")
         precondition(SmartChannelFilter().allows(region: "FR", category: "News"), "Disabled filter rejected")
 
-        print("PASS auto channel grouping: region/quality normalisation, distinct timeshift/region, event-slot exclusion, cross-source feeds, stable IDs, curated precedence, language regions, region/category filter, inventory, guide-ID merging, country names, single-source sports")
+        // Flat containers behind the grouper.
+        var interner = ByteInterner()
+        func intern(_ text: String) -> UInt32 { Array(text.utf8).withUnsafeBufferPointer { interner.intern($0) } }
+        let skyToken = intern("sky sports"), emptyToken = intern("")
+        precondition(intern("sky sports") == skyToken && intern("") == emptyToken && skyToken != emptyToken)
+        var tokens: [UInt32] = []
+        for i in 0..<5_000 { tokens.append(intern("name \(i)")) }
+        precondition(Set(tokens).count == 5_000 && interner.count == 5_002, "Interner grew without collisions")
+        for i in stride(from: 0, to: 5_000, by: 97) { precondition(intern("name \(i)") == tokens[i] && interner.string(tokens[i]) == "name \(i)") }
+        precondition(Array("name 7".utf8).withUnsafeBufferPointer { interner.find($0) } == tokens[7])
+        precondition(Array("absent".utf8).withUnsafeBufferPointer { interner.find($0) } == nil)
+        precondition(interner.dashed(skyToken) == "sky-sports")
+        let (aToken, bToken, accented, plain) = (intern("a"), intern("b"), intern("é"), intern("e"))
+        precondition(interner.compare(aToken, bToken) < 0 && interner.compare(accented, plain) > 0
+            && interner.compare(aToken, aToken) == 0, "Token order follows String order")
+
+        var map = UInt64Map(capacity: 4)
+        var inserted = 0
+        for key in 0..<10_000 as Range<UInt64> {
+            precondition(map.insert(key &* 0x9E37_79B9, next: UInt32(key)) { _ in inserted += 1 } == UInt32(key))
+        }
+        precondition(inserted == 10_000 && map.insert(5 &* 0x9E37_79B9, next: 99) { _ in inserted += 1 } == 5 && inserted == 10_000)
+        precondition(map.find(42 &* 0x9E37_79B9) == 42 && map.find(UInt64(1) << 60) == nil)
+
+        var evens = Bitset(count: 200), low = Bitset(count: 200)
+        for i in stride(from: 0, to: 200, by: 2) { evens.insert(i) }
+        for i in 0..<64 { low.insert(i) }
+        precondition(evens.popcount == 100 && (evens & low).popcount == 32 && (evens | low).popcount == 132)
+        evens.remove(198)
+        precondition(!evens.contains(198) && evens.contains(196) && !evens.contains(199))
+
+        let table = PackedWordTable([(AutoChannelGrouper.Words.pack("hd"), 2), (AutoChannelGrouper.Words.pack("hd"), 8),
+                                     (AutoChannelGrouper.Words.pack("raw"), 8)])
+        precondition(table[AutoChannelGrouper.Words.pack("hd")] == 10 && table[AutoChannelGrouper.Words.pack("raw")] == 8
+            && table[AutoChannelGrouper.Words.pack("sd")] == 0 && table[0] == 0, "Packed vocabulary ORs and misses")
+        precondition(AutoChannelGrouper.Words.pack("HD") == AutoChannelGrouper.Words.pack("hd")
+            && AutoChannelGrouper.Words.pack("abcdefghijk") == 0 && AutoChannelGrouper.Words.pack("a.b") == 0,
+            "Packing is case-insensitive and rejects long or foreign words")
+
+        // The filter-independent index answers several filters.
+        let index = AutoChannelGrouper.GroupIndex(snapshots)
+        precondition(index.feeds(excluding: [], minimumSources: 2, filter: .init()).map(\.id) == feeds.map(\.id))
+        var ukOnly = SmartChannelFilter(isEnabled: true)
+        ukOnly.regions = ["UK": .categories(["Sports"])]
+        precondition(index.feeds(excluding: [], minimumSources: 2, filter: ukOnly).map(\.name) == ["Only Here", "Sky Sports Main Event"])
+
+        // Rank columns pack the source ordinal above the variant ordinal.
+        let catalog = SmartSportsDefinition(schemaVersion: 1, playlistID: "p", name: "n", provenance: "t",
+                                            feeds: feeds, heldEndpoints: []).reconcile(snapshots: [])
+        let columns = VariantRankColumns(feeds: catalog.feeds)
+        precondition(columns.handles.count == catalog.feeds.reduce(0) { $0 + $1.variants.count }
+            && columns.handles.enumerated().allSatisfy { UInt32(truncatingIfNeeded: $1) == UInt32($0) }
+            && Set(columns.handles.map { $0 >> 32 }).count == 3, "Handles carry source and ordinal")
+
+        print("PASS auto channel grouping: region/quality normalisation, distinct timeshift/region, event-slot exclusion, cross-source feeds, stable IDs, curated precedence, language regions, region/category filter, inventory, guide-ID merging, country names, single-source sports, interner/map/bitset/packed vocabulary, rank handles")
     }
 }
