@@ -26,11 +26,12 @@ private final class MPVPlayerPool {
 
     @MainActor
     func release(_ p: MPVPlayer) {
-        p.prepareForReuse()
-        if idle.count < maxIdle {
-            idle.append(p)
+        // A handle must not be assigned to another account while an old
+        // asynchronous STOP is still closing its upstream connection.
+        p.stopWhenBackendIdle { [self, p] in
+            p.prepareForReuse()
+            if idle.count < maxIdle { idle.append(p) }
         }
-        // else: drop the reference; MPVPlayer.deinit will call destroy()
     }
 
     @MainActor
@@ -48,13 +49,14 @@ private enum PlayerStartupTiming {
     private static var openStartedAt: [String: Date] = [:]
 
     static func noteOpen(channel: Channel) {
-        openStartedAt[channel.id] = Date()
+        openStartedAt[channel.preferenceIdentity] = Date()
         AppLog.playback.info("player open-request channel=\(channel.name, privacy: .public) id=\(channel.id, privacy: .public)")
     }
 
     static func noteFirstFrame(channel: Channel) {
-        guard let startedAt = openStartedAt.removeValue(forKey: channel.id) else { return }
+        guard let startedAt = openStartedAt.removeValue(forKey: channel.preferenceIdentity) else { return }
         let elapsedMs = Int((Date().timeIntervalSince(startedAt) * 1000).rounded())
+        PerfMetrics.shared.record("playback.openToFirstFrameMs", Double(elapsedMs))
         AppLog.playback.info("player open-to-first-frame channel=\(channel.name, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
     }
 }
@@ -139,6 +141,14 @@ final class PlayerSlot: Identifiable {
     var currentProgram: EPGProgram?
     private(set) var playbackStreamHealth = StreamHealth()
     private(set) var recoveryErrorMessage: String?
+    private(set) var sourceChangeMessage: String?
+    var logicalChannelID: String { channel.sourceOwnership?.preferenceIdentity ?? channel.id }
+    @ObservationIgnored private var capacityLease: AccountCapacityLedger.Lease?
+    @ObservationIgnored private var sourceEpoch: UInt64 = 0
+    @ObservationIgnored private var liveAlternatives: [Channel] = []
+    @ObservationIgnored private var resolveLiveAlternative: ((SourceChannelIdentity) -> Channel?)?
+    @ObservationIgnored private var smartRecovery = SmartLiveRecoveryPolicy()
+    @ObservationIgnored private var isRetired = false
 
     /// Non-nil while this slot plays from the channel archive.
     private(set) var catchup: CatchupPlayback?
@@ -168,27 +178,41 @@ final class PlayerSlot: Identifiable {
         // teardown.
         let new = MPVPlayerPool.shared.acquire()
         attachCallbacks(to: new)
+        if isBackgroundPaused {
+            new.pauseBackgroundActivity()
+        } else {
+            // A handle recycled while asleep may have no state-poll timer.
+            new.resumeBackgroundActivity()
+        }
         _player = new
         return new
     }
 
     private func attachCallbacks(to player: MPVPlayer) {
+        let epoch = sourceEpoch
         player.onPlaybackEnded = { [weak self] reason in
-            self?.handlePlaybackEnded(reason)
+            guard let self, self.sourceEpoch == epoch, !self.isRetired else { return }
+            self.handlePlaybackEnded(reason)
         }
         player.onFileLoaded = { [weak self] in
-            self?.handleFileLoaded()
+            guard let self, self.sourceEpoch == epoch, !self.isRetired else { return }
+            self.handleFileLoaded()
         }
         player.onFirstFrame = { [weak self] in
-            self?.handleFirstFrame()
+            guard let self, self.sourceEpoch == epoch, !self.isRetired else { return }
+            self.handleFirstFrame()
         }
         player.onStreamIssue = { [weak self] issue in
-            self?.handleStreamIssue(issue)
+            guard let self, self.sourceEpoch == epoch, !self.isRetired else { return }
+            self.handleStreamIssue(issue)
         }
         player.onMediaInfoChanged = { [weak self] info in
-            guard let self else { return }
+            guard let self, self.sourceEpoch == epoch, !self.isRetired else { return }
+            // Archive metadata describes an archive URL, not whether this
+            // channel's live endpoint is currently available.
+            guard self.playbackMode != .catchup else { return }
             StreamProbeService.shared.recordPlaybackInfo(
-                channelID: self.channel.id,
+                channel: self.channel,
                 width: info.width,
                 height: info.height,
                 fps: info.fps,
@@ -216,16 +240,17 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var reconnectTask: Task<Void, Never>?
     @ObservationIgnored private var pendingReconnectIs509: Bool = false
     @ObservationIgnored private var firstFailureAt: Date?
-    @ObservationIgnored private var playbackWatchdog: Task<Void, Never>?
     @ObservationIgnored private var stallWatchdog: Task<Void, Never>?
     @ObservationIgnored private var playbackMode: PlaybackMode = .live
-    @ObservationIgnored private var lastObservedTimePos: Double = 0
-    @ObservationIgnored private var lastPlaybackProgressAt: Date?
-    @ObservationIgnored private var expectedStoppedEndFiles: Int = 0
+    @ObservationIgnored private var livenessMonitor: PlaybackLivenessMonitor?
     @ObservationIgnored private var lastReconnectAt: Date?
     @ObservationIgnored private var pendingOnDemandSeekSeconds: Double?
+    @ObservationIgnored private var pendingCatchupSeekSeconds: Double?
     @ObservationIgnored private var hasRenderedAnyFrame = false
     @ObservationIgnored private var lastTelemetrySnapshotAt: Date?
+    @ObservationIgnored private var lastEvidenceSample: (time: TimeInterval, position: Double, frames: Int, generation: Int)?
+    @ObservationIgnored private var observedHealthySeconds: Double = 0
+    @ObservationIgnored private var observedBufferingSeconds: Double = 0
 
     /// Tracks whether we have explicitly paused recovery Tasks + player for
     /// system sleep via AppLifecycleCoordinator. Prevents duplicate work on
@@ -233,29 +258,15 @@ final class PlayerSlot: Identifiable {
     @ObservationIgnored private var isBackgroundPaused = false
 
     /// After this long of continuous reconnect failures without a single
-    /// successful `FILE_LOADED`, surface an error to the user. The reconnect
-    /// task keeps running in the background — the banner auto-clears if a
-    /// later attempt gets a frame through.
+    /// sustained playback, surface an error to the user. The reconnect task
+    /// keeps running — a first frame clears the banner and observed healthy
+    /// progress resets the failure streak.
     @ObservationIgnored private let fatalReconnectWindow: TimeInterval = 60
     @ObservationIgnored private let startupFailureVisibleWindow: TimeInterval = 8
     @ObservationIgnored private let startupFailureSlowRetryWindow: TimeInterval = 12
     @ObservationIgnored private let startupFailureSlowRetryDelay: TimeInterval = 15
 
-    /// Seconds of continuous playback required before we consider the stream
-    /// "healthy" and reset the reconnect backoff counter.
-    @ObservationIgnored private let healthyPlaybackSeconds: Double = 5
-    /// If playback keeps claiming to be alive but `timePos` does not advance
-    /// for longer than these windows, treat it as a dead player and reload the
-    /// live source. This covers hangs that never surface as `END_FILE`.
-    @ObservationIgnored private let stalledWhileLoadingSeconds: TimeInterval = 15
-    @ObservationIgnored private let stalledWhileBufferingSeconds: TimeInterval = 12
-    @ObservationIgnored private let stalledWhilePlayingSeconds: TimeInterval = 6
-    @ObservationIgnored private let playbackProgressEpsilon: Double = 0.25
     @ObservationIgnored private let minimumImmediateReconnectSpacing: TimeInterval = 2
-    /// Forward-cache level below which warning-level stream issues escalate
-    /// to a full reload. Above this, ffmpeg's internal retries get to run
-    /// while playback continues uninterrupted from the cache.
-    @ObservationIgnored private let escalationCacheFloorSeconds: Double = 3
     @ObservationIgnored private let telemetrySnapshotInterval: TimeInterval = 10
     @ObservationIgnored private let slowRetryFailureWindow: TimeInterval = 60
     @ObservationIgnored private let slowRetryDelay: TimeInterval = 30
@@ -271,11 +282,8 @@ final class PlayerSlot: Identifiable {
     fileprivate func handlePlaybackEnded(_ reason: MPVEndReason) {
         switch reason {
         case .stopped:
-            // Initiated by us (new loadfile, teardown). Nothing to do.
-            if expectedStoppedEndFiles > 0 {
-                expectedStoppedEndFiles -= 1
-                return
-            }
+            // MPVPlayer filters replacement/obsolete item events by actual
+            // playlist entry. A STOP delivered here belongs to this load.
             cancelReconnect()
             return
         case .eof, .error, .http509:
@@ -304,16 +312,20 @@ final class PlayerSlot: Identifiable {
     }
 
     private func handleFileLoaded() {
-        lastObservedTimePos = player.timePos
-        lastPlaybackProgressAt = Date()
+        livenessMonitor = PlaybackLivenessMonitor(position: player.timePos, now: ProcessInfo.processInfo.systemUptime)
         player.clearReconnectingErrorMessage()
         if playbackMode == .onDemand, let seekSeconds = pendingOnDemandSeekSeconds {
             pendingOnDemandSeekSeconds = nil
             player.seek(to: seekSeconds)
         }
+        if playbackMode == .catchup, let seekSeconds = pendingCatchupSeekSeconds {
+            pendingCatchupSeekSeconds = nil
+            player.seek(to: seekSeconds)
+        }
     }
 
     private func handleFirstFrame() {
+        guard !player.startupTargetTimedOut else { return }
         hasRenderedAnyFrame = true
         clearRecoveryErrorMessage()
         endCatchupSwitching()
@@ -325,41 +337,10 @@ final class PlayerSlot: Identifiable {
         if let event = streamHealthEvent(for: issue) {
             playbackStreamHealth.record(event)
         }
-        guard reconnectTask == nil else { return }
-
-        let recoveryReason: MPVEndReason?
-        switch issue {
-        case .httpError(let message) where isHTTP509Message(message):
-            recoveryReason = .http509(message: message)
-        case .hlsReloadFailed, .httpError:
-            // ffmpeg keeps retrying playlist reloads and segment fetches
-            // (seg_max_retry) on its own while playback continues out of the
-            // forward cache — most of these warnings resolve with zero visible
-            // impact. Reloading immediately would throw that cache away and
-            // guarantee an interruption. Escalate only once the cache is
-            // nearly drained; the warnings repeat while the problem persists,
-            // so a failing stream still reconnects before mpv pauses. The
-            // stall watchdog and END_FILE remain the backstops for everything
-            // else.
-            if player.cacheSeconds < escalationCacheFloorSeconds {
-                recoveryReason = .error(
-                    code: 0,
-                    message: "stream network recovery: \(issue.recoveryMessage)"
-                )
-            } else {
-                AppLog.playback.info("Stream issue absorbed by cache channel=\(self.channel.name, privacy: .public) cache=\(self.player.cacheSeconds, privacy: .public)")
-                recoveryReason = nil
-            }
-        case .reconnecting:
-            // mpv's libavformat reconnect is a lightweight segment-level
-            // recovery path. Escalating these warnings to `loadfile replace`
-            // interrupts otherwise healthy playback; the stall watchdog will
-            // still reload if the playhead actually stops advancing.
-            recoveryReason = nil
-        }
-
-        guard let reason = recoveryReason else { return }
-        scheduleReconnect(reason: reason, immediate: true)
+        // A warning (including 509) is not a terminal transport failure. HLS
+        // can keep rendering cached segments while ffmpeg retries internally.
+        // Replacing the load here discards that media and may amplify provider
+        // throttling. END_FILE and measured lack of progress own escalation.
     }
 
     private func isHTTP509Message(_ message: String) -> Bool {
@@ -381,6 +362,7 @@ final class PlayerSlot: Identifiable {
     }
 
     private func scheduleReconnect(reason: MPVEndReason, immediate: Bool = false) {
+        guard playbackMode == .live, !isBackgroundPaused, !isRetired else { return }
         let is509 = if case .http509 = reason { true } else { false }
         if reconnectTask != nil {
             guard is509, !pendingReconnectIs509 else {
@@ -398,9 +380,8 @@ final class PlayerSlot: Identifiable {
 
         let attempt = reconnectAttempt
         reconnectAttempt += 1
+        smartRecovery.noteFailure(now: ProcessInfo.processInfo.systemUptime)
 
-        playbackWatchdog?.cancel()
-        playbackWatchdog = nil
         stallWatchdog?.cancel()
         stallWatchdog = nil
 
@@ -466,102 +447,81 @@ final class PlayerSlot: Identifiable {
     }
 
     private func performReconnect() {
-        guard playbackMode == .live else { return }
+        guard playbackMode == .live, !isBackgroundPaused, !isRetired else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let current = physicalKey(channel)
+        let eligibleAlternatives = liveAlternatives.compactMap { candidate -> Channel? in
+            guard let identity = candidate.sourceChannelIdentity else { return nil }
+            let resolved = resolveLiveAlternative.map { $0(identity) } ?? candidate
+            guard let resolved, !resolved.isOnDemand,
+                  resolved.sourceOwnership?.logicalChannelID == channel.sourceOwnership?.logicalChannelID,
+                  resolved.sourceChannelIdentity == identity else { return nil }
+            return resolved
+        }
+        if case .alternate(let key) = smartRecovery.decision(
+            current: current, alternatives: eligibleAlternatives.map(physicalKey), now: now,
+            playbackRequested: player.wantsPlayback, suspended: isBackgroundPaused,
+            epochMatches: true
+        ), let alternate = eligibleAlternatives.first(where: { physicalKey($0) == key }) {
+            switchLiveSource(to: alternate, now: now)
+            return
+        }
         AppLog.playback.info("Performing reconnect channel=\(self.channel.name, privacy: .public)")
         playbackStreamHealth.record(.recoveryReload)
         lastReconnectAt = Date()
         reconnectTask = nil
         pendingReconnectIs509 = false
         stopRecoveryTasks(resetFailureWindow: false)
-        noteExpectedStopIfReplacingCurrentItem()
         // The stream just failed — a cached CDN edge assignment is a prime
         // suspect (expired token, dead edge). Force a fresh resolution.
         MPVPlayer.invalidateResolvedURL(for: channel.streamURL)
-        player.loadURL(channel.streamURL, autoplay: true)
+        player.loadURL(channel.streamURL, autoplay: player.wantsPlayback, live: true)
         armRecoveryWatchdogs()
-    }
-
-    /// Watches timePos; once playback has advanced by `healthyPlaybackSeconds`
-    /// since the last reload, declare the session healthy and reset backoff.
-    private func armHealthyPlaybackWatchdog() {
-        playbackWatchdog?.cancel()
-        let startTime = player.timePos
-        playbackWatchdog = Task { @MainActor [weak self] in
-            let deadline = Date().addingTimeInterval(30)
-            while Date() < deadline {
-                try? await Task.sleep(for: .milliseconds(500))
-                guard !Task.isCancelled, let self else { return }
-                if self.player.isPlaying,
-                   self.player.timePos - startTime >= self.healthyPlaybackSeconds {
-                    self.reconnectAttempt = 0
-                    self.firstFailureAt = nil
-                    self.clearRecoveryErrorMessage()
-                    return
-                }
-            }
-        }
     }
 
     private func armStallWatchdog() {
         stallWatchdog?.cancel()
-        lastObservedTimePos = player.timePos
-        lastPlaybackProgressAt = Date()
+        livenessMonitor = PlaybackLivenessMonitor(position: player.timePos, now: ProcessInfo.processInfo.systemUptime)
 
         stallWatchdog = Task { @MainActor [weak self] in
             while true {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, let self else { return }
-                guard self.playbackMode == .live else { return }
+                guard self.playbackMode == .live, !self.isBackgroundPaused else { return }
+                guard self.player.focusedScaling else { return }
 
-                // Background thumbnail guard (post-pool multi-view robustness):
-                // Throttled slots (focusedScaling=false) have vid disabled and
-                // should not drive 1 Hz stall detection or cause spurious
-                // reconnects while the pane is tiny. Promotion re-arms via
-                // applySlotPolicies. This + suspendBackgroundRecovery cuts
-                // active watchdogs from 9 to 1 in full grid.
-                if !self.player.focusedScaling {
-                    try? await Task.sleep(for: .seconds(4))
-                    continue
-                }
+                self.samplePlaybackEvidence()
                 self.emitPlaybackTelemetryIfNeeded()
-                let currentTimePos = self.player.timePos
-                if currentTimePos - self.lastObservedTimePos >= self.playbackProgressEpsilon {
-                    self.lastObservedTimePos = currentTimePos
-                    self.lastPlaybackProgressAt = Date()
+                if self.player.startupHoldActive {
+                    self.livenessMonitor = PlaybackLivenessMonitor(position: self.player.timePos, now: ProcessInfo.processInfo.systemUptime)
                     continue
                 }
-
-                self.lastObservedTimePos = currentTimePos
-
-                if !self.player.isPlaying,
-                   !self.player.isBuffering,
-                   !self.player.isLoading {
-                    self.lastPlaybackProgressAt = Date()
-                    continue
-                }
-
-                let threshold: TimeInterval
-                if self.player.isLoading {
-                    threshold = self.stalledWhileLoadingSeconds
-                } else if self.player.isBuffering {
-                    threshold = self.stalledWhileBufferingSeconds
-                } else {
-                    threshold = self.stalledWhilePlayingSeconds
-                }
-
-                let lastProgressAt = self.lastPlaybackProgressAt ?? Date()
-                if Date().timeIntervalSince(lastProgressAt) < threshold {
-                    continue
-                }
-
-                let reason: MPVEndReason = .error(
-                    code: 0,
-                    message: self.player.isBuffering || self.player.isLoading
-                        ? "playback stalled while buffering"
-                        : "playback stalled"
+                let signal = self.livenessMonitor?.sample(
+                    position: self.player.timePos,
+                    now: ProcessInfo.processInfo.systemUptime,
+                    playbackRequested: self.player.wantsPlayback,
+                    isPlaying: self.player.isPlaying,
+                    isLoading: self.player.isLoading,
+                    isBuffering: self.player.isBuffering
                 )
-                self.scheduleReconnect(reason: reason, immediate: true)
-                return
+                switch signal {
+                case .healthy:
+                    self.smartRecovery.noteHealthy()
+                    self.reconnectAttempt = 0
+                    self.firstFailureAt = nil
+                    self.clearRecoveryErrorMessage()
+                case .stalled:
+                    let reason: MPVEndReason = .error(
+                        code: 0,
+                        message: self.player.isBuffering || self.player.isLoading
+                            ? "playback stalled while buffering"
+                            : "playback stalled"
+                    )
+                    self.scheduleReconnect(reason: reason, immediate: true)
+                    return
+                case nil:
+                    break
+                }
             }
         }
     }
@@ -573,29 +533,70 @@ final class PlayerSlot: Identifiable {
             return
         }
         lastTelemetrySnapshotAt = now
+        if allowsOrdinaryLiveEvidence {
+            StreamProbeService.shared.recordPlaybackHealth(channel: channel, health: playbackStreamHealth,
+                healthySeconds: observedHealthySeconds, bufferingSeconds: observedBufferingSeconds, at: now,
+                ordinaryLive: true)
+            StreamProbeService.shared.recordPlaybackBitrate(channel: channel, bitsPerSecond: player.playbackStats.videoBitrateBps)
+        }
+        observedHealthySeconds = 0
+        observedBufferingSeconds = 0
         let health = playbackStreamHealth
         AppLog.playback.info("telemetry heartbeat channel=\(self.channel.name, privacy: .public) mode=\(String(describing: self.playbackMode), privacy: .public) health=\(health.statusLabel, privacy: .public) reconnects=\(health.reconnectCount, privacy: .public) http509=\(health.http509Count, privacy: .public) recoveryReloads=\(health.recoveryReloadCount, privacy: .public) playlistFails=\(health.playlistReloadFailureCount, privacy: .public)")
         player.logPlaybackSyncSnapshot("heartbeat")
     }
 
+    private func samplePlaybackEvidence() {
+        guard allowsOrdinaryLiveEvidence else {
+            lastEvidenceSample = nil
+            observedHealthySeconds = 0
+            observedBufferingSeconds = 0
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let position = player.timePos
+        let frames = player.telemetryRenderedFrameCount
+        let generation = player.telemetryLoadGeneration
+        defer { lastEvidenceSample = (now, position, frames, generation) }
+        guard let prior = lastEvidenceSample, player.wantsPlayback, !isBackgroundPaused,
+              prior.generation == generation,
+              position.isFinite, prior.position.isFinite else { return }
+        let elapsed = now - prior.time
+        guard elapsed > 0, elapsed <= 2.5 else { return }
+        if player.isBuffering { observedBufferingSeconds += elapsed }
+        let delta = position - prior.position
+        if player.isPlaying, !player.isLoading, !player.isBuffering,
+           (player.mediaInfo.width <= 0 || frames > prior.frames),
+           delta >= 0.25, delta <= max(5, elapsed * 3) { observedHealthySeconds += elapsed }
+    }
+
+    var allowsOrdinaryLiveEvidence: Bool {
+        guard playbackMode == .live, !channel.isOnDemand, !isBackgroundPaused else { return false }
+#if DEBUG
+        guard !PlaybackValidation.isEnabled, !SavedPlaybackScenario.isCapturing,
+              !player.usesArchiveTimestampRecovery, !player.usesStartupReserve,
+              !player.startupTargetEnabled, !player.nativeCacheOnlyEnabled,
+              !player.liveAnalysisEnabled else { return false }
+#endif
+        return true
+    }
+
     private func armRecoveryWatchdogs() {
-        armHealthyPlaybackWatchdog()
+        guard playbackMode == .live, !isBackgroundPaused, player.focusedScaling else { return }
         armStallWatchdog()
     }
 
-    /// Suspends the per-slot stall/healthy watchdogs (but leaves any
+    /// Suspends the per-slot progress watchdog (but leaves any
     /// in-flight reconnectTask). Called for non-focused multi-view
     /// thumbnails so we don't have N× 1 Hz Tasks + spurious reconnects
     /// while the player is intentionally throttled (vid=no, paused).
     /// On focus promotion we selectively re-arm only the active pane.
-    /// This + focusedScaling guard inside the loops tames the "timers
-    /// exploding in multi-view" problem after pool work.
+    /// Healthy and stalled decisions share one timer in the focused slot.
     func suspendBackgroundRecovery() {
-        playbackWatchdog?.cancel()
-        playbackWatchdog = nil
         stallWatchdog?.cancel()
         stallWatchdog = nil
-        lastPlaybackProgressAt = nil
+        livenessMonitor = nil
+        lastEvidenceSample = nil
         // Intentionally do *not* cancel reconnectTask here; a pending
         // silent recovery for a thumbnail can complete and keep the slot
         // "warm" for later promotion. Full stop only via cancelReconnect.
@@ -603,7 +604,7 @@ final class PlayerSlot: Identifiable {
 
     /// Re-arms recovery only for the now-focused live slot (idempotent).
     func ensureRecoveryWatchdogsArmedForFocus() {
-        guard playbackMode == .live else { return }
+        guard playbackMode == .live, !isBackgroundPaused, reconnectTask == nil else { return }
         // Only (re)arm if we don't already have active ones; avoids
         // duplicate Tasks on rapid focus toggles.
         if stallWatchdog == nil {
@@ -615,11 +616,9 @@ final class PlayerSlot: Identifiable {
         reconnectTask?.cancel()
         reconnectTask = nil
         pendingReconnectIs509 = false
-        playbackWatchdog?.cancel()
-        playbackWatchdog = nil
         stallWatchdog?.cancel()
         stallWatchdog = nil
-        lastPlaybackProgressAt = nil
+        livenessMonitor = nil
 
         if resetFailureWindow {
             reconnectAttempt = 0
@@ -638,12 +637,6 @@ final class PlayerSlot: Identifiable {
     private func clearRecoveryErrorMessage() {
         recoveryErrorMessage = nil
         _player?.clearReconnectingErrorMessage()
-    }
-
-    private func noteExpectedStopIfReplacingCurrentItem() {
-        if player.currentURL != nil {
-            expectedStoppedEndFiles += 1
-        }
     }
 
     func cancelReconnect() {
@@ -668,14 +661,11 @@ final class PlayerSlot: Identifiable {
         reconnectTask?.cancel()
         reconnectTask = nil
         pendingReconnectIs509 = false
-        playbackWatchdog?.cancel()
-        playbackWatchdog = nil
         stallWatchdog?.cancel()
         stallWatchdog = nil
-        lastPlaybackProgressAt = nil
+        livenessMonitor = nil
 
-        player.pause()
-        player.pauseBackgroundActivity()
+        _player?.pauseBackgroundActivity()
     }
 
     func resumeBackgroundWork() {
@@ -684,35 +674,168 @@ final class PlayerSlot: Identifiable {
 
         AppLog.playback.info("Resuming player background work channel=\(self.channel.name, privacy: .public)")
 
+        guard let player = _player else { return }
         player.resumeBackgroundActivity()
 
-        guard playbackMode == .live else {
-            // Catchup / on-demand: just unpause from where we left off.
-            player.play()
-            return
-        }
+        // Finite media resumes only if its owner still requests playback.
+        // resumeBackgroundActivity removes suspension without changing intent.
+        guard playbackMode == .live else { return }
 
         // Live: safest to do a fresh load after sleep to re-establish
         // network paths, HLS playlists, etc. Then re-arm the stall/reconnect
         // watchdogs exactly as a normal load does.
         stopRecoveryTasks(resetFailureWindow: false)
         player.clearReconnectingErrorMessage()
-        noteExpectedStopIfReplacingCurrentItem()
-        player.loadURL(channel.streamURL, autoplay: true)
+        player.loadURL(channel.streamURL, autoplay: player.wantsPlayback, live: true)
         armRecoveryWatchdogs()
         StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
     }
 
-    init(channel: Channel, currentProgram: EPGProgram?) {
+    init(channel: Channel, currentProgram: EPGProgram?, recoveryPolicy: SmartLiveRecoveryPolicy = SmartLiveRecoveryPolicy()) {
         self.channel = channel
         self.currentProgram = currentProgram
+        self.smartRecovery = recoveryPolicy
     }
 
     func unregisterFromRegistry() {
         cancelReconnect()
     }
 
+    /// Root resolves eligibility and explicit overrides. This owner only
+    /// considers those alternatives after repeated measured live failures.
+    func configureLiveAlternatives(_ channels: [Channel], resolver: ((SourceChannelIdentity) -> Channel?)? = nil) {
+        resolveLiveAlternative = resolver
+        guard let logicalID = channel.sourceOwnership?.logicalChannelID else {
+            liveAlternatives = []
+            return
+        }
+        liveAlternatives = channels.filter {
+            !$0.isOnDemand && $0.sourceOwnership != nil &&
+            $0.sourceOwnership?.logicalChannelID == logicalID
+        }
+    }
+
+    private func physicalKey(_ channel: Channel) -> String {
+        channel.sourceOwnership?.channelIdentity.rawValue ?? channel.id
+    }
+
+    /// Explicit manual source or mode requests use the same teardown barrier
+    /// as automatic live recovery. The caller then applies its original
+    /// live/archive/resume intent; this method never substitutes that intent.
+    func replacePlaybackChannel(_ next: Channel) async -> Bool {
+        if physicalKey(channel) == physicalKey(next), channel.streamURL == next.streamURL {
+            channel = next
+            return true
+        }
+        sourceEpoch &+= 1
+        let epoch = sourceEpoch
+        cancelReconnect()
+        let backend = player
+        let oldLease = capacityLease
+        let closed = await waitForBackendTeardown(backend, lease: oldLease)
+        guard closed, !Task.isCancelled, !isRetired, sourceEpoch == epoch else { return false }
+        channel = next
+        attachCallbacks(to: backend)
+        observedHealthySeconds = 0
+        observedBufferingSeconds = 0
+        lastEvidenceSample = nil
+        lastTelemetrySnapshotAt = nil
+        currentProgram = nil
+        sourceChangeMessage = nil
+        smartRecovery = SmartLiveRecoveryPolicy()
+        return reservePlaybackCapacity()
+    }
+
+    private func reservePlaybackCapacity() -> Bool {
+        guard let ownership = channel.sourceOwnership else { return true } // pre-migration local/legacy items
+        if let capacityLease, capacityLease.accountKey == ownership.accountKey { return true }
+        guard capacityLease == nil else { return false }
+        switch AccountCapacityLedger.shared.reserve(for: channel, kind: .player, ownerID: id) {
+        case .success(let lease): capacityLease = lease; return true
+        case .failure:
+            setRecoveryErrorMessage("This source has no free playback connections. Close a player or recording and retry.")
+            return false
+        }
+    }
+
+    private func waitForBackendTeardown(_ backend: MPVPlayer, lease: AccountCapacityLedger.Lease?) async -> Bool {
+        await withCheckedContinuation { continuation in
+            var completed = false
+            let deadline = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(8))
+                guard !Task.isCancelled, !completed else { return }
+                completed = true
+                self?.setRecoveryErrorMessage("The previous playback connection is still closing. Retry once it has stopped.")
+                continuation.resume(returning: false)
+            }
+            backend.stopWhenBackendIdle { [weak self] in
+                if let lease { _ = AccountCapacityLedger.shared.confirmTeardown(lease: lease) }
+                if self?.capacityLease == lease { self?.capacityLease = nil }
+                guard !completed else { return }
+                completed = true
+                deadline.cancel()
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    /// Retain the old lease through actual backend teardown, even if the
+    /// window closes or the recovery task is cancelled in the meantime.
+    func retireAndRecyclePlayer() {
+        isRetired = true
+        sourceEpoch &+= 1
+        cancelReconnect()
+        clearCatchupState()
+        guard let player = _player else { return }
+        _player = nil
+        let lease = capacityLease
+        capacityLease = nil
+        player.stopWhenBackendIdle { [player] in
+            if let lease { _ = AccountCapacityLedger.shared.confirmTeardown(lease: lease) }
+            MPVPlayerPool.shared.release(player)
+        }
+    }
+
+    private func switchLiveSource(to alternate: Channel, now: TimeInterval) {
+        let expectedEpoch = sourceEpoch
+        let oldChannel = channel
+        let backend = player
+        let oldLease = capacityLease
+        let wantsPlayback = backend.wantsPlayback
+        let intentRevision = backend.ownerPlaybackIntentRevision
+        stopRecoveryTasks(resetFailureWindow: false)
+        reconnectTask = Task { @MainActor [weak self, backend] in
+            guard let self else { return }
+            let closed = await self.waitForBackendTeardown(backend, lease: oldLease)
+            guard closed, !Task.isCancelled, !self.isRetired, self.sourceEpoch == expectedEpoch,
+                  self.playbackMode == .live, !self.isBackgroundPaused, wantsPlayback else { return }
+            guard backend.ownerPlaybackIntentRevision == intentRevision else { return }
+            self.channel = alternate
+            guard self.reservePlaybackCapacity() else {
+                self.channel = oldChannel
+                self.reconnectTask = nil
+                return
+            }
+            self.sourceEpoch &+= 1
+            self.attachCallbacks(to: backend)
+            self.smartRecovery.didSwitch(from: self.physicalKey(oldChannel), to: self.physicalKey(alternate), now: now)
+            self.sourceChangeMessage = "Switched playback source after repeated failures. Live content may skip or repeat."
+            self.currentProgram = nil // guide owner refreshes from this physical binding
+            self.reconnectTask = nil
+            self.reconnectAttempt = 0
+            self.firstFailureAt = nil
+            self.hasRenderedAnyFrame = false
+            self.lastEvidenceSample = nil
+            self.observedHealthySeconds = 0
+            self.observedBufferingSeconds = 0
+            backend.loadURL(alternate.streamURL, autoplay: true, live: true)
+            self.armRecoveryWatchdogs()
+        }
+    }
+
     func loadInitialLive() {
+        sourceEpoch &+= 1
+        if let player = _player { attachCallbacks(to: player) }
         if channel.isOnDemand {
             loadOnDemand()
             return
@@ -720,14 +843,16 @@ final class PlayerSlot: Identifiable {
         playbackMode = .live
         clearCatchupState()
         playbackStreamHealth = StreamHealth()
+        observedHealthySeconds = 0
+        observedBufferingSeconds = 0
         hasRenderedAnyFrame = false
         stopRecoveryTasks(resetFailureWindow: true)
         clearRecoveryErrorMessage()
+        guard reservePlaybackCapacity() else { return }
         if useCurrentLiveLoadIfPossible() {
             return
         }
-        noteExpectedStopIfReplacingCurrentItem()
-        player.loadURL(channel.streamURL, autoplay: true)
+        player.loadURL(channel.streamURL, autoplay: true, live: true)
         armRecoveryWatchdogs()
         // The user is actively watching this channel — bump probe priority so
         // the badge populates quickly even if scrolling hadn't requested it.
@@ -735,6 +860,8 @@ final class PlayerSlot: Identifiable {
     }
 
     func loadLive() {
+        sourceEpoch &+= 1
+        if let player = _player { attachCallbacks(to: player) }
         if channel.isOnDemand {
             loadOnDemand()
             return
@@ -742,14 +869,16 @@ final class PlayerSlot: Identifiable {
         playbackMode = .live
         clearCatchupState()
         playbackStreamHealth = StreamHealth()
+        observedHealthySeconds = 0
+        observedBufferingSeconds = 0
         hasRenderedAnyFrame = false
         stopRecoveryTasks(resetFailureWindow: true)
         clearRecoveryErrorMessage()
+        guard reservePlaybackCapacity() else { return }
         if useCurrentLiveLoadIfPossible() {
             return
         }
-        noteExpectedStopIfReplacingCurrentItem()
-        player.loadURL(channel.streamURL, autoplay: true)
+        player.loadURL(channel.streamURL, autoplay: true, live: true)
         armRecoveryWatchdogs()
         StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
     }
@@ -762,17 +891,18 @@ final class PlayerSlot: Identifiable {
             hasRenderedAnyFrame = true
             PlayerStartupTiming.noteFirstFrame(channel: channel)
         }
+        player.setMute(false)
+        player.play()
+        let generation = player.telemetryLoadGeneration
         Task { @MainActor [weak player] in
             await Task.yield()
-            guard let player else { return }
-            player.setMute(false)
-            player.play()
+            guard let player, player.telemetryLoadGeneration == generation else { return }
             player.logPlaybackSyncSnapshot("visible-unmuted")
             try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, player.telemetryLoadGeneration == generation else { return }
             player.logPlaybackSyncSnapshot("visible-2s")
         }
-        lastObservedTimePos = player.timePos
-        lastPlaybackProgressAt = Date()
+        livenessMonitor = PlaybackLivenessMonitor(position: player.timePos, now: ProcessInfo.processInfo.systemUptime)
         armRecoveryWatchdogs()
         StreamProbeService.shared.requestProbe(for: channel, priority: .userInitiated)
         return true
@@ -783,12 +913,11 @@ final class PlayerSlot: Identifiable {
     /// Start archive playback at `start`, presenting `timeline` on the
     /// transport bar. `start` is clamped into the channel's archive window
     /// and to the timeline itself.
-    func playCatchup(from start: Date, timeline: DateInterval, programID: String?) {
-        // Falling back to live on failure matters: callers may have skipped
-        // the initial live load expecting this to take over — silently
-        // returning would leave a black player.
+    func playCatchup(from start: Date, timeline: DateInterval, programID: String?, autoplay: Bool = true) {
+        sourceEpoch &+= 1
+        if let player = _player { attachCallbacks(to: player) }
         guard let window = channel.archiveWindow() else {
-            loadLive()
+            failCatchup("Catchup is unavailable from this source.")
             return
         }
         let clampedStart = clampCatchupStart(start, window: window, timeline: timeline)
@@ -797,9 +926,9 @@ final class PlayerSlot: Identifiable {
         // continuous clip for the presented program. Providers clamp
         // still-airing ends themselves.
         let duration = max(timeline.end.timeIntervalSince(clampedStart), 60)
-        guard let url = CatchupURLBuilder.url(for: channel, start: clampedStart, duration: duration) else {
+        guard let request = CatchupURLBuilder.request(for: channel, start: clampedStart, duration: duration) else {
             AppLog.playback.error("Catchup URL build failed channel=\(self.channel.name, privacy: .public)")
-            loadLive()
+            failCatchup("This source could not create the requested catchup stream.")
             return
         }
 
@@ -809,16 +938,47 @@ final class PlayerSlot: Identifiable {
         playbackStreamHealth = StreamHealth()
         cancelReconnect()
         clearRecoveryErrorMessage()
+        guard reservePlaybackCapacity() else { return }
         catchup = CatchupPlayback(
             timeline: timeline,
-            loadedStart: clampedStart,
+            loadedStart: request.loadedStart,
             programID: programID,
             isSwitching: true
         )
         armCatchupSwitchTimeout()
-        noteExpectedStopIfReplacingCurrentItem()
         player.setMute(false)
-        player.loadURL(url, autoplay: true)
+        let timestampRecovery = ArchiveTimestampRecovery.options(forArchiveLoad: true).enabled
+        // Linearized timelines cannot support a low-level seek. The DEBUG
+        // experiment starts at the actual URL minute and reports that origin;
+        // only minute-aligned provider seeks can qualify exact wall-clock time.
+        pendingCatchupSeekSeconds = !timestampRecovery && request.initialSeekSeconds > 0.001
+            ? request.initialSeekSeconds : nil
+        player.loadURL(request.url, autoplay: autoplay, archive: true)
+    }
+
+    /// Terminal replay failure retains the archive context and intent until
+    /// the user explicitly chooses another programme or live playback.
+    func stopUnavailableReplay() {
+        guard catchup != nil else { return }
+        sourceEpoch &+= 1
+        pendingCatchupSeekSeconds = nil
+        endCatchupSwitching()
+        failCatchup("Replay unavailable. This source ended repeated archive clips immediately. Select a programme again to retry.",
+            preservingContext: true)
+    }
+
+    private func failCatchup(_ message: String, preservingContext: Bool = false) {
+        playbackMode = .catchup
+        cancelReconnect()
+        if !preservingContext { clearCatchupState() }
+        if let backend = _player {
+            let lease = capacityLease
+            backend.stopWhenBackendIdle { [weak self] in
+                if let lease { _ = AccountCapacityLedger.shared.confirmTeardown(lease: lease) }
+                if self?.capacityLease == lease { self?.capacityLease = nil }
+            }
+        }
+        setRecoveryErrorMessage(message)
     }
 
     /// Move the catchup playhead to a wall-clock target. Seeks inside the
@@ -829,11 +989,12 @@ final class PlayerSlot: Identifiable {
         let clamped = clampCatchupStart(target, window: window, timeline: current.timeline)
 
         let clipOffset = clamped.timeIntervalSince(current.loadedStart)
-        if clipOffset >= 0, player.isSeekable, clipOffset < player.duration - 5 {
+        if !player.usesArchiveTimestampRecovery, clipOffset >= 0, player.isSeekable, clipOffset < player.duration - 5 {
             player.seek(to: clipOffset)
             return
         }
-        playCatchup(from: clamped, timeline: current.timeline, programID: current.programID)
+        playCatchup(from: clamped, timeline: current.timeline, programID: current.programID,
+                    autoplay: player.wantsPlayback)
     }
 
     /// Leave the archive and reconnect the live stream.
@@ -873,13 +1034,25 @@ final class PlayerSlot: Identifiable {
         pendingOnDemandSeekSeconds = seconds
     }
 
+    /// A replacement endpoint is idle after teardown. Queue its position
+    /// before loading so FILE_LOADED applies resume to the new item.
+    func resumeOnDemand(to seconds: Double, reload: Bool) {
+        guard channel.isOnDemand else { return }
+        if reload {
+            seekOnNextOnDemandLoad(to: seconds)
+            loadInitialLive()
+        } else if seconds > 0 {
+            player.seek(to: seconds)
+        }
+    }
+
     private func loadOnDemand() {
         playbackMode = .onDemand
         clearCatchupState()
         playbackStreamHealth = StreamHealth()
         cancelReconnect()
         clearRecoveryErrorMessage()
-        noteExpectedStopIfReplacingCurrentItem()
+        guard reservePlaybackCapacity() else { return }
         player.loadURL(channel.streamURL, autoplay: true)
     }
 
@@ -956,7 +1129,7 @@ final class PlayerSession {
 
     func addChannel(_ channel: Channel, currentProgram: EPGProgram?) {
         guard canAddMoreSlots() else { return }
-        if let existing = slots.first(where: { $0.channel.id == channel.id }) {
+        if let existing = slots.first(where: { $0.channel.preferenceIdentity == channel.preferenceIdentity }) {
             focus(slotID: existing.id)
             return
         }
@@ -985,10 +1158,7 @@ final class PlayerSession {
         // Return the MPVPlayer to the warm pool (if room) instead of letting
         // its deinit destroy the expensive handle. The layer teardown has
         // already reset the render context.
-        if let p = removed._player {
-            removed._player = nil
-            MPVPlayerPool.shared.release(p)
-        }
+        removed.retireAndRecyclePlayer()
 
         slots.remove(at: index)
 
@@ -1061,10 +1231,11 @@ final class PlayerSession {
     /// window or addChannel.
     func recycleAllPlayers() {
         for slot in slots {
-            if let p = slot._player {
-                slot._player = nil
-                MPVPlayerPool.shared.release(p)
-            }
+            slot.retireAndRecyclePlayer()
         }
+    }
+
+    func configureLiveAlternatives(_ alternatives: [Channel], resolver: ((SourceChannelIdentity) -> Channel?)? = nil) {
+        focusedSlot.configureLiveAlternatives(alternatives, resolver: resolver)
     }
 }

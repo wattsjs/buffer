@@ -1,0 +1,16 @@
+{
+  "fixture": "catchup-http-24-v1",
+  "parallelMs": [
+    281,
+    272,
+    268
+  ],
+  "programs": 24,
+  "serialMs": [
+    1477,
+    1440,
+    1452
+  ],
+  "peakRequests": 6,
+  "note": "Loopback HTTP fixture with controlled 40-70ms response latency; not a live-provider throughput claim"
+}

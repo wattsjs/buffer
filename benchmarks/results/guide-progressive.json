@@ -1,0 +1,191 @@
+{
+  "schemaVersion": 1,
+  "fixture": "guide-progressive-96-v1",
+  "scenario": "guide-progressive",
+  "configuration": "Optimized standalone production VM/HTTP clients/parsers; isolated platform/cache dependencies",
+  "after": [
+    {
+      "fixture": "guide-progressive-96-v1",
+      "firstCurrentMs": 108,
+      "firstVisibleHistoryMs": 165,
+      "completeMs": 1798,
+      "currentRows": 96,
+      "historyChannels": 88,
+      "requestedHistoryDays": 7,
+      "returnedHistoryDays": 2,
+      "publications": 6,
+      "maximumMainCommitMs": 0.110958,
+      "requestedChannels": 96,
+      "firstRequestedChannels": [
+        "89",
+        "88",
+        "90",
+        "93",
+        "91",
+        "95",
+        "92",
+        "94"
+      ]
+    },
+    {
+      "fixture": "guide-progressive-96-v1",
+      "firstCurrentMs": 97,
+      "firstVisibleHistoryMs": 164,
+      "completeMs": 1794,
+      "currentRows": 96,
+      "historyChannels": 88,
+      "requestedHistoryDays": 7,
+      "returnedHistoryDays": 2,
+      "publications": 6,
+      "maximumMainCommitMs": 0.125792,
+      "requestedChannels": 96,
+      "firstRequestedChannels": [
+        "89",
+        "88",
+        "90",
+        "93",
+        "94",
+        "91",
+        "92",
+        "95"
+      ]
+    },
+    {
+      "fixture": "guide-progressive-96-v1",
+      "firstCurrentMs": 100,
+      "firstVisibleHistoryMs": 166,
+      "completeMs": 1814,
+      "currentRows": 96,
+      "historyChannels": 88,
+      "requestedHistoryDays": 7,
+      "returnedHistoryDays": 2,
+      "publications": 6,
+      "maximumMainCommitMs": 0.183167,
+      "requestedChannels": 96,
+      "firstRequestedChannels": [
+        "89",
+        "88",
+        "92",
+        "91",
+        "90",
+        "94",
+        "93",
+        "95"
+      ]
+    }
+  ],
+  "afterSourceSHA256": "76bbd28f52b0f2d4435bae7d856a5add59bd0f54cc51af300532c6fbd2b23201",
+  "afterExecutableSHA256": "f99dac64fa1889a594233e227fafd3539b816905c71ad8e4853b633775ba69c1",
+  "sourceHashes": {
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Models/ServerConfig.swift": "7e2e53fc8fc29e391d56a3e1668f06cb51e1bc4e7d6ec89f8987c95d708a66be",
+    "Buffer/Models/VODItem.swift": "dba3e220799c91d3496b653613b4393f5d0f5f8054a11d935f6b4cdd86f9964f",
+    "Buffer/Models/VODSeries.swift": "348bd50250ca76f02fbb411931dd6a1ac573dd39d00b54a1be265bd145438f91",
+    "Buffer/Models/ServerAccountStatus.swift": "ff87b6aef40150f52954f6add5b48e1a806554b56f383cd60d38ba3275471188",
+    "Buffer/Models/ProgramReminder.swift": "64051d1c72efe4795a754b413c9c784d5d83df82c0dff76c85c286c79478a5a9",
+    "Buffer/Models/SyncInterval.swift": "440f75130b599cb34ffc2e298ab4c390c2528c7d4398acfb619943339c80c5af",
+    "Buffer/Services/XtreamClient.swift": "d643c605065e7d8ca862a40f83326d6d809cfdf7f9706b0854236173b7a98c91",
+    "Buffer/Services/StalkerClient.swift": "14e377d5b055ef6a2ee3f6b9ddde8a11d2e8d3540f4afa714110c214d55c19f1",
+    "Buffer/Services/M3UParser.swift": "fc29867b129af5616190987641583271b0f2247dfc4fd764afb38c6e3ee46383",
+    "Buffer/Services/XMLTVParser.swift": "2ea5e5edd5a4da717a086411214137efb2d63eb59ba030e60213eb2c49848beb",
+    "Buffer/Support/AppLog.swift": "c71fdc6554240bf102d6b29687c0c3841b17e862f63531471e4c9c95a55e6233",
+    "Buffer/Support/GuideLookup.swift": "f5ed09a53c4235f746236d684fe0f1c7fcff6d97b6cf70b4692647fe39cb73bf",
+    "Buffer/Support/GuideHistory.swift": "a4acefb7120944e383b93124bb21ade7399f0d32289d7fa849092c753cf26178",
+    "benchmarks/sync_test_support.swift": "1173e24d1308826e5d2635e6b9a7658dbb77d2d6ce0a615866e72b8f8d65f0cb",
+    "Buffer/ViewModels/EPGViewModel.swift": "76bbd28f52b0f2d4435bae7d856a5add59bd0f54cc51af300532c6fbd2b23201",
+    "benchmarks/sync_integration.swift": "08649370e85fc57a7ec382d93290c870218fee2d4995daf606ef90ebea46642c",
+    "Buffer/Support/ChannelIdentityEncoding.h": "b48be886a54cdd4bfb0482ae55a9f21b2805b2b55e2d58e7d77bc1f5afffbd7a"
+  },
+  "recordedAt": "2026-10-04T15:00:29.068441+00:00",
+  "limitations": "Controlled loopback latency and8 failed stream APIs plus failed bulk lookback. Not a real-provider throughput claim; missing schedules stay missing.",
+  "before": [
+    {
+      "fixture": "guide-progressive-96-v1",
+      "firstCurrentMs": 3086,
+      "firstVisibleHistoryMs": 3086,
+      "completeMs": 3086,
+      "currentRows": 96,
+      "historyChannels": 88,
+      "requestedHistoryDays": 7,
+      "returnedHistoryDays": 2,
+      "publications": 1,
+      "maximumMainCommitMs": null,
+      "requestedChannels": 96,
+      "firstRequestedChannels": [
+        "1",
+        "2",
+        "0",
+        "3",
+        "4",
+        "7",
+        "5",
+        "6"
+      ]
+    },
+    {
+      "fixture": "guide-progressive-96-v1",
+      "firstCurrentMs": 3081,
+      "firstVisibleHistoryMs": 3081,
+      "completeMs": 3081,
+      "currentRows": 96,
+      "historyChannels": 88,
+      "requestedHistoryDays": 7,
+      "returnedHistoryDays": 2,
+      "publications": 1,
+      "maximumMainCommitMs": null,
+      "requestedChannels": 96,
+      "firstRequestedChannels": [
+        "0",
+        "1",
+        "3",
+        "2",
+        "5",
+        "4",
+        "6",
+        "7"
+      ]
+    },
+    {
+      "fixture": "guide-progressive-96-v1",
+      "firstCurrentMs": 3114,
+      "firstVisibleHistoryMs": 3114,
+      "completeMs": 3114,
+      "currentRows": 96,
+      "historyChannels": 88,
+      "requestedHistoryDays": 7,
+      "returnedHistoryDays": 2,
+      "publications": 1,
+      "maximumMainCommitMs": null,
+      "requestedChannels": 96,
+      "firstRequestedChannels": [
+        "1",
+        "3",
+        "5",
+        "0",
+        "7",
+        "2",
+        "4",
+        "6"
+      ]
+    }
+  ],
+  "beforeSourceSHA256": "47f057ab6f576346c8decdf4b0879534baf7131c399bdd19ef42c37f665d9b58",
+  "beforeExecutableSHA256": "a437f2657baa49409cc83d966a1b6f41dbd559216e8c21cd1a94665e28d79077",
+  "medianMs": {
+    "firstCurrentMs": 100,
+    "firstVisibleHistoryMs": 165,
+    "completeMs": 1798
+  },
+  "baselineMedianMs": {
+    "firstCurrentMs": 3086,
+    "firstVisibleHistoryMs": 3086,
+    "completeMs": 3086
+  },
+  "changeFraction": {
+    "firstCurrentMs": -0.9675955930006481,
+    "firstVisibleHistoryMs": -0.9465327284510694,
+    "completeMs": -0.41736876215165264
+  },
+  "regression": false
+}

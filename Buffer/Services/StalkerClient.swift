@@ -136,8 +136,8 @@ actor StalkerClient {
     }
 
     private struct EPGEntry: Decodable {
-        let id: String?
-        let channelID: String?
+        let id: StalkerFlexibleString?
+        let channelID: StalkerFlexibleString?
         let name: String?
         let description: String?
         let startTimestamp: StalkerFlexibleString?
@@ -302,22 +302,28 @@ actor StalkerClient {
         return episodes
     }
 
-    func fetchEPG(periodHours: Int) async throws -> [EPGProgram] {
+    func fetchEPG(periodHours: Int, channels: [Channel] = []) async throws -> [EPGProgram] {
         let epg: EPGInfo = try await fetch(
             "itv",
             action: "get_epg_info",
             extra: [URLQueryItem(name: "period", value: "\(periodHours)")]
         )
+        let guideIDs = Dictionary(channels.compactMap { channel -> (String, String)? in
+            guard let epgID = channel.epgChannelID else { return nil }
+            return (channel.id, epgID)
+        }, uniquingKeysWith: { first, _ in first })
         return epg.data.flatMap { channelID, entries in
             entries.compactMap { entry in
                 let start = TimeInterval(Int(entry.startTimestamp?.value ?? "") ?? 0)
                 let stop = TimeInterval(Int(entry.stopTimestamp?.value ?? "") ?? 0)
                 guard start > 0, stop > start else { return nil }
-                let resolvedChannelID = Self.nonEmpty(entry.channelID) ?? channelID
+                guard let title = Self.nonEmpty(entry.name) else { return nil }
+                let nativeChannelID = Self.nonEmpty(entry.channelID?.value) ?? channelID
+                let resolvedChannelID = guideIDs[nativeChannelID] ?? guideIDs[channelID] ?? nativeChannelID
                 return EPGProgram(
-                    id: entry.id ?? "\(resolvedChannelID):\(Int(start))",
+                    id: Self.nonEmpty(entry.id?.value) ?? "\(resolvedChannelID):\(entry.startTimestamp?.value ?? ""):\(entry.stopTimestamp?.value ?? "")",
                     channelID: resolvedChannelID,
-                    title: entry.name ?? "Untitled",
+                    title: title,
                     description: entry.description ?? "",
                     start: Date(timeIntervalSince1970: start),
                     end: Date(timeIntervalSince1970: stop)

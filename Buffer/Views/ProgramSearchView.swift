@@ -613,7 +613,7 @@ struct ProgramSearchResultsPage: View {
             Text("Search programs & channels")
                 .font(BufferFont.emptyTitle)
                 .foregroundStyle(.secondary)
-            Text("\(totalIndexed.formatted()) programs indexed, plus VOD")
+            Text("\(totalIndexed.formatted()) programs indexed")
                 .font(BufferFont.meta)
                 .foregroundStyle(.tertiary)
                 .monospacedDigit()
@@ -729,6 +729,7 @@ private struct ChannelCompactCard: View {
                 Label("Play Channel", systemImage: "play.fill")
             }
             AddToMultiViewMenuItem(channel: channel)
+            SmartSportsSourceMenuItem(channel: channel)
         }
     }
 }
@@ -834,6 +835,7 @@ private struct ProgramResultRow: View {
     @State private var showPopover = false
     @State private var notificationManager = NotificationManager.shared
     @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
+    @Environment(\.epgActionModel) private var actionModel
 
     private var existingReminder: ProgramReminder? {
         guard let playlistID = activePlaylistID else { return nil }
@@ -847,7 +849,8 @@ private struct ProgramResultRow: View {
     /// The program has aired (or is airing) and the channel archive still
     /// covers its start — suitable for "Play from start".
     private var canPlayFromCatchup: Bool {
-        result.channel.canReplay(result.program)
+        guard result.channel.sourceOwnership?.logicalChannelID == nil else { return false }
+        return result.channel.canReplay(result.program)
     }
 
     private var isLive: Bool {
@@ -895,6 +898,10 @@ private struct ProgramResultRow: View {
                 onPlay: {
                     showPopover = false
                     onSelect()
+                },
+                onPlayFromStart: {
+                    showPopover = false
+                    onPlayFromStart()
                 }
             )
         }
@@ -964,6 +971,7 @@ private struct ProgramResultRow: View {
             }
         }
         AddToMultiViewMenuItem(channel: result.channel)
+        SmartSportsSourceMenuItem(channel: result.channel)
 
         Divider()
 
@@ -976,12 +984,17 @@ private struct ProgramResultRow: View {
         guard let playlistID = activePlaylistID else { return }
         let program = result.program
         let channel = result.channel
+        guard let action = actionModel?.sourceProgramAction(channel: channel, program: program) ??
+                (channel.sourceOwnership?.logicalChannelID == nil ? (channel, program) : nil) else {
+            actionModel?.showSmartActionUnavailable("The guide source has changed. Refresh Smart Sports and select the programme again.")
+            return
+        }
         Task { @MainActor in
             let scheduled = await notificationManager.scheduleReminder(
                 playlistID: playlistID,
                 program: program,
                 channel: channel,
-                leadMinutes: lead
+                leadMinutes: lead, sourceChannel: action.channel, sourceProgramID: action.program.id
             )
             AppFeedbackCenter.shared.showReminderResult(
                 playlistID: playlistID,

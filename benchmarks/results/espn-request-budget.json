@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "fixture": "espn-urlprotocol-request-budget-v1",
+  "capturedAtUTC": "2026-10-04T11:21:46.738354+00:00",
+  "host": {
+    "os": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "architecture": "arm64"
+  },
+  "head": "c0db442fa80bf058e69f927c50858cfdb559566b",
+  "configuration": "Standalone swiftc unoptimized production ESPNClient; isolated URLProtocol only",
+  "fixtureDelaySeconds": 0.05,
+  "before": {
+    "measurements": {
+      "cricketRequests": 72,
+      "cricketPeak": 72,
+      "golfRequests": 104,
+      "golfPeak": 96,
+      "cricketMs": 61,
+      "golfMs": 118,
+      "cancelMs": 33,
+      "requestsAtCancel": 8,
+      "requestsAfterCancel": 291,
+      "preCancelledRequests": 291
+    },
+    "clientSourceSHA256": "d98b98db9e7b39128886135423145eea2fbdd912f2b88d437257152d6fae6703",
+    "executableSHA256": "927c4906da3e145e0a246bc26a11cb20f729b5e79aef48654be6f743f7735c68"
+  },
+  "after": {
+    "measurements": {
+      "cricketRequests": 72,
+      "cricketPeak": 8,
+      "golfRequests": 104,
+      "golfPeak": 8,
+      "cricketMs": 543,
+      "golfMs": 782,
+      "cancelMs": 1,
+      "requestsAtCancel": 8,
+      "requestsAfterCancel": 8,
+      "preCancelledRequests": 0
+    },
+    "clientSourceSHA256": "633b64d1249f138b341ef2db24d16427c258155d64fa95d89dff61e67a8c40b0",
+    "executableSHA256": "365ac4ca126b27e63cf26b161c76bae47c5848449a1d353942f9dd264b19e845"
+  },
+  "invariants": [
+    "Eight cricket leagues produce all 72 requests with peak HTTP concurrency <= 8",
+    "Eight golf leagues with 12 tournaments each produce all 104 requests with peak HTTP concurrency <= 8",
+    "In-flight cancellation stops at the eight started requests without starting queued work",
+    "Pre-cancelled fetch starts zero requests",
+    "Queued cricket cancellation releases permits for subsequent work",
+    "maxConcurrentRequests=1 performs cricket requests serially",
+    "Cricket adjacent-day duplicates have equivalent canonical event output at concurrency 1 and 8",
+    "Sports VM releases during transport I/O and cancels owned work",
+    "Source switch invalidates previous index before guide loading and replaces it with correct source",
+    "Unchanged tokens skip rebuilding and five guide requests coalesce into one publication",
+    "Visibility changes rebuild hidden fallback metadata and an empty catalog cancels pending publication",
+    "Superseded manual refresh cannot publish obsolete event content"
+  ],
+  "limitations": [
+    "This is a request-budget and cancellation regression gate, not a live-provider speed claim.",
+    "Capping leaf concurrency intentionally increases total burst fixture duration relative to the unbounded baseline.",
+    "Elapsed timings are single-run diagnostics; root Xcode build load may differ between before and after.",
+    "No live ESPN endpoint, user saved account, real stream or normal app UI is exercised here.",
+    "View-card cached StreamMatch arrays still need source-version invalidation outside SportsViewModel."
+  ],
+  "rerun": "scripts/test-sports.sh"
+}

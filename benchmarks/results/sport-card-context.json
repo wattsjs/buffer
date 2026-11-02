@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "configuration": "Standalone Swift -O production context equality",
+  "recordedAt": "2026-10-04T11:52:18.500128+00:00",
+  "sourceHashes": {
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Models/SportEvent.swift": "0557d4955f0eaf99fdfc5cdf2f6af6e2b9d78a7d2ddfedef8deb5454091933af",
+    "Buffer/Services/StreamMatcher.swift": "54f2d06228040248bb58669a0b810a143518cddc3180258b38cbb0b8f3f5de6f",
+    "Buffer/Support/SportEventMatchState.swift": "8316ceb24b7d71fcf632080678689f6f5e856515683b7629fc8883790be63c06",
+    "benchmarks/sport_card_context_benchmark.swift": "8d3c56b9e3a356d5a8792fcc7163bd4c824eb847411cdab3aad14b78cc05365e"
+  },
+  "limitations": "Context equality microbenchmark; not full-app CPU/RSS or a 28000-entry typical usage map. Production usage caps are 500 channels/100 groups; favorites can extend channel scores.",
+  "beforeSourcePath": "benchmarks/results/sport-card-context-before.swift",
+  "before": {
+    "cardCount": 120,
+    "cases": [
+      {
+        "checksum": 36000,
+        "comparisons": 36000,
+        "medianMs": 0.617083,
+        "name": "unchanged-shared-storage",
+        "samplesMs": [
+          0.586167,
+          0.833125,
+          0.898125,
+          0.70475,
+          0.601333,
+          0.617083,
+          0.604458
+        ]
+      },
+      {
+        "checksum": 480,
+        "comparisons": 480,
+        "medianMs": 254.145875,
+        "name": "equal-rebuilt-storage",
+        "samplesMs": [
+          252.669375,
+          253.954042,
+          254.161667,
+          255.839708,
+          253.942292,
+          254.145875,
+          256.330209
+        ]
+      },
+      {
+        "checksum": 0,
+        "comparisons": 480,
+        "medianMs": 88.870083,
+        "name": "one-score-change",
+        "samplesMs": [
+          90.214375,
+          88.870083,
+          88.76375,
+          90.844667,
+          90.18725,
+          88.869708,
+          88.753625
+        ]
+      },
+      {
+        "checksum": 0,
+        "comparisons": 36000,
+        "medianMs": 0.103875,
+        "name": "source-revision-change",
+        "samplesMs": [
+          0.103875,
+          0.101958,
+          0.104083,
+          0.104458,
+          0.105292,
+          0.101708,
+          0.101625
+        ]
+      }
+    ],
+    "fixture": "sport-card-context-v1",
+    "scoreCount": 28000,
+    "sourceSHA256": "7aab1451ed2ac2f5c5bec9ee96e20229f90e8b3d3810a435684bb278972c78d9",
+    "executableSHA256": "a0486069caf95a12d16487acae2538a683a30b65e12eec9510bc8b8b62889d6d"
+  },
+  "after": {
+    "cardCount": 120,
+    "cases": [
+      {
+        "checksum": 36000,
+        "comparisons": 36000,
+        "medianMs": 0.472209,
+        "name": "unchanged-shared-storage",
+        "samplesMs": [
+          0.541667,
+          0.604166,
+          0.467208,
+          0.466875,
+          0.4695,
+          0.473583,
+          0.472209
+        ],
+        "medianReductionPercent": 23.47723077770738
+      },
+      {
+        "checksum": 480,
+        "comparisons": 480,
+        "medianMs": 0.00625,
+        "name": "equal-rebuilt-storage",
+        "samplesMs": [
+          0.006291,
+          0.006292,
+          0.00625,
+          0.00625,
+          0.00625,
+          0.00625,
+          0.00625
+        ],
+        "medianReductionPercent": 99.9975407824345
+      },
+      {
+        "checksum": 0,
+        "comparisons": 480,
+        "medianMs": 0.00625,
+        "name": "one-score-change",
+        "samplesMs": [
+          0.00625,
+          0.00625,
+          0.00625,
+          0.00625,
+          0.006208,
+          0.00625,
+          0.00625
+        ],
+        "medianReductionPercent": 99.99296726211003
+      },
+      {
+        "checksum": 0,
+        "comparisons": 36000,
+        "medianMs": 0.1195,
+        "name": "source-revision-change",
+        "samplesMs": [
+          0.117125,
+          0.1195,
+          0.117166,
+          0.117292,
+          0.1195,
+          0.126042,
+          0.124792
+        ],
+        "medianReductionPercent": -15.04211793020458
+      }
+    ],
+    "fixture": "sport-card-context-v1",
+    "scoreCount": 28000,
+    "sourceSHA256": "8316ceb24b7d71fcf632080678689f6f5e856515683b7629fc8883790be63c06",
+    "executableSHA256": "39467246bb86e00605e7936f67e40492e1a48c3678c3eec35f1d5f89367b6aa7"
+  }
+}

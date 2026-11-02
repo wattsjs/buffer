@@ -13,6 +13,7 @@ nonisolated struct ChannelSearchIndex: Sendable, Codable {
     let inSportsGroup: Bool
     let isAudioOnlyGroup: Bool
     let isHidden: Bool         // channel belongs to a user-hidden group
+    let guideKey: String?       // source-scoped when physical ownership is known
     /// EPG titles already lowercased, sorted by start time.
     /// Only programs within a ±48h window are kept.
     let epgTitles: ContiguousArray<EPGTitle>
@@ -106,7 +107,7 @@ nonisolated struct StreamSearchIndex: Sendable, Codable {
 
 /// A matched stream for a sport event.
 nonisolated struct StreamMatch: Identifiable, Sendable {
-    var id: String { channel.id }
+    var id: String { channel.preferenceIdentity }
     let channel: Channel
     let score: Double
     let reason: String         // channel group / folder
@@ -115,6 +116,32 @@ nonisolated struct StreamMatch: Identifiable, Sendable {
     let programStart: Date?
     let programEnd: Date?
     let isHidden: Bool         // from a user-hidden group (fallback only)
+    var relevance: Relevance = .channelHint
+
+    enum Relevance: Int, Sendable {
+        case channelHint
+        case relatedProgramme
+        case eventProgramme
+    }
+}
+
+/// Only current endpoint-bound observations belong here. Unknown format does
+/// not become a measured format merely because a channel name says UHD.
+nonisolated struct StreamMatchQuality: Sendable, Equatable {
+    enum Availability: Int, Sendable { case failed, unknown, observedAvailable }
+    var availability: Availability = .unknown
+    var isUnstable = false
+    var healthySeconds: Double = 0
+    var observedHeight: Int = 0
+    var observedFPS: Double = 0
+    /// Probed transport bitrate in bits/sec; 0 when unknown.
+    var observedBitRate: Int64 = 0
+    var observedSeconds: Double = 0
+    var bufferingSeconds: Double = 0
+    /// Set only by a fresh measurement of moving startup / true broadcast
+    /// delay. First-picture, probe-duration and replay-window proxies do not qualify.
+    var startupSeconds: Double? = nil
+    var liveDelaySeconds: Double? = nil
 }
 
 /// High-performance sport event → channel matcher.
@@ -134,17 +161,31 @@ nonisolated enum StreamMatcher {
     static func buildIndex(
         channels: [Channel],
         programs: [String: [EPGProgram]],
-        hiddenGroups: Set<String> = []
+        hiddenGroups: Set<String> = [],
+        now: Date = Date(),
+        shouldCancel: @Sendable () -> Bool = { false }
     ) -> StreamSearchIndex {
-        let cutoff = Date().addingTimeInterval(-3600)
-        let horizon = Date().addingTimeInterval(48 * 3600)
+        guard !shouldCancel() else { return .empty }
+        let cutoff = now.addingTimeInterval(-3600)
+        let horizon = now.addingTimeInterval(48 * 3600)
         let hiddenGroupPaths = hiddenGroups.map(splitGroupPath)
 
         var entries: [ChannelSearchIndex] = []
         entries.reserveCapacity(channels.count)
         var tokenBuckets: [String: [Int]] = [:]
+        // Channel variants share XMLTV IDs. Normalize those schedules once,
+        // while keeping channel-name tokens and document frequency separate.
+        var seenGuideIDs = Set<String>()
+        var sharedGuideIDs = Set<String>()
+        for channel in channels {
+            if let id = guideKey(for: channel), !seenGuideIDs.insert(id).inserted {
+                sharedGuideIDs.insert(id)
+            }
+        }
+        var guideCache: [String: (titles: ContiguousArray<ChannelSearchIndex.EPGTitle>, tokens: Set<String>)] = [:]
 
         for channel in channels {
+            guard !shouldCancel() else { return .empty }
             let isHidden = isGroupHidden(
                 channel.group,
                 hiddenGroups: hiddenGroups,
@@ -162,8 +203,17 @@ nonisolated enum StreamMatcher {
             collectIndexTokens(nameWords, into: &indexTokens)
             collectIndexToken(nameAcronym, into: &indexTokens)
 
-            if let epgID = channel.epgChannelID {
-                for p in programs[epgID] ?? [] {
+            let lookupGuideKey = guideKey(for: channel)
+            if let epgID = lookupGuideKey, let cached = guideCache[epgID] {
+                epgTitles = cached.titles
+                indexTokens.formUnion(cached.tokens)
+            } else if let epgID = lookupGuideKey {
+                var guideTokens = Set<String>()
+                // Ordinary playlists retain raw guide dictionaries. A merged
+                // physical snapshot supplies scoped keys and never falls back
+                // to a different source's schedule.
+                let rows = programs[epgID] ?? channel.epgChannelID.flatMap { programs[$0] } ?? []
+                for p in rows {
                     if p.end > cutoff && p.start < horizon {
                         // Cap description to 256 chars — athlete names and key
                         // details are near the start; normalise() is expensive
@@ -176,8 +226,8 @@ nonisolated enum StreamMatcher {
                         let descLower = normalise(descPrefix)
                         let titleWords = ContiguousArray(tokenWords(in: titleLower))
                         let descWords = ContiguousArray(tokenWords(in: descLower))
-                        collectIndexTokens(titleWords, into: &indexTokens)
-                        collectIndexTokens(descWords, into: &indexTokens)
+                        collectIndexTokens(titleWords, into: &guideTokens)
+                        collectIndexTokens(descWords, into: &guideTokens)
                         epgTitles.append(.init(
                             title: p.title,
                             description: descPrefix,
@@ -189,6 +239,10 @@ nonisolated enum StreamMatcher {
                             end: p.end
                         ))
                     }
+                }
+                indexTokens.formUnion(guideTokens)
+                if sharedGuideIDs.contains(epgID) {
+                    guideCache[epgID] = (epgTitles, guideTokens)
                 }
             }
 
@@ -203,6 +257,7 @@ nonisolated enum StreamMatcher {
                 inSportsGroup: groupLower.contains("sport") || groupLower.contains("ppv"),
                 isAudioOnlyGroup: isAudioOnlyGroup,
                 isHidden: isHidden,
+                guideKey: lookupGuideKey,
                 epgTitles: epgTitles
             ))
 
@@ -222,6 +277,7 @@ nonisolated enum StreamMatcher {
                 latestProgramEnd = max(latestProgramEnd ?? epg.end, epg.end)
             }
         }
+        guard !shouldCancel() else { return .empty }
         let inverted = tokenBuckets.mapValues { ContiguousArray($0) }
         return StreamSearchIndex(
             entries: entries,
@@ -235,6 +291,12 @@ nonisolated enum StreamMatcher {
             earliestProgramStart: earliestProgramStart,
             latestProgramEnd: latestProgramEnd
         )
+    }
+
+    static func guideKey(for channel: Channel) -> String? {
+        guard let guideID = channel.epgChannelID else { return nil }
+        guard let sourceID = channel.sourceChannelIdentity?.sourceID else { return guideID }
+        return sourceID.uuidString.lowercased() + "|" + guideID
     }
 
     private static func buildInverseDocumentFrequency(
@@ -294,7 +356,6 @@ nonisolated enum StreamMatcher {
     // MARK: - Matching
 
     private static let minimumScore: Double = 80
-    private static let maxCandidateEntries = 160
 
     /// Sports where EPG listings use tournament/sport names rather than
     /// individual match names, and events may span many hours.
@@ -306,9 +367,12 @@ nonisolated enum StreamMatcher {
 
     static func findMatches(
         for event: SportEvent,
-        index: StreamSearchIndex
+        index: StreamSearchIndex,
+        now: Date = Date(),
+        shouldCancel: @Sendable () -> Bool = { false }
     ) -> [StreamMatch] {
-        let queries = buildQueries(for: event)
+        guard !shouldCancel() else { return [] }
+        let queries = buildQueries(for: event).sorted { $0.score > $1.score }
         guard !queries.isEmpty else { return [] }
         guard !index.entries.isEmpty else { return [] }
 
@@ -328,32 +392,39 @@ nonisolated enum StreamMatcher {
         // - EPG entries often span the whole day ("ATP Tennis 10am-8pm")
         // - Individual match times within the block are approximate
         let isTournament = tournamentSports.contains(event.sport)
-        let now = Date()
         let isEventLive = event.status.isLive
         let allowCurrentlyLiveEPG = isEventLive || (!event.status.isFinished && event.startDate <= now)
         let windowStart = event.startDate.addingTimeInterval(isTournament ? -6 * 3600 : -1800)
         let windowEnd = event.startDate.addingTimeInterval(isTournament ? 12 * 3600 : 7200)
+        let fixture = FixtureTerms(event: event)
 
         var matches: [StreamMatch] = []
-        matches.reserveCapacity(16)
+        matches.reserveCapacity(32)
+        var programmeScores: [String: Score] = [:]
 
-        let candidateIndices = candidateEntryIndices(for: queries, in: index)
-        guard !candidateIndices.isEmpty else { return [] }
+        let candidateIndices = candidateEntryIndices(for: queries, in: index, shouldCancel: shouldCancel)
+        guard !candidateIndices.isEmpty, !shouldCancel() else { return [] }
 
         // Iterate candidate indices only; the inverted index is built in the
         // background whenever channels/EPG change.
         for i in candidateIndices {
+            guard !shouldCancel() else { return [] }
             let score = scoreEntry(
                 entries: index.entries, at: i,
                 queries: queries,
                 broadcastLower: broadcastLower,
                 contextKeywords: contextKeywords,
                 eventStart: event.startDate,
+                now: now,
                 windowStart: windowStart,
                 windowEnd: windowEnd,
                 allowCurrentlyLiveEPG: allowCurrentlyLiveEPG,
-                isTournament: isTournament
+                isTournament: isTournament,
+                fixture: fixture,
+                programmeScores: &programmeScores,
+                shouldCancel: shouldCancel
             )
+            guard !shouldCancel() else { return [] }
             if score.value >= minimumScore {
                 matches.append(StreamMatch(
                     channel: index.entries[i].channel,
@@ -363,7 +434,8 @@ nonisolated enum StreamMatcher {
                     programDescription: score.programDescription,
                     programStart: score.programStart,
                     programEnd: score.programEnd,
-                    isHidden: index.entries[i].isHidden
+                    isHidden: index.entries[i].isHidden,
+                    relevance: score.relevance
                 ))
             }
         }
@@ -372,47 +444,152 @@ nonisolated enum StreamMatcher {
         // nothing else is available.
         let visible = matches.filter { !$0.isHidden }
         var result = visible.isEmpty ? matches : visible
-        result.sort { $0.score > $1.score }
-        if result.count > 10 { result.removeSubrange(10...) }
+        result = rankedMatches(result)
         return result
+    }
+
+    /// Relevance is categorical so a known broadcaster or favorite cannot
+    /// outrank the programme that actually names this event. Within that
+    /// evidence tier, reliability and sports motion precede useful resolution.
+    static func rankedMatches(
+        _ matches: [StreamMatch],
+        qualityByChannel: [String: StreamMatchQuality] = [:],
+        favoriteChannelIDs: Set<String> = [],
+        channelScores: [String: Double] = [:],
+        groupScores: [String: Double] = [:]
+    ) -> [StreamMatch] {
+        // Compute normalization and quality once per result, not O(n log n)
+        // times inside the comparator for hundreds of regional alternatives.
+        let ranked = matches.map { match in
+            let quality = qualityByChannel[match.channel.preferenceIdentity] ?? StreamMatchQuality()
+            return (match: match, availability: quality.availability.rawValue,
+                unstable: quality.isUnstable, healthy: healthyClass(quality.healthySeconds),
+                stallRatio: quality.observedSeconds >= 180 && quality.observedSeconds.isFinite && quality.bufferingSeconds >= 0 && quality.bufferingSeconds.isFinite
+                    ? min(1, quality.bufferingSeconds / quality.observedSeconds) : nil,
+                startup: measuredSeconds(quality.startupSeconds), delay: measuredSeconds(quality.liveDelaySeconds),
+                motion: motionClass(quality.observedFPS),
+                height: quality.observedHeight > 0 ? quality.observedHeight : advertisedHeight(match.channel),
+                bitrate: bitrateClass(quality.observedBitRate),
+                preference: preferenceBoost(match.channel, favorites: favoriteChannelIDs, channels: channelScores, groups: groupScores),
+                name: match.channel.name.lowercased())
+        }
+        return ranked.sorted { lhs, rhs in
+            if lhs.match.relevance != rhs.match.relevance { return lhs.match.relevance.rawValue > rhs.match.relevance.rawValue }
+            if lhs.availability != rhs.availability { return lhs.availability > rhs.availability }
+            if lhs.unstable != rhs.unstable { return !lhs.unstable }
+            if lhs.healthy != rhs.healthy { return lhs.healthy > rhs.healthy }
+            if lhs.stallRatio != rhs.stallRatio {
+                if let l = lhs.stallRatio, let r = rhs.stallRatio { return l < r }
+                return lhs.stallRatio != nil
+            }
+            if lhs.delay != rhs.delay {
+                if let l = lhs.delay, let r = rhs.delay { return l < r }
+                return lhs.delay != nil
+            }
+            if lhs.startup != rhs.startup {
+                if let l = lhs.startup, let r = rhs.startup { return l < r }
+                return lhs.startup != nil
+            }
+            if lhs.motion != rhs.motion { return lhs.motion > rhs.motion }
+            if lhs.height != rhs.height { return lhs.height > rhs.height }
+            if lhs.bitrate != rhs.bitrate { return lhs.bitrate > rhs.bitrate }
+            if lhs.preference != rhs.preference { return lhs.preference > rhs.preference }
+            if lhs.match.score != rhs.match.score { return lhs.match.score > rhs.match.score }
+            if lhs.name != rhs.name { return lhs.name < rhs.name }
+            return lhs.match.id < rhs.match.id
+        }.map(\.match)
+    }
+
+    /// Broadcaster-only hints ("a FOX affiliate") can number in the
+    /// hundreds for a national event. Keep every programme match, and only
+    /// the best-ranked hints, fewer when real programme evidence exists.
+    static func presentable(_ ranked: [StreamMatch], hintLimit: Int = 12, hintLimitWithoutEvidence: Int = 24) -> [StreamMatch] {
+        let hasEvidence = ranked.contains { $0.relevance != .channelHint }
+        let limit = hasEvidence ? hintLimit : hintLimitWithoutEvidence
+        var hints = 0
+        return ranked.filter { match in
+            guard match.relevance == .channelHint else { return true }
+            hints += 1
+            return hints <= limit
+        }
+    }
+
+    private static func measuredSeconds(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        return value
+    }
+
+    private static func healthyClass(_ seconds: Double) -> Int {
+        guard seconds.isFinite else { return 0 }
+        return Int(min(3, max(0, seconds) / 30))
+    }
+
+    private static func motionClass(_ fps: Double) -> Int {
+        guard fps.isFinite else { return 0 }
+        if fps >= 45 { return 2 }
+        if fps >= 23 { return 1 }
+        return 0
+    }
+
+    /// Coarse 2 Mb/s steps so probe noise between near-identical feeds of the
+    /// same resolution does not reorder them; unknown sorts below measured.
+    private static func bitrateClass(_ bitsPerSecond: Int64) -> Int {
+        guard bitsPerSecond > 0 else { return 0 }
+        return 1 + Int(min(bitsPerSecond, 40_000_000) / 2_000_000)
+    }
+
+    /// Used only as an advertised preference when no current measured height
+    /// exists. The row's badge retains its observed/unknown provenance.
+    private static func advertisedHeight(_ channel: Channel) -> Int {
+        let words = Set(tokenWords(in: normalise(channel.name)))
+        if !words.isDisjoint(with: ["4k", "uhd", "2160p"]) { return 2160 }
+        if !words.isDisjoint(with: ["fhd", "1080p", "1080"]) { return 1080 }
+        if !words.isDisjoint(with: ["hd", "720p", "720"]) { return 720 }
+        if words.contains("sd") { return 576 }
+        return 0
+    }
+
+    private static func preferenceBoost(_ channel: Channel, favorites: Set<String>,
+                                        channels: [String: Double], groups: [String: Double]) -> Double {
+        let key = channel.preferenceIdentity
+        return (favorites.contains(key) ? 0.08 : 0)
+            + min(0.08, max(0, channels[key] ?? 0) * 0.08)
+            + min(0.05, max(0, groups[channel.group] ?? 0) * 0.05)
     }
 
     private static func candidateEntryIndices(
         for queries: [SearchQuery],
-        in index: StreamSearchIndex
+        in index: StreamSearchIndex,
+        shouldCancel: @Sendable () -> Bool
     ) -> [Int] {
-        var candidateWeights: [Int: Double] = [:]
-
+        var candidates = Set<Int>()
+        var examined = 0
+        var seenQueries = Set<String>()
         for query in queries {
-            for term in query.fuzzyTerms {
-                if let hits = index.tokenToEntryIndices[term] {
-                    let weight = index.inverseDocumentFrequency[term] ?? 0.1
-                    for hit in hits {
-                        candidateWeights[hit, default: 0] += weight
-                    }
+            guard !shouldCancel() else { return [] }
+            let terms = Set(query.fuzzyTerms).filter { $0.count >= 2 }.sorted()
+            guard !terms.isEmpty else { continue }
+            // Exact evidence needs all terms. A fuzzy repair may miss one
+            // term, but never lets the generic league keyword alone admit
+            // every NFL channel into a two-team event's expensive scoring.
+            let threshold = query.allowsFuzzy && query.score >= 100 && terms.count > 1 ? terms.count - 1 : terms.count
+            let queryKey = String(threshold) + "|" + terms.joined(separator: "|")
+            guard seenQueries.insert(queryKey).inserted else { continue }
+            var hitsPerEntry: [Int: Int] = [:]
+            for term in terms {
+                for hit in index.tokenToEntryIndices[term] ?? [] {
+                    if examined & 63 == 0, shouldCancel() { return [] }
+                    examined &+= 1
+                    hitsPerEntry[hit, default: 0] += 1
                 }
             }
-            for token in query.tokens where token.count >= 2 {
-                if let hits = index.tokenToEntryIndices[token] {
-                    let weight = index.inverseDocumentFrequency[token] ?? 0.1
-                    for hit in hits {
-                        candidateWeights[hit, default: 0] += weight
-                    }
-                }
-            }
+            for (entry, hits) in hitsPerEntry where hits >= threshold { candidates.insert(entry) }
         }
-
-        guard candidateWeights.count > maxCandidateEntries else {
-            return Array(candidateWeights.keys)
-        }
-
-        return candidateWeights
-            .sorted { lhs, rhs in
-                if lhs.value != rhs.value { return lhs.value > rhs.value }
-                return lhs.key < rhs.key
-            }
-            .prefix(maxCandidateEntries)
-            .map(\.key)
+        guard !shouldCancel() else { return [] }
+        // A repeated local network can occupy hundreds of entries. A fixed
+        // candidate cap excluded exact UHD event matches before scoring them.
+        // Score every plausible inverted-index hit; shared guide scores reuse.
+        return candidates.sorted()
     }
 
     // MARK: - Scoring
@@ -424,6 +601,7 @@ nonisolated enum StreamMatcher {
         var programDescription: String?
         var programStart: Date?
         var programEnd: Date?
+        var relevance: StreamMatch.Relevance = .channelHint
 
         mutating func record(
             _ v: Double,
@@ -431,15 +609,17 @@ nonisolated enum StreamMatcher {
             program: String? = nil,
             description: String? = nil,
             start: Date? = nil,
-            end: Date? = nil
+            end: Date? = nil,
+            relevance newRelevance: StreamMatch.Relevance = .channelHint
         ) {
-            if v > value {
+            if newRelevance.rawValue > relevance.rawValue || (newRelevance == relevance && v > value) {
                 value = v
                 reason = r
                 programTitle = program
                 programDescription = description
                 programStart = start
                 programEnd = end
+                relevance = newRelevance
             }
         }
     }
@@ -450,19 +630,27 @@ nonisolated enum StreamMatcher {
         broadcastLower: [String],
         contextKeywords: [ContiguousArray<UInt8>],
         eventStart: Date,
+        now: Date,
         windowStart: Date,
         windowEnd: Date,
         allowCurrentlyLiveEPG: Bool,
-        isTournament: Bool
+        isTournament: Bool,
+        fixture: FixtureTerms?,
+        programmeScores: inout [String: Score],
+        shouldCancel: @Sendable () -> Bool
     ) -> Score {
         var best = Score()
         let entry = entries[i]
         let groupLabel = entry.group.isEmpty ? "" : entry.group
 
         // ── EPG titles + descriptions in event window (strongest signal) ──
-        if !entry.epgTitles.isEmpty {
-            let now = Date()
+        if let guideID = entry.guideKey, let cached = programmeScores[guideID] {
+            best = cached
+        } else if !entry.epgTitles.isEmpty {
+            var examined = 0
             for epg in entry.epgTitles {
+                if examined & 15 == 0, shouldCancel() { return Score() }
+                examined &+= 1
                 let overlapsEventWindow = epg.start < windowEnd && epg.end > windowStart
                 let isCurrentlyLive = allowCurrentlyLiveEPG && epg.start <= now && epg.end > now
                 guard overlapsEventWindow || isCurrentlyLive else { continue }
@@ -473,6 +661,28 @@ nonisolated enum StreamMatcher {
                         isTournament: isTournament
                     )
                     : 12
+                // A title naming this team against someone else is another
+                // fixture, whichever query found it; one naming both sides
+                // is the event itself even when only one team term matched.
+                let verdict = fixture?.verdict(forTitle: epg.title) ?? .undetermined
+                if verdict == .conflicting {
+                    PerfMetrics.shared.increment("sports.match.fixtureConflictsRejected")
+                    continue
+                }
+                let fixtureBonus: Double = verdict == .confirmed ? 40 : 0
+                func titleRelevance(_ q: SearchQuery) -> StreamMatch.Relevance {
+                    verdict == .confirmed || q.score >= 140 ? .eventProgramme : .relatedProgramme
+                }
+                // Fuzzy and description-only evidence is weaker than a title
+                // naming the event: it needs a sport/league word in the listing,
+                // and a description alone never claims to be the event itself.
+                lazy var hasSportContext = contextKeywords.contains { kw in
+                    containsBytes(kw, in: epg.titleLower)
+                        || (!epg.descLower.isEmpty && containsBytes(kw, in: epg.descLower))
+                }
+                func descriptionRelevance(_ q: SearchQuery) -> StreamMatch.Relevance {
+                    verdict == .confirmed ? .eventProgramme : .relatedProgramme
+                }
 
                 for q in queries {
                     guard q.target != .channelOnly else { continue }
@@ -482,20 +692,15 @@ nonisolated enum StreamMatcher {
                         // sports (e.g. "giants" in both MLB and IPL cricket).
                         // Require a sport-context signal: the EPG title or
                         // description must also contain a sport/league keyword.
-                        if q.tokenBytes.count == 1 {
-                            let hasContext = contextKeywords.contains { kw in
-                                containsBytes(kw, in: epg.titleLower)
-                                || (!epg.descLower.isEmpty && containsBytes(kw, in: epg.descLower))
-                            }
-                            if !hasContext { continue }
-                        }
+                        if q.tokenBytes.count == 1, !hasSportContext { continue }
                         best.record(
-                            q.score + 50 + timeBonus,
+                            q.score + 50 + timeBonus + fixtureBonus,
                             groupLabel,
                             program: epg.title,
                             description: epg.description,
                             start: epg.start,
-                            end: epg.end
+                            end: epg.end,
+                            relevance: titleRelevance(q)
                         )
                         break
                     }
@@ -503,14 +708,15 @@ nonisolated enum StreamMatcher {
                         query: q,
                         words: epg.titleWords,
                         compactText: epg.titleCompact
-                    ) {
+                    ), verdict == .confirmed || hasSportContext {
                         best.record(
-                            q.score + 28 + (coverage * 18) + (timeBonus * 0.8),
+                            q.score + 28 + (coverage * 18) + (timeBonus * 0.8) + fixtureBonus,
                             groupLabel,
                             program: epg.title,
                             description: epg.description,
                             start: epg.start,
-                            end: epg.end
+                            end: epg.end,
+                            relevance: titleRelevance(q)
                         )
                         break
                     }
@@ -526,11 +732,12 @@ nonisolated enum StreamMatcher {
                             program: epg.title,
                             description: epg.description,
                             start: epg.start,
-                            end: epg.end
+                            end: epg.end,
+                            relevance: descriptionRelevance(q)
                         )
                         break
                     }
-                    if q.tokens.count >= 2,
+                    if q.tokens.count >= 2, hasSportContext,
                        let coverage = descriptionFuzzyTokenCoverage(query: q, epg: epg) {
                         best.record(
                             q.score + 18 + (coverage * 14) + (timeBonus * 0.6),
@@ -538,13 +745,18 @@ nonisolated enum StreamMatcher {
                             program: epg.title,
                             description: epg.description,
                             start: epg.start,
-                            end: epg.end
+                            end: epg.end,
+                            relevance: descriptionRelevance(q)
                         )
                         break
                     }
                 }
             }
+            if let guideID = entry.guideKey { programmeScores[guideID] = best }
         }
+
+        // Shared guide evidence retains the programme, not another variant's folder.
+        best.reason = groupLabel
 
         // ── Channel name ──
         for q in queries {
@@ -1030,6 +1242,63 @@ nonisolated enum StreamMatcher {
 
     private static func acronym(for words: ContiguousArray<String>) -> String {
         String(words.compactMap(\.first))
+    }
+
+    /// Head-to-head check for guide titles of the form "A v B".
+    struct FixtureTerms: Sendable {
+        enum Verdict: Sendable { case confirmed, conflicting, undetermined }
+
+        let home: [String]
+        let away: [String]
+
+        init?(event: SportEvent) {
+            guard let homeTeam = event.homeTeam, let awayTeam = event.awayTeam else { return nil }
+            home = StreamMatcher.teamSearchTerms(for: homeTeam)
+            away = StreamMatcher.teamSearchTerms(for: awayTeam)
+            guard !home.isEmpty, !away.isEmpty else { return nil }
+        }
+
+        private static let separators = [" versus ", " vs. ", " vs ", " v. ", " v ", " @ "]
+        // Placeholder opponents and broadcast suffixes carry no fixture identity.
+        private static let neutralWords: Set<String> = ["tbc", "tba", "tbd", "live", "replay", "highlights", "hd", "fhd", "uhd", "4k"]
+
+        func verdict(forTitle title: String) -> Verdict {
+            let lower = StreamMatcher.normalise(title)
+            guard let range = Self.separators.lazy.compactMap({ lower.range(of: $0) }).first else { return .undetermined }
+            let left = String(lower[..<range.lowerBound])
+            let right = String(lower[range.upperBound...])
+            let leftHome = Self.side(left, names: home), leftAway = Self.side(left, names: away)
+            let rightHome = Self.side(right, names: home), rightAway = Self.side(right, names: away)
+            if (leftHome && rightAway) || (leftAway && rightHome) { return .confirmed }
+            let leftNamed = leftHome || leftAway, rightNamed = rightHome || rightAway
+            // One side is ours; the other names a real, different opponent.
+            if leftNamed != rightNamed {
+                let other = leftNamed ? right : left
+                // The opponent side may run into trailing context, e.g.
+                // "Liverpool v Everton: Live" or "Liverpool v Everton (R)".
+                let opponent = other.split(whereSeparator: { ":(|[".contains($0) }).first.map(String.init) ?? other
+                let words = StreamMatcher.tokenWords(in: opponent).filter { !Self.neutralWords.contains($0) && $0.count >= 3 }
+                if !words.isEmpty, !Self.fuzzySide(words, names: leftNamed ? (leftHome ? away : home) : (rightHome ? away : home)) {
+                    return .conflicting
+                }
+            }
+            return .undetermined
+        }
+
+        private static func side(_ text: String, names: [String]) -> Bool {
+            names.contains { StreamMatcher.wordBoundaryMatch($0, in: text) }
+        }
+
+        /// Tolerates guide misspellings of the expected opponent so a typo
+        /// is never treated as a different team.
+        private static func fuzzySide(_ words: [String], names: [String]) -> Bool {
+            let contiguous = ContiguousArray(words)
+            return names.contains { name in
+                StreamMatcher.tokenWords(in: name).contains { term in
+                    term.count >= 4 && StreamMatcher.bestSimilarity(for: term, in: contiguous) >= 0.88
+                }
+            }
+        }
     }
 
     private static func teamSearchTerms(for team: TeamInfo) -> [String] {

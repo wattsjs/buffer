@@ -6,6 +6,7 @@ struct RemindersView: View {
 
     @State private var notificationManager = NotificationManager.shared
     @State private var tick = Date()
+    @Environment(\.epgActionModel) private var actionModel
 
     private var upcoming: [ProgramReminder] {
         notificationManager.reminders
@@ -46,7 +47,11 @@ struct RemindersView: View {
                 ForEach(upcoming) { reminder in
                     ReminderRow(
                         reminder: reminder,
-                        channel: channels.first { $0.id == reminder.channelID },
+                        channel: actionModel?.pinnedSourceChannel(ownership: reminder.sourceOwnership,
+                            legacyID: reminder.channelID, playlistID: reminder.playlistID) ?? channels.first {
+                                if let key = reminder.sourceOwnership?.channelIdentity { return $0.sourceChannelIdentity == key }
+                                return $0.id == reminder.channelID
+                            },
                         onPlay: { onPlayReminder(reminder) },
                         onCancel: { notificationManager.cancelReminder(id: reminder.id) }
                     )
@@ -226,8 +231,8 @@ private struct ReminderRow: View {
     /// hand it to RecordingManager via the same path the EPG grid uses.
     private func reminderProgram() -> EPGProgram {
         EPGProgram(
-            id: reminder.programID,
-            channelID: reminder.channelID,
+            id: reminder.sourceProgramID ?? reminder.programID,
+            channelID: reminder.sourceOwnership?.guideBinding?.epgChannelID ?? reminder.channelID,
             title: reminder.programTitle,
             description: reminder.programDescription,
             start: reminder.programStart,
@@ -239,8 +244,9 @@ private struct ReminderRow: View {
     private func recordingMenuItems(channel: Channel) -> some View {
         let recorder = RecordingManager.shared
         let existing = recorder.recordings.first { rec in
-            rec.programID == reminder.programID
-                && rec.channelID == channel.id
+            rec.programID == (reminder.sourceProgramID ?? reminder.programID)
+                && ((channel.sourceChannelIdentity != nil && rec.sourceOwnership?.channelIdentity == channel.sourceChannelIdentity) ||
+                    (rec.sourceOwnership == nil && rec.channelID == channel.id && rec.playlistID == reminder.playlistID))
                 && (rec.status == .scheduled || rec.status == .recording)
         }
 
@@ -260,7 +266,7 @@ private struct ReminderRow: View {
                 let program = reminderProgram()
                 Task { @MainActor in
                     _ = await recorder.startLiveRecording(
-                        playlistID: reminder.playlistID,
+                        playlistID: channel.sourceChannelIdentity?.sourceID ?? reminder.playlistID,
                         channel: channel,
                         program: program
                     )
@@ -271,7 +277,7 @@ private struct ReminderRow: View {
         } else {
             Button {
                 _ = recorder.schedule(
-                    playlistID: reminder.playlistID,
+                    playlistID: channel.sourceChannelIdentity?.sourceID ?? reminder.playlistID,
                     channel: channel,
                     program: reminderProgram()
                 )

@@ -102,6 +102,7 @@ nonisolated final class PerformanceMonitor: @unchecked Sendable {
 
     private func emitSummary(at now: ContinuousClock.Instant) {
         lastSummaryAt = now
+        PerfMetrics.shared.emitSummary()
         guard sampleCount > 0 else {
             AppLog.performance.info("ui-lag heartbeat samples=0 mainQueuePending=\(self.pingSentAt != nil, privacy: .public)")
             return

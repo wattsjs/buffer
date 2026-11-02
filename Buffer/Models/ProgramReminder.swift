@@ -14,6 +14,9 @@ struct ProgramReminder: Identifiable, Codable, Equatable, Sendable {
     let createdAt: Date
     let leadMinutes: Int
     let streamURL: URL
+    /// Optional for reminders saved before source ownership was introduced.
+    var sourceOwnership: ChannelSourceOwnership? = nil
+    var sourceProgramID: String? = nil
 
     static func makeID(playlistID: UUID, channelID: String, programID: String) -> String {
         "buffer.reminder|\(playlistID.uuidString)|\(channelID)|\(programID)"

@@ -1,0 +1,70 @@
+{
+  "fixture": "sync-http-overlap-v1",
+  "schemaVersion": 1,
+  "configuration": "Standalone optimized production EPGViewModel + HTTP clients/parsers; platform/cache stubs",
+  "movieAndSeriesLatencyMs": 650,
+  "guideLatencyMs": 20,
+  "after": [
+    {
+      "fixture": "sync-http-overlap-v1",
+      "elapsedMs": 730,
+      "catalogDispatchSkewMs": 0.103
+    },
+    {
+      "fixture": "sync-http-overlap-v1",
+      "elapsedMs": 731,
+      "catalogDispatchSkewMs": 0.069
+    },
+    {
+      "fixture": "sync-http-overlap-v1",
+      "elapsedMs": 727,
+      "catalogDispatchSkewMs": 0.049
+    }
+  ],
+  "afterSourceSHA256": "ac858527c682aec5ef2a60271a320d89f6664e5bfffa9a4727b7763037a9b490",
+  "afterExecutableSHA256": "87cd0811970b5eafc41d2f1dece6ace3e50d253a998da7743d8f067a6014c3fe",
+  "sourceHashes": {
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Models/ServerConfig.swift": "7e2e53fc8fc29e391d56a3e1668f06cb51e1bc4e7d6ec89f8987c95d708a66be",
+    "Buffer/Models/VODItem.swift": "dba3e220799c91d3496b653613b4393f5d0f5f8054a11d935f6b4cdd86f9964f",
+    "Buffer/Models/VODSeries.swift": "348bd50250ca76f02fbb411931dd6a1ac573dd39d00b54a1be265bd145438f91",
+    "Buffer/Models/ServerAccountStatus.swift": "ff87b6aef40150f52954f6add5b48e1a806554b56f383cd60d38ba3275471188",
+    "Buffer/Models/ProgramReminder.swift": "64051d1c72efe4795a754b413c9c784d5d83df82c0dff76c85c286c79478a5a9",
+    "Buffer/Models/SyncInterval.swift": "440f75130b599cb34ffc2e298ab4c390c2528c7d4398acfb619943339c80c5af",
+    "Buffer/Services/XtreamClient.swift": "e81b64778ce3686aa6e555a05a79dbf537c6a766361e1fa8d290e1bc7419824d",
+    "Buffer/Services/StalkerClient.swift": "96f197507874c2368cf6e54b1b36ff43bb3888f2cf20974c4557cf154bb05a1a",
+    "Buffer/Services/M3UParser.swift": "f11bfb05a78c5dec22e3235a41c703c9b35391fbe6e811cb6e7add7d1fbb5a62",
+    "Buffer/Services/XMLTVParser.swift": "d09b2ed54fd707c4f21e62360b21e963529c42338aae653ebe462fba35d9e05b",
+    "Buffer/Support/AppLog.swift": "c71fdc6554240bf102d6b29687c0c3841b17e862f63531471e4c9c95a55e6233",
+    "Buffer/Support/GuideLookup.swift": "f5ed09a53c4235f746236d684fe0f1c7fcff6d97b6cf70b4692647fe39cb73bf",
+    "benchmarks/sync_test_support.swift": "ad9bdef415e61281c0993d993c2f74461ea79bf65095384ec15a3ca7e07011ff",
+    "Buffer/ViewModels/EPGViewModel.swift": "ac858527c682aec5ef2a60271a320d89f6664e5bfffa9a4727b7763037a9b490",
+    "benchmarks/sync_integration.swift": "4f96031f6b74d9637edbe793953fc10939195b86db353dd3a7d670a3ac665629"
+  },
+  "recordedAt": "2026-10-04T11:07:52.992227+00:00",
+  "limitations": "Controlled loopback latency; not a live-provider throughput claim or full-app Debug CPU/RSS measurement.",
+  "before": [
+    {
+      "fixture": "sync-http-overlap-v1",
+      "elapsedMs": 1388,
+      "catalogDispatchSkewMs": 656.611
+    },
+    {
+      "fixture": "sync-http-overlap-v1",
+      "elapsedMs": 1390,
+      "catalogDispatchSkewMs": 664.236
+    },
+    {
+      "fixture": "sync-http-overlap-v1",
+      "elapsedMs": 1391,
+      "catalogDispatchSkewMs": 656.25
+    }
+  ],
+  "beforeSourceSHA256": "bd2188a92cd77c9178ba3ddec479fddf699466bb7b4e87b5b598a8544d64f861",
+  "beforeExecutableSHA256": "886c7b9da402302b937b9334aa0a457afb9a4ee347a92966e50a724f5c993887",
+  "baselineMedianMs": 1390,
+  "medianMs": 730,
+  "changeFraction": -0.47482014388489213,
+  "regression": false
+}

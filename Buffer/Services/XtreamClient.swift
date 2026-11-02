@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 struct XtreamAccountInfo: Codable, Equatable {
     let isAuthenticated: Bool
@@ -23,12 +24,12 @@ struct XtreamAccountInfo: Codable, Equatable {
 
 extension KeyedDecodingContainer {
     // String-first: for fields that are typically strings (names, URLs, IDs)
-    func flexString(forKey key: Key) throws -> String {
+    nonisolated func flexString(forKey key: Key) throws -> String {
         if let s = try? decode(String.self, forKey: key) { return s }
         if let i = try? decode(Int.self, forKey: key) { return String(i) }
         return ""
     }
-    func flexStringIfPresent(forKey key: Key) throws -> String? {
+    nonisolated func flexStringIfPresent(forKey key: Key) throws -> String? {
         if contains(key) {
             if let s = try? decode(String.self, forKey: key) { return s }
             if let i = try? decode(Int.self, forKey: key) { return String(i) }
@@ -36,12 +37,12 @@ extension KeyedDecodingContainer {
         return nil
     }
     // Int-first: for fields that are typically integers (stream_id, category_id, etc.)
-    func flexInt(forKey key: Key) throws -> String {
+    nonisolated func flexInt(forKey key: Key) throws -> String {
         if let i = try? decode(Int.self, forKey: key) { return String(i) }
         if let s = try? decode(String.self, forKey: key) { return s }
         return ""
     }
-    func flexIntIfPresent(forKey key: Key) throws -> String? {
+    nonisolated func flexIntIfPresent(forKey key: Key) throws -> String? {
         if contains(key) {
             if let i = try? decode(Int.self, forKey: key) { return String(i) }
             if let s = try? decode(String.self, forKey: key) { return s }
@@ -49,7 +50,7 @@ extension KeyedDecodingContainer {
         return nil
     }
     // Bool decoder: handles true/false, 1/0, "true"/"false"/"1"/"0"
-    func flexBool(forKey key: Key) throws -> Bool {
+    nonisolated func flexBool(forKey key: Key) throws -> Bool {
         if let b = try? decode(Bool.self, forKey: key) { return b }
         if let i = try? decode(Int.self, forKey: key) { return i != 0 }
         if let s = try? decode(String.self, forKey: key) {
@@ -536,52 +537,93 @@ actor XtreamClient {
                 logoURL: stream.stream_icon.flatMap { URL(string: $0) },
                 group: categoryName,
                 streamURL: streamURL,
-                epgChannelID: stream.epg_channel_id,
+                epgChannelID: nonEmpty(stream.epg_channel_id) ?? "xtream-stream-\(stream.stream_id)",
                 catchup: makeXtreamCatchup(streamID: stream.stream_id, archive: stream)
             ))
         }
         return channels
     }
 
-    func fetchCatchupEPG(for channels: [Channel], since minimumStart: Date? = nil) async throws -> [EPGProgram] {
-        var programs: [EPGProgram] = []
-        var firstError: Error?
+    struct CatchupProgress: Sendable {
+        let channelID: String
+        let epgID: String
+        let programs: [EPGProgram]
+        let failed: Bool
+        let completed: Int
+        let total: Int
+        let receivedListings: Int
+        let responseEarliestEpoch: Double
+        let responseLatestEpoch: Double
+    }
 
+    func fetchCatchupEPG(for channels: [Channel], since minimumStart: Date? = nil, maxConcurrentRequests: Int = 8, collectResults: Bool = true,
+                         onProgress: (@Sendable (CatchupProgress) async -> Void)? = nil) async throws -> [EPGProgram] {
+        try Task.checkCancellation()
+        var jobs: [CatchupJob] = []
+        jobs.reserveCapacity(channels.count)
         for channel in channels {
             guard let epgID = channel.epgChannelID else { continue }
+            let target = try xtreamURL(with: [
+                URLQueryItem(name: "username", value: config.username),
+                URLQueryItem(name: "password", value: config.password),
+                URLQueryItem(name: "action", value: "get_simple_data_table"),
+                URLQueryItem(name: "stream_id", value: channel.id)
+            ])
+            jobs.append(CatchupJob(
+                url: target,
+                channelID: channel.id,
+                epgID: epgID,
+                minimumStart: minimumStart
+            ))
+        }
 
-            do {
-                let target = try xtreamURL(with: [
-                    URLQueryItem(name: "username", value: config.username),
-                    URLQueryItem(name: "password", value: config.password),
-                    URLQueryItem(name: "action", value: "get_simple_data_table"),
-                    URLQueryItem(name: "stream_id", value: channel.id)
-                ])
-                let data = try await fetchData(from: target)
-                let envelope = try JSONDecoder().decode(XtreamEPGEnvelope.self, from: data)
+        let started = ContinuousClock.now
+        let concurrency = min(8, max(1, maxConcurrentRequests), max(jobs.count, 1))
+        var programs: [EPGProgram] = []
+        var firstError: Error?
+        var nextIndex = 0
+        var completed = 0
+        var succeeded = 0
+        var deliveredPrograms = 0
 
-                for listing in envelope.listings {
-                    guard let start = Self.date(fromEpochString: listing.startTimestamp),
-                          let end = Self.date(fromEpochString: listing.stopTimestamp),
-                          end > start else { continue }
-                    if let minimumStart, end <= minimumStart { continue }
-
-                    let listingID = nonEmpty(listing.id) ?? "\(Int(start.timeIntervalSince1970))-\(Int(end.timeIntervalSince1970))"
-                    programs.append(EPGProgram(
-                        id: "xtream-simple-\(channel.id)-\(listingID)",
-                        channelID: epgID,
-                        title: Self.decodedEPGText(listing.title) ?? "No Event Today",
-                        description: Self.decodedEPGText(listing.description) ?? "",
-                        start: start,
-                        end: end
-                    ))
+        await withTaskGroup(of: CatchupBatch.self) { group in
+            func enqueue() {
+                guard !Task.isCancelled, !group.isCancelled, nextIndex < jobs.count else { return }
+                let job = jobs[nextIndex]
+                nextIndex += 1
+                group.addTask {
+                    await Self.fetchCatchupBatch(job)
                 }
-            } catch {
-                firstError = firstError ?? error
+            }
+            for _ in 0..<min(concurrency, jobs.count) {
+                enqueue()
+            }
+            while let batch = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    continue
+                }
+                if let error = batch.error, firstError == nil {
+                    firstError = error
+                }
+                deliveredPrograms += batch.programs.count
+                if collectResults { programs.append(contentsOf: batch.programs) }
+                completed += 1
+                if batch.error == nil { succeeded += 1 }
+                enqueue()
+                if let onProgress {
+                    await onProgress(CatchupProgress(channelID: batch.channelID, epgID: batch.epgID,
+                        programs: batch.programs, failed: batch.error != nil, completed: completed, total: jobs.count,
+                        receivedListings: batch.receivedListings, responseEarliestEpoch: batch.responseEarliestEpoch,
+                        responseLatestEpoch: batch.responseLatestEpoch))
+                }
             }
         }
 
-        if programs.isEmpty, let firstError {
+        try Task.checkCancellation()
+        AppLog.sync.info("Xtream catchup EPG fetched channels=\(jobs.count, privacy: .public) programs=\(deliveredPrograms, privacy: .public) collected=\(collectResults, privacy: .public) concurrency=\(concurrency, privacy: .public) fetchMs=\(AppLog.elapsedMilliseconds(since: started), privacy: .public)")
+
+        if succeeded == 0, let firstError {
             throw firstError
         }
         return programs
@@ -865,6 +907,67 @@ actor XtreamClient {
         return finalURL
     }
 
+    private struct CatchupJob: Sendable {
+        let url: URL
+        let channelID: String
+        let epgID: String
+        let minimumStart: Date?
+    }
+
+    private struct CatchupBatch: Sendable {
+        var channelID: String
+        var epgID: String
+        var programs: [EPGProgram]
+        var error: (any Error)?
+        var receivedListings = 0
+        var responseEarliestEpoch = 0.0
+        var responseLatestEpoch = 0.0
+    }
+
+    private static func fetchCatchupBatch(_ job: CatchupJob) async -> CatchupBatch {
+        var request = URLRequest(url: job.url)
+        request.timeoutInterval = 15
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse,
+               !(200..<400).contains(http.statusCode) {
+                return CatchupBatch(channelID: job.channelID, epgID: job.epgID, programs: [], error: URLError(.badServerResponse))
+            }
+            let envelope = try JSONDecoder().decode(XtreamEPGEnvelope.self, from: data)
+            var programs: [EPGProgram] = []
+            programs.reserveCapacity(envelope.listings.count)
+            var earliest = Double.infinity
+            var latest = 0.0
+            for listing in envelope.listings {
+                guard let start = date(fromEpochString: listing.startTimestamp),
+                      let end = date(fromEpochString: listing.stopTimestamp),
+                      end > start else { continue }
+                earliest = min(earliest, start.timeIntervalSince1970)
+                latest = max(latest, end.timeIntervalSince1970)
+                if let minimumStart = job.minimumStart, end <= minimumStart { continue }
+                // Missing text is unavailable metadata, not an invented
+                // "No Event" interval. Explicit provider No Event text stays.
+                guard let title = decodedEPGText(listing.title) else { continue }
+                let listingID = listing.id?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let id = (listingID?.isEmpty == false ? listingID! : nil)
+                    ?? "\(Int(start.timeIntervalSince1970))-\(Int(end.timeIntervalSince1970))"
+                programs.append(EPGProgram(
+                    id: "xtream-simple-\(job.channelID)-\(id)",
+                    channelID: job.epgID,
+                    title: title,
+                    description: decodedEPGText(listing.description) ?? "",
+                    start: start,
+                    end: end
+                ))
+            }
+            return CatchupBatch(channelID: job.channelID, epgID: job.epgID, programs: programs, error: nil,
+                receivedListings: envelope.listings.count, responseEarliestEpoch: earliest.isFinite ? earliest : 0,
+                responseLatestEpoch: latest)
+        } catch {
+            return CatchupBatch(channelID: job.channelID, epgID: job.epgID, programs: [], error: error)
+        }
+    }
+
     private func fetchData(from url: URL) async throws -> Data {
         var request = URLRequest(url: url)
         request.timeoutInterval = 15
@@ -890,7 +993,7 @@ actor XtreamClient {
     private static func date(fromEpochString value: String?) -> Date? {
         guard let value,
               let seconds = TimeInterval(value),
-              seconds > 0 else {
+              seconds.isFinite, seconds > 0, seconds < Double(Int.max) else {
             return nil
         }
         return Date(timeIntervalSince1970: seconds)

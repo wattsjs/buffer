@@ -7,11 +7,20 @@ struct SportsView: View {
     let favoriteChannelIDs: Set<String>
     let hiddenGroups: Set<String>
     let onChannelSelected: (Channel) -> Void
+    var onCatchup: ((Channel, EPGProgram) -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
+            if let warning = viewModel.refreshWarning, viewModel.totalEvents > 0 {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(BufferFont.meta)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, BufferLayout.content)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             if viewModel.totalEvents == 0 && !viewModel.hasLoadedOnce {
                 loadingState
@@ -119,7 +128,8 @@ struct SportsView: View {
                                 SportEventCard(
                                     event: event,
                                     viewModel: viewModel,
-                                    onChannelSelected: onChannelSelected
+                                    onChannelSelected: onChannelSelected,
+                                    onCatchup: onCatchup
                                 )
                             }
                         }
@@ -168,9 +178,10 @@ struct SportsView: View {
 
     private var emptyState: some View {
         ContentUnavailableView {
-            Label("No Events", systemImage: "sportscourt")
+            Label(viewModel.refreshWarning == nil ? "No Events" : "Sports Unavailable",
+                  systemImage: viewModel.refreshWarning == nil ? "sportscourt" : "wifi.exclamationmark")
         } description: {
-            Text("No sporting events found right now. Try refreshing or check back later.")
+            Text(viewModel.refreshWarning ?? "No sporting events found right now. Try refreshing or check back later.")
         } actions: {
             Button("Refresh") {
                 viewModel.refresh()
@@ -187,15 +198,23 @@ private struct SportEventCard: View {
     let event: SportEvent
     let viewModel: SportsViewModel
     let onChannelSelected: (Channel) -> Void
+    let onCatchup: ((Channel, EPGProgram) -> Void)?
 
     @State private var hovered = false
     @State private var showStreams = false
-    @State private var matches: [StreamMatch]?
-    @State private var matchUnavailableMessage: String?
-    @State private var isMatching = false
-    @State private var lastIndexVersion: Int = 0
+    @State private var matchState = SportEventMatchState()
     @State private var notificationManager = NotificationManager.shared
     @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
+    @Environment(\.epgActionModel) private var actionModel
+
+    private var matchContext: SportEventMatchContext {
+        SportEventMatchContext(
+            event: event,
+            indexVersion: viewModel.searchIndexVersion,
+            modelIdentity: ObjectIdentifier(viewModel),
+            preferencesVersion: viewModel.matchingPreferencesVersion
+        )
+    }
 
     /// Subtitle for tournament-style events (no head-to-head teams): round
     /// detail and/or venue, e.g. "Rd 2 · Harbour Town Golf Links".
@@ -216,31 +235,43 @@ private struct SportEventCard: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    /// Event is playable if live, halftime, or starting within 15 minutes.
-    private var eventIsPlayable: Bool {
-        switch event.status {
-        case .live, .halftime: return true
-        default:
-            return event.startDate.timeIntervalSinceNow <= 15 * 60
+    private var eventActionMode: SportsEventActionPolicy.Mode {
+        SportsEventActionPolicy.mode(for: event)
+    }
+
+    private var actionHint: String? {
+        switch eventActionMode {
+        case .live: return nil
+        case .upcoming: return "Set a reminder"
+        case .replayOnly: return "Replay where available"
+        case .unavailable: return "Event unavailable"
         }
     }
 
-    /// Synthetic EPGProgram used for reminder + recording integrations.
-    /// ESPN scoreboards only give a start time, so we assume a 3-hour window.
-    private func syntheticProgram(for channel: Channel) -> EPGProgram {
-        EPGProgram(
-            id: "sport_\(event.id)",
-            channelID: channel.epgChannelID ?? channel.id,
-            title: event.displayTitle,
-            description: "\(event.league.fullName)",
-            start: event.startDate,
-            end: event.startDate.addingTimeInterval(3 * 3600)
-        )
+    private func replayProgram(for match: StreamMatch) -> EPGProgram? {
+        SportsEventActionPolicy.replayProgram(for: event, match: match,
+            currentPrograms: actionModel?.programsForChannel(match.channel) ?? [])
+    }
+
+    private func actionProgram(for channel: Channel) -> EPGProgram? {
+        let matches = matchState.snapshot(for: matchContext,
+            unavailableMessage: viewModel.streamIndexUnavailableMessage).matches
+        let match = matches.first { $0.channel.preferenceIdentity == channel.preferenceIdentity }
+        return SportsProgrammeBinding.program(for: event, channel: channel, match: match,
+            currentPrograms: actionModel?.programsForChannel(channel) ?? [])
     }
 
     private func setReminder(for channel: Channel) {
-        guard let playlistID = activePlaylistID else { return }
-        let program = syntheticProgram(for: channel)
+        guard eventActionMode == .upcoming else { return }
+        if channel.sourceOwnership?.logicalChannelID != nil {
+            actionModel?.showSmartActionUnavailable("Choose a programme in this channel’s guide to set a reminder with its source binding.")
+            return
+        }
+        guard let playlistID = channel.sourceChannelIdentity?.sourceID ?? activePlaylistID else { return }
+        guard let program = actionProgram(for: channel) else {
+            actionModel?.showSmartActionUnavailable("The matching programme has changed. Refresh the guide before scheduling this event.")
+            return
+        }
         Task { @MainActor in
             let scheduled = await notificationManager.scheduleReminder(
                 playlistID: playlistID,
@@ -259,8 +290,16 @@ private struct SportEventCard: View {
     }
 
     private func record(channel: Channel) {
-        guard let playlistID = activePlaylistID else { return }
-        let program = syntheticProgram(for: channel)
+        guard eventActionMode == .live || eventActionMode == .upcoming else { return }
+        if channel.sourceOwnership?.logicalChannelID != nil {
+            actionModel?.showSmartActionUnavailable("Choose a programme in the guide to pin the recording to its actual source and end time.")
+            return
+        }
+        guard let playlistID = channel.sourceChannelIdentity?.sourceID ?? activePlaylistID else { return }
+        guard let program = actionProgram(for: channel) else {
+            actionModel?.showSmartActionUnavailable("The matching programme has changed. Refresh the guide before scheduling this event.")
+            return
+        }
         switch event.status {
         case .live, .halftime:
             Task { @MainActor in
@@ -280,6 +319,11 @@ private struct SportEventCard: View {
     }
 
     var body: some View {
+        let matchingContext = matchContext
+        let matchSnapshot = matchState.snapshot(
+            for: matchingContext,
+            unavailableMessage: viewModel.streamIndexUnavailableMessage
+        )
         VStack(alignment: .leading, spacing: 0) {
             // Top bar: league + time
             HStack(spacing: 6) {
@@ -340,34 +384,50 @@ private struct SportEventCard: View {
         .accessibilityLabel("\(event.displayTitle), \(event.status.label)")
         .accessibilityAddTraits(.isButton)
         .accessibilityHint("Double-tap to view streams or play")
-        .onChange(of: viewModel.searchIndexVersion) { _, newVersion in
-            guard showStreams, newVersion != lastIndexVersion else { return }
-            lastIndexVersion = newVersion
-            rematchIfNeeded()
+        .onChange(of: matchContext) { updateMatching() }
+        .onChange(of: showStreams) { updateMatching() }
+        .onDisappear {
+            showStreams = false
+            matchState.cancel()
         }
         .popover(isPresented: $showStreams, arrowEdge: .trailing) {
             StreamMatchesPopover(
                 event: event,
-                matches: matches ?? [],
+                matches: matchSnapshot.matches,
                 favoriteIDs: viewModel.favoriteChannelIDs,
-                unavailableMessage: matchUnavailableMessage,
-                reminderHint: eventIsPlayable ? nil : "Set a reminder",
-                onPlay: eventIsPlayable ? { channel in
+                unavailableMessage: matchSnapshot.unavailableMessage,
+                reminderHint: actionHint,
+                onPlay: eventActionMode == .live ? { channel in
+                    guard matchingContext == matchContext, matchState.hasCurrentMatches(for: matchingContext),
+                          eventActionMode == .live else { return }
                     showStreams = false
                     onChannelSelected(channel)
                 } : nil,
-                onRemind: eventIsPlayable ? nil : { channel in
+                onRemind: eventActionMode == .upcoming ? { channel in
+                    guard matchingContext == matchContext, matchState.hasCurrentMatches(for: matchingContext),
+                          eventActionMode == .upcoming else { return }
                     showStreams = false
                     setReminder(for: channel)
-                },
-                onRecord: { channel in
+                } : nil,
+                onRecord: eventActionMode == .live || eventActionMode == .upcoming ? { channel in
+                    guard matchingContext == matchContext, matchState.hasCurrentMatches(for: matchingContext),
+                          eventActionMode == .live || eventActionMode == .upcoming else { return }
                     showStreams = false
                     record(channel: channel)
-                }
+                } : nil,
+                replayProgramForMatch: eventActionMode == .replayOnly ? { replayProgram(for: $0) } : nil,
+                onCatchup: eventActionMode == .replayOnly && onCatchup != nil ? { channel, program in
+                    guard matchingContext == matchContext, matchState.hasCurrentMatches(for: matchingContext),
+                          let match = matchSnapshot.matches.first(where: { $0.channel.preferenceIdentity == channel.preferenceIdentity }),
+                          let current = replayProgram(for: match), current.id == program.id,
+                          current.start == program.start, current.end == program.end else { return }
+                    showStreams = false
+                    onCatchup?(channel, current)
+                } : nil
             )
         }
         .overlay(alignment: .topTrailing) {
-            if isMatching {
+            if matchSnapshot.isMatching {
                 ProgressView()
                     .controlSize(.small)
                     .padding(8)
@@ -464,40 +524,17 @@ private struct SportEventCard: View {
     // MARK: - Matching
 
     private func handleTap() {
-        if let matches, !matches.isEmpty {
-            showStreams = true
-            return
-        }
-        if let message = viewModel.streamIndexUnavailableMessage {
-            matches = []
-            matchUnavailableMessage = message
-            showStreams = true
-            return
-        }
-        isMatching = true
-        Task {
-            let result = await viewModel.matchEvent(event)
-            isMatching = false
-            matches = result
-            matchUnavailableMessage = result.isEmpty ? viewModel.streamIndexUnavailableMessage : nil
-            if !result.isEmpty || matchUnavailableMessage != nil {
-                showStreams = true
-            }
-        }
-        lastIndexVersion = viewModel.searchIndexVersion
+        showStreams = true
+        updateMatching()
     }
 
-    /// Rematch while the popover is open, e.g. when the index transitions
-    /// from building to ready.
-    private func rematchIfNeeded() {
-        guard !isMatching else { return }
-        if let matches, !matches.isEmpty { return }
-        isMatching = true
-        Task {
-            let result = await viewModel.matchEvent(event)
-            isMatching = false
-            matches = result
-            matchUnavailableMessage = result.isEmpty ? viewModel.streamIndexUnavailableMessage : nil
+    private func updateMatching() {
+        matchState.update(
+            context: matchContext,
+            unavailableMessage: viewModel.streamIndexUnavailableMessage,
+            isPresented: showStreams
+        ) { [viewModel, event] in
+            await viewModel.matchEvent(event)
         }
     }
 }

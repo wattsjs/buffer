@@ -107,8 +107,14 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         playlistID: UUID,
         program: EPGProgram,
         channel: Channel,
-        leadMinutes: Int = 5
+        leadMinutes: Int = 5,
+        sourceChannel: Channel? = nil,
+        sourceProgramID: String? = nil
     ) async -> Bool {
+        let actionChannel = sourceChannel ?? channel
+        // A virtual row's selected guide may belong to a different source
+        // than its displayed stream. Require the action resolver's binding.
+        guard actionChannel.epgChannelID?.hasPrefix("smart-guide:") != true else { return false }
         if authorizationStatus == .notDetermined {
             await requestAuthorization()
         }
@@ -177,7 +183,9 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
             notifyAt: fireDate,
             createdAt: now,
             leadMinutes: leadMinutes,
-            streamURL: channel.streamURL
+            streamURL: actionChannel.streamURL,
+            sourceOwnership: actionChannel.sourceOwnership,
+            sourceProgramID: sourceProgramID ?? program.id
         )
         reminders.removeAll { $0.id == id }
         removeFromIndex(id: id)
@@ -207,12 +215,12 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
     /// Remove every reminder owned by the given playlist. Called when the
     /// playlist is deleted.
     func cancelReminders(forPlaylistID playlistID: UUID) {
-        let doomed = reminders.filter { $0.playlistID == playlistID }
+        let doomed = reminders.filter { $0.playlistID == playlistID || $0.sourceOwnership?.channelIdentity.sourceID == playlistID }
         guard !doomed.isEmpty else { return }
         let ids = doomed.map(\.id)
         UNUserNotificationCenter.current()
             .removePendingNotificationRequests(withIdentifiers: ids)
-        reminders.removeAll { $0.playlistID == playlistID }
+        reminders.removeAll { $0.playlistID == playlistID || $0.sourceOwnership?.channelIdentity.sourceID == playlistID }
         saveReminders()
     }
 

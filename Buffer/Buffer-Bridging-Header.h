@@ -3,5 +3,6 @@
 
 #include "Services/BufferDirectRecorder.h"
 #include "Services/BufferProbe.h"
+#include "Support/ChannelIdentityEncoding.h"
 
 #endif

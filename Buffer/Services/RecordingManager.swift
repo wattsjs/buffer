@@ -21,6 +21,7 @@ final class RecordingManager {
     /// All known recordings — scheduled, in-flight, completed. Most-recent
     /// first when displayed.
     private(set) var recordings: [Recording] = []
+    private(set) var capacityErrorMessage: String?
 
     /// Persisted user settings.
     var preRollSeconds: Int {
@@ -86,6 +87,7 @@ final class RecordingManager {
 
     /// Active direct-recording handles, keyed by recording ID.
     @ObservationIgnored private var liveSessions: [UUID: OpaquePointer] = [:]
+    @ObservationIgnored private var capacityLeases: [UUID: AccountCapacityLedger.Lease] = [:]
     @ObservationIgnored private var liveStopTimers: [UUID: DispatchSourceTimer] = [:]
 
     // Scheduled recordings use the same direct-recorder path as manual live
@@ -216,14 +218,16 @@ final class RecordingManager {
     ) async -> Recording? {
         let now = Date()
         let end = program?.end ?? now.addingTimeInterval(3 * 60 * 60)
+        let recordingID = UUID()
         let fileURL = outputFileURL(
             channelName: channel.name,
             title: program?.title ?? channel.name,
-            start: now
+            start: now,
+            recordingID: recordingID
         )
 
-        let recordingID = UUID()
         let streamURL = channel.streamURL
+        guard reserveCapacity(ownership: channel.sourceOwnership, recordingID: recordingID) else { return nil }
 
         // Insert the row as `.startingUp` BEFORE kicking off the recorder
         // open — that handshake can take several seconds on a cold channel
@@ -231,8 +235,8 @@ final class RecordingManager {
         // exists.
         let placeholder = Recording(
             id: recordingID,
-            playlistID: playlistID,
-            channelID: channel.id,
+            playlistID: channel.sourceOwnership?.channelIdentity.sourceID ?? playlistID,
+            channelID: channel.sourceOwnership?.channelIdentity.nativeID ?? channel.id,
             channelName: channel.name,
             programID: program?.id,
             title: program?.title ?? channel.name,
@@ -246,7 +250,8 @@ final class RecordingManager {
             actualEnd: nil,
             fileURL: fileURL,
             status: .startingUp,
-            errorMessage: nil
+            errorMessage: nil,
+            sourceOwnership: channel.sourceOwnership
         )
         recordings.insert(placeholder, at: 0)
         saveRecordings()
@@ -264,10 +269,12 @@ final class RecordingManager {
             if let handle = startResult?.handle {
                 buffer_direct_recorder_free(handle)
             }
+            releaseCapacity(recordingID)
             return nil
         }
 
         guard let startResult else {
+            releaseCapacity(recordingID)
             recordings[index].status = .failed
             recordings[index].errorMessage = "Could not start recording"
             saveRecordings()
@@ -298,6 +305,7 @@ final class RecordingManager {
     func stopLiveRecording(id: UUID) {
         guard let handle = liveSessions[id] else { return }
         buffer_direct_recorder_free(handle)
+        releaseCapacity(id)
         liveSessions[id] = nil
         liveStopTimers[id]?.cancel()
         liveStopTimers[id] = nil
@@ -349,22 +357,25 @@ final class RecordingManager {
         // upgrade — for now, treat as idempotent no-op).
         if let existing = recordings.first(where: {
             $0.programID == program.id
-                && $0.channelID == channel.id
+                && $0.channelID == (channel.sourceOwnership?.channelIdentity.nativeID ?? channel.id)
+                && $0.playlistID == (channel.sourceOwnership?.channelIdentity.sourceID ?? playlistID)
                 && ($0.status == .scheduled || $0.status == .recording)
         }) {
             return existing
         }
 
+        let recordingID = UUID()
         let fileURL = outputFileURL(
             channelName: channel.name,
             title: program.title,
-            start: program.start
+            start: program.start,
+            recordingID: recordingID
         )
 
         let recording = Recording(
-            id: UUID(),
-            playlistID: playlistID,
-            channelID: channel.id,
+            id: recordingID,
+            playlistID: channel.sourceOwnership?.channelIdentity.sourceID ?? playlistID,
+            channelID: channel.sourceOwnership?.channelIdentity.nativeID ?? channel.id,
             channelName: channel.name,
             programID: program.id,
             title: program.title,
@@ -378,7 +389,8 @@ final class RecordingManager {
             actualEnd: nil,
             fileURL: fileURL,
             status: .scheduled,
-            errorMessage: nil
+            errorMessage: nil,
+            sourceOwnership: channel.sourceOwnership
         )
         recordings.insert(recording, at: 0)
         saveRecordings()
@@ -420,6 +432,7 @@ final class RecordingManager {
             if let handle = liveSessions[id] {
                 buffer_direct_recorder_free(handle)
             }
+            releaseCapacity(id)
             liveSessions[id] = nil
             liveStopTimers[id]?.cancel()
             liveStopTimers[id] = nil
@@ -444,6 +457,7 @@ final class RecordingManager {
     func stopAll() {
         for (id, handle) in liveSessions {
             buffer_direct_recorder_free(handle)
+            releaseCapacity(id)
             markFinished(id: id, error: nil)
         }
         liveSessions.removeAll()
@@ -482,6 +496,12 @@ final class RecordingManager {
             saveRecordings()
             return
         }
+        guard reserveCapacity(ownership: recording.sourceOwnership, recordingID: id) else {
+            recordings[index].status = .failed
+            recordings[index].errorMessage = capacityErrorMessage
+            saveRecordings()
+            return
+        }
 
         // Flip to `.startingUp` so the list shows "Starting…" while the
         // recorder opens (HLS + TLS handshake can run several seconds).
@@ -504,10 +524,12 @@ final class RecordingManager {
             if let handle = startResult?.handle {
                 buffer_direct_recorder_free(handle)
             }
+            releaseCapacity(id)
             return
         }
 
         guard let startResult else {
+            releaseCapacity(id)
             recordings[freshIndex].status = .failed
             recordings[freshIndex].errorMessage = "Could not start recording"
             saveRecordings()
@@ -535,6 +557,7 @@ final class RecordingManager {
         if let handle = liveSessions[id] {
             buffer_direct_recorder_free(handle)
         }
+        releaseCapacity(id)
         liveSessions[id] = nil
         scheduledStopTimers[id] = nil
         markFinished(id: id, error: nil)
@@ -603,6 +626,7 @@ final class RecordingManager {
             var error = [CChar](repeating: 0, count: 256)
             let hasError = buffer_direct_recorder_copy_error(handle, &error, error.count) != 0
             buffer_direct_recorder_free(handle)
+            releaseCapacity(id)
             liveSessions[id] = nil
             liveStopTimers[id]?.cancel()
             liveStopTimers[id] = nil
@@ -626,6 +650,22 @@ final class RecordingManager {
         let expectedStop = recording.scheduledEnd.addingTimeInterval(Double(postRollSeconds))
         guard Date() + Self.unexpectedStopGraceSeconds < expectedStop else { return nil }
         return "Recording stopped unexpectedly"
+    }
+
+    private func reserveCapacity(ownership: ChannelSourceOwnership?, recordingID: UUID) -> Bool {
+        capacityErrorMessage = nil
+        guard let ownership else { return true } // existing persisted recordings
+        switch AccountCapacityLedger.shared.reserve(accountKey: ownership.accountKey, kind: .recording, ownerID: recordingID) {
+        case .success(let lease): capacityLeases[recordingID] = lease; return true
+        case .failure:
+            capacityErrorMessage = "This source has no free recording connections. Close a player or recording and retry."
+            return false
+        }
+    }
+
+    private func releaseCapacity(_ recordingID: UUID) {
+        guard let lease = capacityLeases.removeValue(forKey: recordingID) else { return }
+        _ = AccountCapacityLedger.shared.confirmTeardown(lease: lease)
     }
 
     // MARK: - Timer plumbing
@@ -778,16 +818,16 @@ final class RecordingManager {
         return movies.appendingPathComponent("Buffer Recordings", isDirectory: true)
     }
 
-    private func outputFileURL(channelName: String, title: String, start: Date) -> URL {
+    private func outputFileURL(channelName: String, title: String, start: Date, recordingID: UUID) -> URL {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HHmm"
         let stamp = formatter.string(from: start)
         let safeChannel = Self.sanitize(channelName)
-        let safeTitle = Self.sanitize(title)
+        let safeTitle = String(Self.sanitize(title).prefix(180))
         // `.ts` because the direct recorder remuxes the source into MPEG-TS.
         // MPEG-TS is self-describing so partial files play while recording
         // is in progress.
-        let filename = "\(stamp) \(safeTitle).ts"
+        let filename = "\(stamp) \(safeTitle) \(recordingID.uuidString.lowercased()).ts"
         return outputDirectory
             .appendingPathComponent(safeChannel, isDirectory: true)
             .appendingPathComponent(filename)

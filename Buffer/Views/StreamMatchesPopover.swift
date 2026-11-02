@@ -9,6 +9,33 @@ struct StreamMatchesPopover: View {
     var onPlay: ((Channel) -> Void)? = nil
     var onRemind: ((Channel) -> Void)? = nil
     var onRecord: ((Channel) -> Void)? = nil
+    var replayProgramForMatch: ((StreamMatch) -> EPGProgram?)? = nil
+    var onCatchup: ((Channel, EPGProgram) -> Void)? = nil
+    @State private var showHiddenChannels = false
+
+    init(
+        event: SportEvent,
+        matches: [StreamMatch],
+        favoriteIDs: Set<String>,
+        unavailableMessage: String? = nil,
+        reminderHint: String? = nil,
+        onPlay: ((Channel) -> Void)? = nil,
+        onRemind: ((Channel) -> Void)? = nil,
+        onRecord: ((Channel) -> Void)? = nil,
+        replayProgramForMatch: ((StreamMatch) -> EPGProgram?)? = nil,
+        onCatchup: ((Channel, EPGProgram) -> Void)? = nil
+    ) {
+        self.event = event
+        self.matches = matches
+        self.favoriteIDs = favoriteIDs
+        self.unavailableMessage = unavailableMessage
+        self.reminderHint = reminderHint
+        self.onPlay = onPlay
+        self.onRemind = onRemind
+        self.onRecord = onRecord
+        self.replayProgramForMatch = replayProgramForMatch
+        self.onCatchup = onCatchup
+    }
 
     /// ESPN scoreboards only surface a start time. We assume a 3-hour window
     /// so the user can see roughly when the broadcast will wrap.
@@ -33,11 +60,9 @@ struct StreamMatchesPopover: View {
         return "\(dayPrefix) · \(timeFmt.string(from: event.startDate)) – \(timeFmt.string(from: end))"
     }
 
-    private var visibleMatches: [StreamMatch] {
-        matches.filter { !$0.isHidden }
-    }
-
     var body: some View {
+        let visibility = StreamMatchVisibility(matches: matches)
+        let displayedMatches = visibility.displayedMatches(showHidden: showHiddenChannels)
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(event.displayTitle)
@@ -71,28 +96,61 @@ struct StreamMatchesPopover: View {
 
             Divider()
 
-            if visibleMatches.isEmpty {
+            if displayedMatches.isEmpty {
                 VStack(spacing: 8) {
-                    if unavailableMessage != nil {
-                        ProgressView()
-                            .controlSize(.small)
+                    if visibility.hasOnlyHiddenMatches {
+                        Text("Matching channels are in hidden groups.")
+                            .font(BufferFont.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Show hidden channels") { showHiddenChannels = true }
+                            .buttonStyle(.bordered)
+                    } else {
+                        if unavailableMessage != nil {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(unavailableMessage ?? "No matching streams found")
+                            .font(BufferFont.caption)
+                            .foregroundStyle(.tertiary)
                     }
-                    Text(unavailableMessage ?? "No matching streams found")
-                        .font(BufferFont.caption)
-                        .foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 24)
             } else {
+                if visibility.hasOnlyHiddenMatches {
+                    HStack {
+                        Label("Showing hidden channels", systemImage: "eye.slash")
+                            .font(BufferFont.micro)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Hide") { showHiddenChannels = false }
+                            .buttonStyle(.borderless)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+                }
+                HStack {
+                    Text("\(displayedMatches.count) matching \(displayedMatches.count == 1 ? "channel" : "channels")")
+                    Spacer()
+                    Text("Best quality first")
+                }
+                .font(BufferFont.micro)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 14)
+                .padding(.top, 8)
                 ScrollView {
-                    VStack(spacing: 8) {
-                        ForEach(visibleMatches) { match in
+                    LazyVStack(spacing: 8) {
+                        ForEach(displayedMatches) { match in
+                            let replayProgram = replayProgramForMatch?(match)
                             StreamMatchPopoverRow(
                                 match: match,
-                                isFavorite: favoriteIDs.contains(match.channel.id),
+                                isFavorite: favoriteIDs.contains(match.channel.preferenceIdentity),
                                 onPlay: onPlay.map { action in { action(match.channel) } },
                                 onRemind: onRemind.map { action in { action(match.channel) } },
-                                onRecord: onRecord.map { action in { action(match.channel) } }
+                                onRecord: onRecord.map { action in { action(match.channel) } },
+                                onReplay: onCatchup.flatMap { action in replayProgram.map { program in { action(match.channel, program) } } },
+                                replayUnavailable: event.status.isFinished && replayProgram == nil,
+                                recordIsLive: event.status.isLive
                             )
                             .requestStreamProbe(for: match.channel)
                         }
@@ -100,10 +158,12 @@ struct StreamMatchesPopover: View {
                     .padding(.vertical, 6)
                     .padding(.horizontal, 8)
                 }
-                .frame(maxHeight: 420)
+                .frame(height: min(420, CGFloat(displayedMatches.count) * 140))
             }
         }
-        .frame(width: 460)
+        .frame(width: 520)
+        .onChange(of: visibility.disclosureIdentity) { showHiddenChannels = false }
+        .onChange(of: event.id) { showHiddenChannels = false }
     }
 }
 
@@ -113,6 +173,9 @@ private struct StreamMatchPopoverRow: View {
     let onPlay: (() -> Void)?
     let onRemind: (() -> Void)?
     let onRecord: (() -> Void)?
+    let onReplay: (() -> Void)?
+    let replayUnavailable: Bool
+    let recordIsLive: Bool
 
     @State private var hovered = false
 
@@ -132,7 +195,7 @@ private struct StreamMatchPopoverRow: View {
                             .foregroundStyle(.pink)
                     }
                     Spacer(minLength: 0)
-                    StreamProbeBadge(channelID: match.channel.id, style: .compact)
+                    StreamProbeBadge(channel: match.channel, style: .compact)
                 }
 
                 if !metaLine.isEmpty {
@@ -140,6 +203,12 @@ private struct StreamMatchPopoverRow: View {
                         .font(BufferFont.microMedium)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
+                }
+
+                if match.isHidden {
+                    Label("Hidden group", systemImage: "eye.slash")
+                        .font(BufferFont.micro)
+                        .foregroundStyle(.secondary)
                 }
 
                 if let title = match.programTitle, !title.isEmpty {
@@ -160,7 +229,7 @@ private struct StreamMatchPopoverRow: View {
             Spacer()
 
             VStack(alignment: .trailing, spacing: 10) {
-                confidenceDots(score: match.score)
+                confidenceDots(for: match)
 
                 HStack(spacing: 8) {
                     if let onRecord {
@@ -171,7 +240,7 @@ private struct StreamMatchPopoverRow: View {
                                 .frame(width: 26, height: 26)
                         }
                         .buttonStyle(.borderless)
-                        .help(onPlay != nil ? "Record now" : "Schedule recording")
+                        .help(recordIsLive ? "Record now" : "Schedule recording")
                     }
 
                     if let onPlay {
@@ -182,6 +251,18 @@ private struct StreamMatchPopoverRow: View {
                         }
                         .buttonStyle(.borderless)
                         .help("Play now")
+                    } else if let onReplay {
+                        Button(action: onReplay) {
+                            Label("Replay", systemImage: "arrow.counterclockwise")
+                                .font(BufferFont.metaMedium)
+                                .frame(minHeight: 26)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Replay this programme from its original source archive")
+                    } else if replayUnavailable {
+                        Text("Replay unavailable")
+                            .font(BufferFont.micro)
+                            .foregroundStyle(.secondary)
                     } else if let onRemind {
                         Button(action: onRemind) {
                             Image(systemName: "bell.fill")
@@ -209,14 +290,21 @@ private struct StreamMatchPopoverRow: View {
         .onTapGesture {
             if let onPlay {
                 onPlay()
+            } else if let onReplay {
+                onReplay()
             } else {
                 onRemind?()
             }
         }
     }
 
-    private func confidenceDots(score: Double) -> some View {
-        let filled = score > 180 ? 3 : (score > 120 ? 2 : 1)
+    private func confidenceDots(for match: StreamMatch) -> some View {
+        let filled = match.relevance.rawValue + 1
+        let evidence: String = switch match.relevance {
+        case .eventProgramme: "Event matched in this source’s guide"
+        case .relatedProgramme: "Related guide listing; confirm the broadcast"
+        case .channelHint: "Possible broadcaster; no matching programme listing"
+        }
         return HStack(spacing: 2) {
             ForEach(0..<3, id: \.self) { i in
                 Circle()
@@ -224,10 +312,14 @@ private struct StreamMatchPopoverRow: View {
                     .frame(width: 5, height: 5)
             }
         }
+        .accessibilityLabel(evidence)
+        .help(evidence)
     }
 
     private var metaLine: String {
         var parts: [String] = []
+        if match.relevance == .channelHint { parts.append("Possible broadcaster") }
+        else if match.relevance == .relatedProgramme { parts.append("Related listing") }
         if !match.reason.isEmpty { parts.append(match.reason) }
         if let timingLabel { parts.append(timingLabel) }
         return parts.joined(separator: " · ")

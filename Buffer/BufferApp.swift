@@ -35,7 +35,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, SP
     private var focusingScheduledUpdate = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        startUpdater()
+        PlaybackValidation.applyLaunchOverrides()
+#if DEBUG
+        let isDiagnosticLaunch = PlaybackValidation.isEnabled || SavedPlaybackScenario.isEnabled
+            || CommandLine.arguments.contains("--observe-session")
+        if isDiagnosticLaunch {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.unhideWithoutActivation()
+            DispatchQueue.main.async {
+                NSApp.unhideWithoutActivation()
+                for window in NSApp.windows where window.canBecomeMain {
+                    window.orderFrontRegardless()
+                }
+            }
+        }
+#endif
+        if !PlaybackValidation.isEnabled { startUpdater() }
 #if DEBUG
         PerformanceMonitor.shared.start()
 #endif
@@ -45,6 +60,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate, SP
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        SavedPlaybackScenario.stop()
+        SessionObservation.stop()
 #if DEBUG
         PerformanceMonitor.shared.stop()
 #endif
@@ -179,7 +196,11 @@ struct BufferApp: App {
     @Environment(\.openWindow) private var openWindow
 
     init() {
+        if PerformanceBenchmark.shouldRun {
+            PerformanceBenchmark.runAndExit()
+        }
         ImageLoader.configure()
+        if PlaybackValidation.isEnabled { return }
         // Touch the shared NotificationManager so its init runs — this sets
         // the UNUserNotificationCenter delegate and registers categories.
         // Actual permission + reconciliation happens in `.task` below.
@@ -196,6 +217,8 @@ struct BufferApp: App {
             ContentView(viewModel: viewModel)
                 .frame(minWidth: 800, minHeight: 500)
                 .task {
+                    guard !PlaybackValidation.isEnabled else { return }
+                    SessionObservation.start(viewModel: viewModel)
                     AppLog.app.info("Notification bootstrap started")
                     await notificationManager.bootstrap()
                     AppLog.app.info("Notification bootstrap finished")
@@ -215,6 +238,27 @@ struct BufferApp: App {
                     openWindow(id: "settings")
                 }
                 .keyboardShortcut(",", modifiers: .command)
+            }
+
+            CommandMenu("Sources") {
+                Button {
+                    viewModel.activateSmartSports()
+                } label: {
+                    Label("Smart Channels", systemImage: viewModel.isSmartSportsActive ? "checkmark" : "sportscourt")
+                }
+                Divider()
+                ForEach(viewModel.playlists) { source in
+                    Button {
+                        viewModel.chooseSource(id: source.id)
+                    } label: {
+                        Label(source.name.isEmpty ? "Untitled Source" : source.name,
+                              systemImage: !viewModel.isSmartSportsActive && source.id == viewModel.activePlaylistID ? "checkmark" : "server.rack")
+                    }
+                }
+                Divider()
+                Button("Filter Smart Channels…") { openWindow(id: "smart-channel-filter") }
+                Button("Manage Sources…") { openWindow(id: "settings") }
+                Button("Review Smart Sports…") { openWindow(id: "smart-sports-reviews") }
             }
 
             CommandGroup(after: .help) {
@@ -246,15 +290,40 @@ struct BufferApp: App {
         Window("Settings", id: "settings") {
             SettingsView(viewModel: viewModel)
         }
-        .windowStyle(.hiddenTitleBar)
-        .windowToolbarStyle(.unified(showsTitle: false))
-        .defaultSize(width: 920, height: 640)
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified(showsTitle: true))
+        .defaultSize(width: 1120, height: 760)
         .restorationBehavior(.disabled)
 
         Window("Keyboard Shortcuts", id: "keyboard-shortcuts") {
             KeyboardShortcutsView()
         }
         .defaultSize(width: 420, height: 320)
+        .restorationBehavior(.disabled)
+
+        // Source choices and reviews stay beside the guide so the user can
+        // compare schedules while adjusting their saved selections.
+        WindowGroup("Playback & Guide Sources", id: "smart-sports-sources", for: String.self) { $feedID in
+            if let feedID {
+                SmartSportsSourceInspector(feedID: feedID, coordinator: viewModel.smartSports)
+            }
+        }
+        .defaultSize(width: 640, height: 660)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        Window("Smart Channel Filter", id: "smart-channel-filter") {
+            SmartChannelFilterView(viewModel: viewModel)
+        }
+        .defaultSize(width: 600, height: 680)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        Window("Smart Sports Reviews", id: "smart-sports-reviews") {
+            SmartSportsReviewView(coordinator: viewModel.smartSports)
+        }
+        .defaultSize(width: 820, height: 660)
+        .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
     }
 

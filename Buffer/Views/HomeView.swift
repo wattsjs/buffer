@@ -359,7 +359,7 @@ private struct RecentChannelCard: View {
                     y: BufferLayout.cardShadowY
                 )
                 .overlay(alignment: .bottomLeading) {
-                    StreamProbeBadge(channelID: channel.id, style: .compact)
+                    StreamProbeBadge(channel: channel, style: .compact)
                         .padding(6)
                 }
 
@@ -388,12 +388,13 @@ private struct RecentChannelCard: View {
         .help(channel.name)
         .bufferHoverTracking($isHovering)
         .requestStreamProbe(for: channel)
-        .fadeIfStreamDead(channelID: channel.id)
+        .fadeIfStreamDead(channel: channel)
         .contextMenu {
             Button(action: onTap) {
                 Label("Play Channel", systemImage: "play.fill")
             }
             AddToMultiViewMenuItem(channel: channel)
+            SmartSportsSourceMenuItem(channel: channel)
         }
     }
 }
@@ -407,10 +408,16 @@ private struct HomeLiveEventCard: View {
 
     @State private var hovered = false
     @State private var showStreams = false
-    @State private var matches: [StreamMatch]?
-    @State private var matchUnavailableMessage: String?
-    @State private var isMatching = false
-    @State private var lastIndexVersion: Int = 0
+    @State private var matchState = SportEventMatchState()
+
+    private var matchContext: SportEventMatchContext {
+        SportEventMatchContext(
+            event: event,
+            indexVersion: viewModel.searchIndexVersion,
+            modelIdentity: ObjectIdentifier(viewModel),
+            preferencesVersion: viewModel.matchingPreferencesVersion
+        )
+    }
 
     private var tournamentSubtitle: String? {
         var parts: [String] = []
@@ -429,6 +436,11 @@ private struct HomeLiveEventCard: View {
     }
 
     var body: some View {
+        let matchingContext = matchContext
+        let matchSnapshot = matchState.snapshot(
+            for: matchingContext,
+            unavailableMessage: viewModel.streamIndexUnavailableMessage
+        )
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: event.sport.icon)
@@ -472,25 +484,27 @@ private struct HomeLiveEventCard: View {
         .onTapGesture {
             handleTap()
         }
-        .onChange(of: viewModel.searchIndexVersion) { _, newVersion in
-            guard showStreams, newVersion != lastIndexVersion else { return }
-            lastIndexVersion = newVersion
-            rematchIfNeeded()
+        .onChange(of: matchContext) { updateMatching() }
+        .onChange(of: showStreams) { updateMatching() }
+        .onDisappear {
+            showStreams = false
+            matchState.cancel()
         }
         .popover(isPresented: $showStreams, arrowEdge: .bottom) {
             HomeLiveStreamsPopover(
                 event: event,
-                matches: matches ?? [],
+                matches: matchSnapshot.matches,
                 favoriteIDs: viewModel.favoriteChannelIDs,
-                unavailableMessage: matchUnavailableMessage,
+                unavailableMessage: matchSnapshot.unavailableMessage,
                 onChannelSelected: { channel in
+                    guard matchingContext == matchContext, matchState.hasCurrentMatches(for: matchingContext) else { return }
                     showStreams = false
                     onChannelSelected(channel)
                 }
             )
         }
         .overlay(alignment: .topTrailing) {
-            if isMatching {
+            if matchSnapshot.isMatching {
                 ProgressView()
                     .controlSize(.small)
                     .padding(8)
@@ -544,43 +558,17 @@ private struct HomeLiveEventCard: View {
     // MARK: - Matching
 
     private func handleTap() {
-        if let matches, !matches.isEmpty {
-            showStreams = true
-            return
-        }
-        if let message = viewModel.streamIndexUnavailableMessage {
-            matches = []
-            matchUnavailableMessage = message
-            showStreams = true
-            return
-        }
-        isMatching = true
-        Task {
-            let result = await viewModel.matchEvent(event)
-            isMatching = false
-            matches = result
-            matchUnavailableMessage = result.isEmpty ? viewModel.streamIndexUnavailableMessage : nil
-            if !result.isEmpty || matchUnavailableMessage != nil {
-                showStreams = true
-            }
-        }
-        lastIndexVersion = viewModel.searchIndexVersion
+        showStreams = true
+        updateMatching()
     }
 
-    /// Rematch while the popover is open, e.g. when the index transitions
-    /// from building to ready.
-    private func rematchIfNeeded() {
-        guard !isMatching else { return }
-        // If we already have valid matches from a previous rematch, keep them.
-        if let matches, !matches.isEmpty { return }
-        isMatching = true
-        Task {
-            let result = await viewModel.matchEvent(event)
-            isMatching = false
-            matches = result
-            matchUnavailableMessage = result.isEmpty ? viewModel.streamIndexUnavailableMessage : nil
-            // If the index became ready and we found matches, update the popover.
-            // If it's still not ready, keep showing the indexing message.
+    private func updateMatching() {
+        matchState.update(
+            context: matchContext,
+            unavailableMessage: viewModel.streamIndexUnavailableMessage,
+            isPresented: showStreams
+        ) { [viewModel, event] in
+            await viewModel.matchEvent(event)
         }
     }
 }

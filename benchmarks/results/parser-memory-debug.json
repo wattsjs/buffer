@@ -1,0 +1,314 @@
+{
+  "schemaVersion": 1,
+  "fixture": "parser-memory-v1",
+  "configuration": "debug",
+  "cases": [
+    {
+      "kind": "xml",
+      "count": 1000,
+      "descriptionBytes": 128,
+      "after": [
+        {
+          "capacity": 1023,
+          "checksum": 127890,
+          "count": 1000,
+          "elementStride": 80,
+          "inputBytes": 258019,
+          "kind": "xml",
+          "peakRSSBytes": 8224768,
+          "requestedCount": 1000,
+          "reservedElementBytes": 81840,
+          "samplesMs": [
+            3.576959,
+            3.618,
+            3.685959,
+            3.651667,
+            3.77125,
+            3.674292,
+            3.83325
+          ],
+          "medianMs": 3.674292
+        },
+        {
+          "capacity": 1023,
+          "checksum": 127890,
+          "count": 1000,
+          "elementStride": 80,
+          "inputBytes": 258019,
+          "kind": "xml",
+          "peakRSSBytes": 8224768,
+          "requestedCount": 1000,
+          "reservedElementBytes": 81840,
+          "samplesMs": [
+            3.934417,
+            3.761666,
+            3.8155,
+            3.789041,
+            3.879375,
+            4.719208,
+            4.178833
+          ],
+          "medianMs": 3.879375
+        },
+        {
+          "capacity": 1023,
+          "checksum": 127890,
+          "count": 1000,
+          "elementStride": 80,
+          "inputBytes": 258019,
+          "kind": "xml",
+          "peakRSSBytes": 8650752,
+          "requestedCount": 1000,
+          "reservedElementBytes": 81840,
+          "samplesMs": [
+            3.925125,
+            4.615,
+            4.143917,
+            3.794875,
+            4.46975,
+            4.605208,
+            3.915666
+          ],
+          "medianMs": 4.143917
+        }
+      ],
+      "before": [
+        {
+          "capacity": 524492,
+          "checksum": 127890,
+          "count": 1000,
+          "elementStride": 80,
+          "inputBytes": 258019,
+          "kind": "xml",
+          "peakRSSBytes": 8388608,
+          "requestedCount": 1000,
+          "reservedElementBytes": 41959360,
+          "samplesMs": [
+            3.893208,
+            4.03375,
+            3.866916,
+            4.18725,
+            3.95475,
+            4.021708,
+            3.955583
+          ],
+          "medianMs": 3.955583
+        },
+        {
+          "capacity": 524492,
+          "checksum": 127890,
+          "count": 1000,
+          "elementStride": 80,
+          "inputBytes": 258019,
+          "kind": "xml",
+          "peakRSSBytes": 8404992,
+          "requestedCount": 1000,
+          "reservedElementBytes": 41959360,
+          "samplesMs": [
+            4.147875,
+            4.210667,
+            4.1295,
+            4.072916,
+            4.786542,
+            3.912,
+            3.976958
+          ],
+          "medianMs": 4.1295
+        },
+        {
+          "capacity": 524492,
+          "checksum": 127890,
+          "count": 1000,
+          "elementStride": 80,
+          "inputBytes": 258019,
+          "kind": "xml",
+          "peakRSSBytes": 8388608,
+          "requestedCount": 1000,
+          "reservedElementBytes": 41959360,
+          "samplesMs": [
+            4.553125,
+            4.105666,
+            4.751042,
+            4.765042,
+            5.225833,
+            4.335375,
+            5.281791
+          ],
+          "medianMs": 4.751042
+        }
+      ],
+      "medianMs": 3.879375,
+      "medianPeakRSSBytes": 8224768,
+      "baselineMedianMs": 4.1295,
+      "changeFraction": -0.060570286959680364,
+      "regression": false
+    },
+    {
+      "kind": "m3u",
+      "count": 50000,
+      "descriptionBytes": 0,
+      "after": [
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 63389696,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            505.550417,
+            500.23525,
+            509.924417,
+            495.516375,
+            504.985625,
+            499.050916,
+            525.077417
+          ],
+          "medianMs": 504.985625
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 63340544,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            552.89725,
+            506.250916,
+            505.831834,
+            518.309958,
+            500.224375,
+            509.837125,
+            510.315958
+          ],
+          "medianMs": 509.837125
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 62439424,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            506.262,
+            500.506041,
+            498.624125,
+            494.773542,
+            499.994,
+            499.672666,
+            502.605084
+          ],
+          "medianMs": 499.994
+        }
+      ],
+      "before": [
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 91029504,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            586.991709,
+            600.622208,
+            585.500125,
+            590.692375,
+            592.480541,
+            620.205791,
+            724.163458
+          ],
+          "medianMs": 592.480541
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 88293376,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            671.429208,
+            590.787167,
+            580.350959,
+            591.50675,
+            581.754833,
+            577.742833,
+            583.027083
+          ],
+          "medianMs": 583.027083
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 88227840,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            589.091542,
+            597.542958,
+            591.905667,
+            593.339709,
+            583.325125,
+            586.043334,
+            588.66625
+          ],
+          "medianMs": 589.091542
+        }
+      ],
+      "medianMs": 504.985625,
+      "medianPeakRSSBytes": 63340544,
+      "baselineMedianMs": 589.091542,
+      "changeFraction": -0.14277223657711247,
+      "regression": false
+    }
+  ],
+  "trials": 3,
+  "samples": 7,
+  "absoluteToleranceMs": 0.05,
+  "recordedAt": "2026-10-04T11:40:04.020319+00:00",
+  "sourceHashes": {
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/VODItem.swift": "dba3e220799c91d3496b653613b4393f5d0f5f8054a11d935f6b4cdd86f9964f",
+    "Buffer/Support/AppLog.swift": "c71fdc6554240bf102d6b29687c0c3841b17e862f63531471e4c9c95a55e6233",
+    "benchmarks/parser_memory_benchmark.swift": "758eeecb295fa6445c740178ec8beeeb8939c3ea3803c07b53d38a184484c028",
+    "Buffer/Services/XMLTVParser.swift": "2ea5e5edd5a4da717a086411214137efb2d63eb59ba030e60213eb2c49848beb",
+    "Buffer/Services/M3UParser.swift": "68010ea992c8721342f6a83109ef2ed6a9406172af8bb059c7f573df9e4499fd"
+  },
+  "executableSHA256": "c6ce605772eb780159b0e7120fed0d3544662682077bb52205aad9bfea18edd0",
+  "compiler": "Apple Swift version 6.4 (swiftlang-6.4.0.33.1 clang-2100.3.33.1)\nTarget: arm64-apple-macosx27.0.0",
+  "limitations": "Synthetic fixtures, standalone production parsers; RSS includes fixture generation and allocator reuse. Reserved element bytes are not resident-memory bytes.",
+  "beforeSourceHashes": {
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/VODItem.swift": "dba3e220799c91d3496b653613b4393f5d0f5f8054a11d935f6b4cdd86f9964f",
+    "Buffer/Support/AppLog.swift": "c71fdc6554240bf102d6b29687c0c3841b17e862f63531471e4c9c95a55e6233",
+    "benchmarks/parser_memory_benchmark.swift": "758eeecb295fa6445c740178ec8beeeb8939c3ea3803c07b53d38a184484c028",
+    ".local/bench/XMLTVParser-memory-before.swift": "d09b2ed54fd707c4f21e62360b21e963529c42338aae653ebe462fba35d9e05b",
+    ".local/bench/M3UParser-memory-before.swift": "f11bfb05a78c5dec22e3235a41c703c9b35391fbe6e811cb6e7add7d1fbb5a62"
+  },
+  "beforeExecutableSHA256": "ebad54e6c43d1bdc29db892b507b4907df845a619f59faf1467d307b8df2c58a",
+  "regression": false
+}

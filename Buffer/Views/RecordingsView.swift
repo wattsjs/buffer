@@ -71,9 +71,17 @@ private struct RecordingRow: View {
 
     @State private var manager = RecordingManager.shared
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.epgActionModel) private var actionModel
 
     private var channel: Channel? {
-        channels.first { $0.id == recording.channelID }
+        if let actionModel {
+            return actionModel.pinnedSourceChannel(ownership: recording.sourceOwnership,
+                legacyID: recording.channelID, playlistID: recording.playlistID)
+        }
+        if let key = recording.sourceOwnership?.channelIdentity {
+            return channels.first { $0.sourceChannelIdentity == key }
+        }
+        return channels.first { $0.id == recording.channelID }
     }
 
     /// The partial .ts file is playable the moment recording starts, so

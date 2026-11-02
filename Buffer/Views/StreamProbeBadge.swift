@@ -5,7 +5,19 @@ import SwiftUI
 /// yet, so callers can drop it into any channel cell unconditionally.
 struct StreamProbeBadge: View {
     let channelID: String
+    var channel: Channel? = nil
     var style: Style = .compact
+
+    init(channelID: String, style: Style = .compact) {
+        self.channelID = channelID
+        self.style = style
+    }
+
+    init(channel: Channel, style: Style = .compact) {
+        self.channelID = channel.id
+        self.channel = channel
+        self.style = style
+    }
 
     enum Style {
         case compact   // res • fps in a single pill
@@ -14,15 +26,43 @@ struct StreamProbeBadge: View {
     }
 
     @State private var service = StreamProbeService.shared
+    @Environment(\.epgActionModel) private var actionModel
     @AppStorage(StreamProbeSetting.enabledKey) private var probesEnabled: Bool = StreamProbeSetting.defaultEnabled
 
     var body: some View {
         // Touch `version` so SwiftUI re-renders when probe state changes.
         let _ = service.version
-        if let probe = service.probe(for: channelID),
+        if let feedID = channel?.sourceOwnership?.logicalChannelID {
+            let _ = PlayerSessionRegistry.shared.allSessions.count
+            let _ = RecordingManager.shared.recordings.count
+            if let availability = actionModel?.smartSports.aggregateAvailability(for: feedID) {
+                logicalStatus(availability)
+            } else {
+                statusBadge(symbol: "questionmark.circle", tint: .secondary, text: "unmeasured")
+            }
+        } else if let probe = channel.map({ service.probe(for: $0) }) ?? service.probe(for: channelID),
            probesEnabled || probe.streamHealth.hasEvents {
             content(for: probe)
         }
+    }
+
+    @ViewBuilder
+    private func logicalStatus(_ availability: SmartSportsAvailability) -> some View {
+        Group {
+            switch availability.state {
+            case .unavailable:
+                statusBadge(symbol: "questionmark.circle", tint: .secondary, text: "unavailable")
+            case .busy:
+                statusBadge(symbol: "clock", tint: .secondary, text: "busy")
+            case .observedAvailable:
+                statusBadge(symbol: "checkmark.circle", tint: .secondary, text: "\(availability.observedAvailableCount) checked")
+            case .uncertain:
+                statusBadge(symbol: "questionmark.circle", tint: .secondary, text: "unmeasured")
+            case .observedFailures:
+                statusBadge(symbol: "exclamationmark.triangle.fill", tint: .orange, text: "sources failed")
+            }
+        }
+        .help(availability.message)
     }
 
     @ViewBuilder
@@ -132,7 +172,7 @@ struct StreamProbeRequestModifier: ViewModifier {
     var priority: TaskPriority = .utility
 
     func body(content: Content) -> some View {
-        content.task(id: channel.id) {
+        content.task(id: channel.sourceChannelIdentity?.rawValue ?? channel.id) {
             StreamProbeService.shared.requestProbe(for: channel, priority: priority)
         }
     }
@@ -150,20 +190,40 @@ extension View {
     func fadeIfStreamDead(channelID: String) -> some View {
         modifier(FadeIfStreamDeadModifier(channelID: channelID))
     }
+
+    func fadeIfStreamDead(channel: Channel) -> some View {
+        modifier(FadeIfStreamDeadModifier(channelID: channel.id, channel: channel))
+    }
 }
 
 private struct FadeIfStreamDeadModifier: ViewModifier {
     let channelID: String
+    var channel: Channel? = nil
     @State private var service = StreamProbeService.shared
+    @Environment(\.epgActionModel) private var actionModel
     @AppStorage(StreamProbeSetting.enabledKey) private var probesEnabled: Bool = StreamProbeSetting.defaultEnabled
 
     func body(content: Content) -> some View {
         let _ = service.version
-        let dead = probesEnabled && (service.probe(for: channelID).map(Self.isDead) ?? false)
+        let dead = channelIsUnavailable
         content
             .opacity(dead ? 0.35 : 1)
             .saturation(dead ? 0.4 : 1)
             .animation(.easeInOut(duration: 0.25), value: dead)
+            // Guide rows reuse this modifier for another channel while
+            // scrolling; a new channel must appear at its final opacity rather
+            // than cross-fading from the previous row's availability.
+            .id(channelID)
+    }
+
+    private var channelIsUnavailable: Bool {
+        if let feedID = channel?.sourceOwnership?.logicalChannelID {
+            // Unknown or failed variants remain actionable: another eligible
+            // physical source can still satisfy this stable logical row.
+            return actionModel?.smartSports.aggregateAvailability(for: feedID).state == .unavailable
+        }
+        let probe = channel.map { service.probe(for: $0) } ?? service.probe(for: channelID)
+        return probesEnabled && (probe.map(Self.isDead) ?? false)
     }
 
     nonisolated private static func isDead(_ probe: StreamProbe) -> Bool {

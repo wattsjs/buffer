@@ -135,8 +135,8 @@ final class MPVLayerHostView: NSView {
 /// - kCGLCEMPEngine (multi-threaded GL) is enabled for Apple Silicon GPU
 ///   parallelism. This lets the GL driver distribute work across GPU cores
 ///   instead of serializing through a single command stream.
-/// - A dedicated serial queue serializes CGL context access, preventing
-///   concurrent draw calls from CAOpenGLLayer and teardown from clashing.
+/// - CGL context locking protects setup/teardown. Display invalidations from
+///   mpv are coalesced with a lock before dispatching to the main thread.
 /// - Advanced render control is enabled: mpv reports frame timing info
 ///   and we call report_swap() after each present for accurate A/V sync.
 @available(macOS, deprecated: 10.14)
@@ -144,22 +144,17 @@ final class MPVPlayerLayer: CAOpenGLLayer {
     private var player: MPVPlayer?
     private var ownedCGL: CGLContextObj?
     private var renderReady = false
-    private var hasRenderedFrame = false
     private var callbackBoxPtr: UnsafeMutableRawPointer?
     private var torn = false
 
-    /// Serial queue for CGL context operations. All mpv render calls go
-    /// through this queue to ensure exclusive CGL context access.
-    private let glQueue = DispatchQueue(label: "com.wattsjs.buffer.mpvgl", qos: .userInteractive)
-
-    /// Coalesces update-callback dispatches so only one
-    /// `setNeedsDisplay()` is queued on the main thread at a time.
-    nonisolated(unsafe) private var displayScheduled = false
-
     private class CallbackBox {
+        nonisolated let gate = RenderInvalidationGate()
         weak var layer: MPVPlayerLayer?
         init(layer: MPVPlayerLayer) { self.layer = layer }
     }
+
+    // Render-thread only: spacing between decoded frames, for cadence/jitter.
+    private var lastDecodedFrameAt: ContinuousClock.Instant?
 
     override init() {
         super.init()
@@ -177,7 +172,6 @@ final class MPVPlayerLayer: CAOpenGLLayer {
 
     func attach(player: MPVPlayer) {
         self.player = player
-        hasRenderedFrame = false
         setNeedsDisplay()
     }
 
@@ -185,7 +179,6 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         guard !torn else { return }
         torn = true
         renderReady = false
-        hasRenderedFrame = false
 
         if let ctx = player?.renderContextHandle {
             mpv_render_context_set_update_callback(ctx, nil, nil)
@@ -282,10 +275,9 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         player.setRenderUpdateCallback({ ctx in
             guard let ctx else { return }
             let box = Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue()
-            guard let layer = box.layer, !layer.displayScheduled else { return }
-            layer.displayScheduled = true
-            DispatchQueue.main.async { [weak layer] in
-                guard let layer else { return }
+            guard box.gate.schedule() else { return }
+            DispatchQueue.main.async { [weak box] in
+                guard let box else { return }
                 // Clear the coalesce flag here rather than inside draw():
                 // during fullscreen transitions CoreAnimation can drop the
                 // draw pass for our layer, and if the flag is only reset in
@@ -293,7 +285,8 @@ final class MPVPlayerLayer: CAOpenGLLayer {
                 // frame callback is dropped, freezing the video.
                 // CoreAnimation coalesces multiple setNeedsDisplay calls
                 // into one draw pass anyway.
-                layer.displayScheduled = false
+                box.gate.complete()
+                guard let layer = box.layer else { return }
                 guard !layer.torn else { return }
 
                 // Thumbnail rendering guard for multi-view (post-pool robustness).
@@ -364,28 +357,35 @@ final class MPVPlayerLayer: CAOpenGLLayer {
         let h = dims[3]
         guard w > 0, h > 0 else { return }
 
-        // Check if mpv has a new frame to render. With advanced render
-        // control, update() returns flags indicating frame availability.
-        // If there's no new frame and this is just a redraw (resize,
-        // window move), skip the expensive render pass.
+        // Core Animation may replace the backing framebuffer on resize or
+        // request an existing frame again after uncovering this layer. Every
+        // draw must fill that target, including while playback is paused.
+        // mpv redraws its retained picture when update() has no new frame;
+        // SKIP_RENDERING would ignore the framebuffer and leave it blank.
+        // Keep the update flag for decoded-frame telemetry so these display
+        // redraws never count as playback progress or another first frame.
+        // Capture the acknowledged item before rendering; reading the latest
+        // Swift load generation afterward can label an old queued frame as a
+        // newer request whose FILE_LOADED event has not arrived.
+        let itemIdentity = player?.renderItemIdentity
+        let renderStarted = ContinuousClock.now
         let flags = mpv_render_context_update(renderCtx)
         let hasFrame = (flags & 1) != 0  // MPV_RENDER_UPDATE_FRAME
-        let shouldRender = hasFrame || !hasRenderedFrame
 
         var fboParam = mpv_opengl_fbo(fbo: fbo, w: w, h: h, internal_format: 0)
         var flip: Int32 = 1
         var depth: Int32 = 8
-        var skip: Int32 = shouldRender ? 0 : 1
+        var blockForTargetTime = MPVRenderTiming.blockForTargetTime
 
         withUnsafeMutablePointer(to: &fboParam) { fboPtr in
             withUnsafeMutablePointer(to: &flip) { flipPtr in
                 withUnsafeMutablePointer(to: &depth) { depthPtr in
-                    withUnsafeMutablePointer(to: &skip) { skipPtr in
+                    withUnsafeMutablePointer(to: &blockForTargetTime) { timingPtr in
                         var params = [
                             mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_FBO, data: UnsafeMutableRawPointer(fboPtr)),
                             mpv_render_param(type: MPV_RENDER_PARAM_FLIP_Y, data: UnsafeMutableRawPointer(flipPtr)),
                             mpv_render_param(type: MPV_RENDER_PARAM_DEPTH, data: UnsafeMutableRawPointer(depthPtr)),
-                            mpv_render_param(type: MPV_RENDER_PARAM_SKIP_RENDERING, data: UnsafeMutableRawPointer(skipPtr)),
+                            mpv_render_param(type: MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, data: UnsafeMutableRawPointer(timingPtr)),
                             mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
                         ]
                         mpv_render_context_render(renderCtx, &params)
@@ -394,18 +394,29 @@ final class MPVPlayerLayer: CAOpenGLLayer {
             }
         }
 
-        // Only flush and report swap when we actually rendered.
-        if shouldRender {
-            hasRenderedFrame = true
-            if hasFrame {
-                let frameWidth = Int(w)
-                let frameHeight = Int(h)
-                Task { @MainActor [weak player] in
-                    player?.noteRenderedFrame(width: frameWidth, height: frameHeight)
-                }
+        let renderMs = PerfMetrics.milliseconds(since: renderStarted)
+        if hasFrame {
+            PerfMetrics.shared.record("render.mpv.frameRenderMs", renderMs)
+            PerfMetrics.shared.increment("render.mpv.decodedFrames")
+            if let lastDecodedFrameAt {
+                let interval = PerfMetrics.milliseconds(since: lastDecodedFrameAt, now: renderStarted)
+                // Ignore pauses; keep only steady-state cadence.
+                if interval < 500 { PerfMetrics.shared.record("render.mpv.frameIntervalMs", interval) }
             }
-            glFlush()
-            mpv_render_context_report_swap(renderCtx)
+            lastDecodedFrameAt = renderStarted
+        } else {
+            PerfMetrics.shared.increment("render.mpv.redraws")
         }
+        if hasFrame {
+            let frameWidth = Int(w)
+            let frameHeight = Int(h)
+            let renderedAt = ContinuousClock.now
+            Task { @MainActor [weak player] in
+                guard let itemIdentity else { return }
+                player?.noteRenderedFrame(width: frameWidth, height: frameHeight, identity: itemIdentity, renderedAt: renderedAt)
+            }
+        }
+        glFlush()
+        mpv_render_context_report_swap(renderCtx)
     }
 }

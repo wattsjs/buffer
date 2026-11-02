@@ -1,0 +1,39 @@
+{
+  "checksum": 480,
+  "configuration": "swiftc-Debug-Onone",
+  "fixture": "guide-lookup-480-v1",
+  "preparationIncluded": true,
+  "queriesPerBatch": 480,
+  "samplesMs": [
+    4.18245415,
+    4.286075,
+    4.2742854,
+    4.26501875,
+    4.2837271,
+    4.271075,
+    4.31183125,
+    4.2543583499999995,
+    4.30805625,
+    4.21641045,
+    4.30924585,
+    4.33160625,
+    4.3955625,
+    4.3442667,
+    4.27955835,
+    4.2873854,
+    4.3263979,
+    4.4562667,
+    4.43421665,
+    4.50348125,
+    4.32530625
+  ],
+  "schema": 1,
+  "strategy": "prefix-scan",
+  "recordedAt": "2026-10-04T10:59:38.829787+00:00",
+  "machine": {
+    "arch": "arm64",
+    "os": "27.0"
+  },
+  "binarySHA256": "f2471f1e7a01d031cd013008376968cf2745373f47f1b4cf865509b87a7e1bbc",
+  "productionSourceSHA256": "d608d5191f79678a445c2faeda0dee49c5b13a46c478eb103e7dcca37f82f29a"
+}

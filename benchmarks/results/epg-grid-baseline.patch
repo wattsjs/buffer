@@ -1,0 +1,62 @@
+--- a/Buffer/Views/EPGScrollGrid.swift
++++ b/Buffer/Views/EPGScrollGrid.swift
+@@ -56,6 +56,7 @@
+     let initialHorizontalOffset: CGFloat?
+     let horizontalScrollRequest: HorizontalScrollRequest?
+     let timelineIdentity: AnyHashable?
++    var itemSetVersion: AnyHashable? = nil
+     let dataVersion: AnyHashable?
+     let timeStripSlots: [TimeStripSlot]
+     let timeStripSlotWidth: CGFloat
+@@ -109,7 +110,8 @@
+         container.setInitialHorizontalOffset(initialHorizontalOffset)
+         container.setHorizontalScrollRequest(horizontalScrollRequest)
+ 
+-        if let channelNameProvider {
++        let itemSetUnchanged = itemSetVersion != nil && itemSetVersion == coordinator.itemSetVersion
++        if let channelNameProvider, !itemSetUnchanged {
+             container.setChannelNames(items.map { channelNameProvider($0) })
+         }
+         // NOTE: rowData is NO LONGER computed for the full items list here.
+@@ -120,8 +122,15 @@
+         coordinator.dataVersion = dataVersion
+         coordinator.updateVisibleRowData()
+ 
+-        let newIDs = items.map { AnyHashable($0.id) }
+-        if newIDs != coordinator.itemIDs {
++        if itemSetUnchanged {
++            coordinator.items = items
++            if dataVersionChanged {
++                coordinator.reloadVisibleProgramRows()
++            } else {
++                coordinator.refreshVisibleRows()
++            }
++        } else if let newIDs = Optional(items.map { AnyHashable($0.id) }), newIDs != coordinator.itemIDs {
++            coordinator.itemSetVersion = itemSetVersion
+             coordinator.items = items
+             coordinator.itemIDs = newIDs
+             container.channelTableView.reloadData()
+@@ -129,6 +138,7 @@
+             // After reload the visible rows may have changed; ensure row data for them.
+             coordinator.updateVisibleRowData()
+         } else {
++            coordinator.itemSetVersion = itemSetVersion
+             coordinator.items = items
+             if dataVersionChanged {
+                 coordinator.reloadVisibleProgramRows()
+@@ -164,6 +174,7 @@
+         weak var container: EPGContainerView?
+         var items: [Item]
+         var itemIDs: [AnyHashable]
++        var itemSetVersion: AnyHashable?
+         /// Captured so AppKit scroll handlers can compute rowData for only the visible window without full scan.
+         var rowDataProvider: ((Item) -> ChannelLabelRowData)?
+         var dataVersion: AnyHashable?
+@@ -172,6 +183,7 @@
+             self.parent = parent
+             self.items = parent.items
+             self.itemIDs = parent.items.map { AnyHashable($0.id) }
++            self.itemSetVersion = nil // First update must populate channel names.
+             self.rowDataProvider = parent.rowDataProvider
+             self.dataVersion = parent.dataVersion
+         }

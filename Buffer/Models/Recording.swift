@@ -46,6 +46,9 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
     let streamURL: URL
     let source: Source
     let createdAt: Date
+    /// Physical source is pinned for the entire recording. The logical
+    /// Smart channel remains metadata; it never rewrites an active recorder.
+    let sourceOwnership: ChannelSourceOwnership?
 
     var actualStart: Date?
     var actualEnd: Date?
@@ -83,6 +86,7 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
         case id, playlistID, channelID, channelName, programID, title
         case programDescription, scheduledStart, scheduledEnd, streamURL
         case source, createdAt, actualStart, actualEnd, fileURL, status
+        case sourceOwnership
         case errorMessage, wakeAt
         case streamInfo, bytesWritten, fileSizeBytes
     }
@@ -101,6 +105,7 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
         streamURL = try c.decode(URL.self, forKey: .streamURL)
         source = try c.decode(Source.self, forKey: .source)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
+        sourceOwnership = try c.decodeIfPresent(ChannelSourceOwnership.self, forKey: .sourceOwnership)
         actualStart = try c.decodeIfPresent(Date.self, forKey: .actualStart)
         actualEnd = try c.decodeIfPresent(Date.self, forKey: .actualEnd)
         fileURL = try c.decodeIfPresent(URL.self, forKey: .fileURL)
@@ -129,7 +134,8 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
         actualEnd: Date?,
         fileURL: URL?,
         status: Status,
-        errorMessage: String?
+        errorMessage: String?,
+        sourceOwnership: ChannelSourceOwnership? = nil
     ) {
         self.id = id
         self.playlistID = playlistID
@@ -143,6 +149,7 @@ struct Recording: Identifiable, Codable, Hashable, Sendable {
         self.streamURL = streamURL
         self.source = source
         self.createdAt = createdAt
+        self.sourceOwnership = sourceOwnership
         self.actualStart = actualStart
         self.actualEnd = actualEnd
         self.fileURL = fileURL

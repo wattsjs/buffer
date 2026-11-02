@@ -36,14 +36,16 @@ enum ReminderMenuBuilder {
         event: NSEvent,
         in view: NSView,
         onPlay: @escaping () -> Void,
-        onPlayFromStart: (() -> Void)? = nil
+        onPlayFromStart: (() -> Void)? = nil,
+        actionModel: EPGViewModel? = nil
     ) {
         let menu = buildMenu(
             playlistID: playlistID,
             program: program,
             channel: channel,
             onPlay: onPlay,
-            onPlayFromStart: onPlayFromStart
+            onPlayFromStart: onPlayFromStart,
+            actionModel: actionModel
         )
         NSMenu.popUpContextMenu(menu, with: event, for: view)
     }
@@ -53,7 +55,8 @@ enum ReminderMenuBuilder {
         program: EPGProgram,
         channel: Channel,
         onPlay: @escaping () -> Void,
-        onPlayFromStart: (() -> Void)? = nil
+        onPlayFromStart: (() -> Void)? = nil,
+        actionModel: EPGViewModel? = nil
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -66,28 +69,41 @@ enum ReminderMenuBuilder {
 
         let manager = NotificationManager.shared
         let existing = manager.reminder(playlistID: playlistID, for: program)
+        let action = actionModel?.sourceProgramAction(channel: channel, program: program) ??
+            (channel.sourceOwnership?.logicalChannelID == nil ? (channel, program) : nil)
 
         if let existing {
             let title = "Cancel Reminder (" + leadDescription(minutes: existing.leadMinutes) + ")"
             menu.addItem(ClosureMenuItem(title: title, symbol: "bell.slash") {
                 manager.cancelReminder(playlistID: playlistID, for: program)
             })
+        } else if action == nil {
+            let unavailable = NSMenuItem(title: "Guide source unavailable — refresh Smart Sports", action: nil, keyEquivalent: "")
+            unavailable.isEnabled = false
+            menu.addItem(unavailable)
         } else if program.end <= Date() {
             let past = NSMenuItem(title: "Already aired", action: nil, keyEquivalent: "")
             past.isEnabled = false
             menu.addItem(past)
         } else {
-            menu.addItem(makeRemindItem(title: "Remind Me at Start", symbol: "bell", lead: 0, playlistID: playlistID, program: program, channel: channel))
-            menu.addItem(makeRemindItem(title: "Remind Me 5 min Before", symbol: "bell", lead: 5, playlistID: playlistID, program: program, channel: channel))
-            menu.addItem(makeRemindItem(title: "Remind Me 15 min Before", symbol: "bell", lead: 15, playlistID: playlistID, program: program, channel: channel))
-            menu.addItem(makeRemindItem(title: "Remind Me 1 hour Before", symbol: "bell", lead: 60, playlistID: playlistID, program: program, channel: channel))
+            menu.addItem(makeRemindItem(title: "Remind Me at Start", symbol: "bell", lead: 0, playlistID: playlistID, program: program, channel: channel, action: action))
+            menu.addItem(makeRemindItem(title: "Remind Me 5 min Before", symbol: "bell", lead: 5, playlistID: playlistID, program: program, channel: channel, action: action))
+            menu.addItem(makeRemindItem(title: "Remind Me 15 min Before", symbol: "bell", lead: 15, playlistID: playlistID, program: program, channel: channel, action: action))
+            menu.addItem(makeRemindItem(title: "Remind Me 1 hour Before", symbol: "bell", lead: 60, playlistID: playlistID, program: program, channel: channel, action: action))
         }
 
         menu.addItem(.separator())
-        addRecordingItems(to: menu, playlistID: playlistID, program: program, channel: channel)
+        if let action {
+            addRecordingItems(to: menu, playlistID: action.channel.sourceChannelIdentity?.sourceID ?? playlistID,
+                program: action.program, channel: action.channel)
+        }
 
         menu.addItem(.separator())
-        if let onPlayFromStart {
+        if channel.sourceOwnership?.logicalChannelID != nil, let actionModel {
+            menu.addItem(ClosureMenuItem(title: "Open Original Source Guide", symbol: "list.bullet.rectangle") {
+                actionModel.showOriginalSourceGuide(for: channel)
+            })
+        } else if let onPlayFromStart {
             menu.addItem(ClosureMenuItem(title: "Play from Start", symbol: "gobackward", handler: onPlayFromStart))
         }
         menu.addItem(ClosureMenuItem(title: "Play Channel", symbol: "play.fill", handler: onPlay))
@@ -103,7 +119,8 @@ enum ReminderMenuBuilder {
         let recorder = RecordingManager.shared
         let existing = recorder.recordings.first { rec in
             rec.programID == program.id
-                && rec.channelID == channel.id
+                && ((channel.sourceChannelIdentity != nil && rec.sourceOwnership?.channelIdentity == channel.sourceChannelIdentity) ||
+                    (rec.sourceOwnership == nil && rec.channelID == channel.id && rec.playlistID == playlistID))
                 && (rec.status == .scheduled || rec.status == .recording)
         }
 
@@ -135,7 +152,8 @@ enum ReminderMenuBuilder {
         lead: Int,
         playlistID: UUID,
         program: EPGProgram,
-        channel: Channel
+        channel: Channel,
+        action: (channel: Channel, program: EPGProgram)?
     ) -> ClosureMenuItem {
         ClosureMenuItem(title: title, symbol: symbol) {
             Task { @MainActor in
@@ -143,7 +161,7 @@ enum ReminderMenuBuilder {
                     playlistID: playlistID,
                     program: program,
                     channel: channel,
-                    leadMinutes: lead
+                    leadMinutes: lead, sourceChannel: action?.channel, sourceProgramID: action?.program.id
                 )
                 AppFeedbackCenter.shared.showReminderResult(
                     playlistID: playlistID,

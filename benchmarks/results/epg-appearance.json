@@ -1,0 +1,138 @@
+{
+  "appearances": [
+    {
+      "appearance": "light",
+      "minimumMetadataContrast": 7.091090653239037,
+      "minimumPrimaryContrast": 12.398127035887693,
+      "programmeSurface": "#F1F1F1",
+      "renderedProgrammeContrast": [
+        {
+          "renderedTitleContrast": 13.57108627016935,
+          "rowOpacity": 1,
+          "saturation": 1
+        },
+        {
+          "renderedTitleContrast": 2.5759304282989097,
+          "rowOpacity": 0.45,
+          "saturation": 0.4
+        },
+        {
+          "renderedTitleContrast": 2.0087897614582664,
+          "rowOpacity": 0.35,
+          "saturation": 0.4
+        }
+      ]
+    },
+    {
+      "appearance": "dark",
+      "minimumMetadataContrast": 6.597930323141869,
+      "minimumPrimaryContrast": 9.259213136753731,
+      "programmeSurface": "#2D2D2D",
+      "renderedProgrammeContrast": [
+        {
+          "renderedTitleContrast": 10.334440991244847,
+          "rowOpacity": 1,
+          "saturation": 1
+        },
+        {
+          "renderedTitleContrast": 3.36903949194377,
+          "rowOpacity": 0.45,
+          "saturation": 0.4
+        },
+        {
+          "renderedTitleContrast": 2.5448521340281887,
+          "rowOpacity": 0.35,
+          "saturation": 0.4
+        }
+      ]
+    },
+    {
+      "appearance": "light-contrast",
+      "minimumMetadataContrast": 7.091090653239037,
+      "minimumPrimaryContrast": 12.398127035887693,
+      "programmeSurface": "#F1F1F1",
+      "renderedProgrammeContrast": [
+        {
+          "renderedTitleContrast": 13.57108627016935,
+          "rowOpacity": 1,
+          "saturation": 1
+        },
+        {
+          "renderedTitleContrast": 2.5759304282989097,
+          "rowOpacity": 0.45,
+          "saturation": 0.4
+        },
+        {
+          "renderedTitleContrast": 2.0087897614582664,
+          "rowOpacity": 0.35,
+          "saturation": 0.4
+        }
+      ]
+    },
+    {
+      "appearance": "dark-contrast",
+      "minimumMetadataContrast": 6.597930323141869,
+      "minimumPrimaryContrast": 9.259213136753731,
+      "programmeSurface": "#2D2D2D",
+      "renderedProgrammeContrast": [
+        {
+          "renderedTitleContrast": 10.334440991244847,
+          "rowOpacity": 1,
+          "saturation": 1
+        },
+        {
+          "renderedTitleContrast": 3.36903949194377,
+          "rowOpacity": 0.45,
+          "saturation": 0.4
+        },
+        {
+          "renderedTitleContrast": 2.5448521340281887,
+          "rowOpacity": 0.35,
+          "saturation": 0.4
+        }
+      ]
+    }
+  ],
+  "checks": 184,
+  "fixture": "production-epg-appearance-and-pan-v1",
+  "capturedAtUTC": "2026-10-04T13:46:43.026015+00:00",
+  "host": {
+    "os": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "architecture": "arm64"
+  },
+  "sourceSHA256": {
+    "Buffer/Views/EPGGridView.swift": "15a7d80ad8aac21557e18d6c01ff0f41b5638645ed0cfacf0f5db06110848aa0",
+    "Buffer/Views/EPGScrollGrid.swift": "45c9ab8dfd5c22b594777b6821bfef046b2b31dbd614aed1b97152b4f5232859",
+    "Buffer/Support/EPGGridStyle.swift": "a61835e96ed16fe8aab3cbf5b70cae4a2dce57679ba09d89fab3f623bc95269e",
+    "Buffer/Support/EPGProgramCanvas.swift": "607a73ad394458eb87a6023d01c7053c17bc6100b32946a05a31b371054777ef",
+    "Buffer/Support/EPGVisibleChannelContext.swift": "a71fc208734aeba08e7018ea66f9911036ef4c6381cf6356fcdd859ef2c98f2c",
+    "benchmarks/epg_appearance_tests.swift": "ce0f0c6c7534b3c90fc3b675f561413c65d7298a762ff6483369d2e14c6536bb"
+  },
+  "beforeSourceSHA256": {
+    ".local/bench/EPGGridView-colors-before.swift": "bfe563f70873a6ecdf3096272807bb81d1dec70e4bb55fa5e4380acfcec34616",
+    ".local/bench/EPGScrollGrid-colors-before.swift": "e616aba1df275743ba56ce11a2d57ae64c899f64342d853c01e525fcffc9f3d2"
+  },
+  "checksCovered": [
+    "Native programme canvas pixels in light, dark and both increased contrast appearances",
+    "Primary and metadata text on upcoming/past/replay/live and hovered surfaces",
+    "State indicator contrast on actual programme surfaces",
+    "Native pointer hover and live-state expiry without rebuilding programme blocks",
+    "Appearance transition with unchanged programme geometry",
+    "Production EPGScrollGrid with 80640-point document and real ProgramBlocksView",
+    "Initial archive offset and pans to 0,1200,20040,60060 document points",
+    "Actual equatable/popover/frame/divider/opacity/saturation/animation wrapper chain",
+    "Row opacity 1,0.45,0.35 and actual glyph pixel contrast over adaptive page",
+    "Direct partial dirty rectangles with nonzero document origin and explicit 2x bitmap contexts",
+    "Drawing reference-time propagation through hosted programme views",
+    "Bounded viewport fallback and current metadata resolution from remembered visible IDs"
+  ],
+  "limitations": [
+    "Offscreen cacheDisplay captures exercise CPU/AppKit drawing, not live WindowServer or GPU texture qualification.",
+    "The missing programme-card failure in the user screenshot was not reproduced by this offscreen fixture.",
+    "Root owns full-target compilation and real dark/light/panned app validation.",
+    "Measured glyph contrast uses fully covered text pixels; no whole-app accessibility conformance claim is made.",
+    "No saved provider, public ESPN endpoint or live stream was accessed."
+  ],
+  "screenshots": ".local/bench/epg-appearance/",
+  "rerun": "scripts/test-epg-appearance.sh"
+}

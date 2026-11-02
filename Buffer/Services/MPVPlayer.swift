@@ -17,41 +17,6 @@ enum BufferSetting {
     }
 }
 
-enum MPVEndReason: Equatable, Sendable {
-    /// Playback was stopped by a `stop` command or a new `loadfile`.
-    case stopped
-    /// mpv reached EOF. For live streams this is usually a false EOF and the
-    /// owner should reconnect; for finite files it's the end of playback.
-    case eof
-    /// An mpv error code (see `mpv_error_string`).
-    case error(code: Int32, message: String)
-    /// HTTP 509 Bandwidth Limit Exceeded — provider is throttling.
-    /// Treated separately from generic errors because the recovery strategy
-    /// is fundamentally different: back off much longer, stop other streams
-    /// if account-level, and never retry at the segment-fetch level.
-    case http509(message: String)
-
-    var isRecoverable: Bool {
-        switch self {
-        case .stopped: return false
-        case .eof, .error, .http509: return true
-        }
-    }
-}
-
-enum MPVStreamIssue: Equatable, Sendable {
-    case httpError(String)
-    case hlsReloadFailed(String)
-    case reconnecting(String)
-
-    var recoveryMessage: String {
-        switch self {
-        case .httpError(let message), .hlsReloadFailed(let message), .reconnecting(let message):
-            message
-        }
-    }
-}
-
 struct MPVMediaInfo: Equatable, Sendable {
     var width: Int = 0
     var height: Int = 0
@@ -59,6 +24,7 @@ struct MPVMediaInfo: Equatable, Sendable {
     var videoCodec: String = ""
     var audioCodec: String = ""
     var audioChannels: Int = 0
+    var audioSampleRate: Int = 0
     var hwdec: String = ""
     /// Estimated seconds behind the live edge, adjusted by preferred delay.
     /// `nil` when the stream does not expose a replay window.
@@ -99,16 +65,10 @@ final class MPVPlayer {
         static let stateEpsilon = 0.05
         static let timePosEpsilon = 0.25
         static let cacheEpsilon = 0.5
-        static let demuxerLavfProbeSize = 2_097_152
-        // mpv exposes this as seconds (not microseconds), unlike ffmpeg's raw
-        // AVOption surface.
-        static let demuxerLavfAnalyzeDuration = 5.0
         // ffmpeg I/O buffer for reading stream data. 512 KB cuts system-call
         // overhead by 16× vs the 32 KB default, which matters a lot for 4 K
         // HEVC segments that are 4–8 MB each.
         static let demuxerLavfBufferSize = 524_288
-        static let fastProbeSize = 65_536
-        static let fastAnalyzeDuration = 0.1
         static let liveLatencyEpsilon = 0.5
 
         /// User-facing forward buffer target. Startup and mpv's cache-pause
@@ -247,6 +207,44 @@ final class MPVPlayer {
     private(set) var isPlaying = false
     private(set) var errorMessage: String?
     private(set) var cacheSeconds: Double = 0
+    @ObservationIgnored private var preciseCacheSample = PlaybackCacheSample()
+    var telemetryExactCacheSeconds: Double? {
+        preciseCacheSample.currentSeconds(generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)
+    }
+    private(set) var usesStartupReserve = false
+    private(set) var startupTargetEnabled = false
+    private(set) var nativeCacheOnlyEnabled = false
+    var startupHoldActive: Bool { playbackControl.startupSuspended }
+    private(set) var startupHoldReleasedAtMs: Int?
+    private(set) var startupHoldReleaseCacheSeconds: Double?
+    private(set) var startupTargetTimedOut = false
+    @ObservationIgnored private var startupTargetHold: StartupTargetHold?
+    @ObservationIgnored private var pendingStartupLoad: (path: String, generation: Int)?
+    @ObservationIgnored private var startupPauseConfirmedGeneration: Int?
+    private(set) var telemetryCachePauseInitial: Bool?
+    private(set) var telemetryCachePauseWaitSeconds: Double?
+    @ObservationIgnored private var loadProbeOptions = MPVLoadProbeOptions.baseline
+    var liveAnalysisEnabled: Bool { loadProbeOptions.liveAnalysisRequestedSeconds != nil }
+    var liveAnalysisRequestedSeconds: Double? { loadProbeOptions.liveAnalysisRequestedSeconds }
+    private(set) var telemetryLavfAnalyzeDurationSeconds: Double?
+    private(set) var telemetryLavfProbeSize: Int64?
+    private(set) var telemetryLavfProbeInfo: String?
+    @ObservationIgnored private var startupPhases = MPVStartupPhases()
+    var telemetryStartupPhaseTimingsMilliseconds: [String: Double] { startupPhases.timingsMilliseconds }
+    @ObservationIgnored private var rawTimeSample = PlaybackClockSample()
+    @ObservationIgnored private var videoPTSSample = PlaybackClockSample()
+    var telemetryRawTimePos: Double? {
+        rawTimeSample.current(generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)?.seconds
+    }
+    var telemetryRawTimePosAgeMilliseconds: Double? {
+        rawTimeSample.current(generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)?.ageMilliseconds
+    }
+    var telemetryVideoPTS: Double? {
+        videoPTSSample.current(generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)?.seconds
+    }
+    var telemetryVideoPTSAgeMilliseconds: Double? {
+        videoPTSSample.current(generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)?.ageMilliseconds
+    }
     private(set) var isBuffering = false
     /// True from the moment `loadURL` is called until the first frame is
     /// rendered (or the load fails). mpv's `paused-for-cache` only flips after
@@ -257,6 +255,50 @@ final class MPVPlayer {
     private(set) var volume: Double = 100
     private(set) var isMuted = false
     private(set) var timePos: Double = 0
+    private(set) var cacheFloorPauseCount = 0
+    private(set) var firstFrameElapsedMs: Int?
+    var telemetryLoadGeneration: Int { loadGeneration }
+    var telemetryBackendItemIdle: Bool {
+        currentURL == nil && itemLifecycle.isBackendIdle
+    }
+    @ObservationIgnored private var backendTeardownCompletions: [() -> Void] = []
+
+    /// An accepted STOP command alone does not prove the upstream is closed.
+    /// Defer connection leases and handle reuse until the item lifecycle has
+    /// received both command completion and the last entry's END_FILE.
+    func stopWhenBackendIdle(_ completion: @escaping () -> Void) {
+        backendTeardownCompletions.append(completion)
+        stop()
+        completeBackendTeardownIfIdle()
+    }
+
+    private func completeBackendTeardownIfIdle() {
+        guard telemetryBackendItemIdle, !backendTeardownCompletions.isEmpty else { return }
+        let completions = backendTeardownCompletions
+        backendTeardownCompletions.removeAll()
+        for completion in completions { completion() }
+    }
+    /// Only the entry acknowledged by loadfile and FILE_LOADED may contribute
+    /// render telemetry. A newer requested generation alone proves nothing.
+    var renderItemIdentity: MPVItemLifecycle.Identity? { itemLifecycle.loadedIdentity }
+    var telemetryBufferingMilliseconds: Int {
+        bufferingTotalMilliseconds + (bufferingStartedAt.map { AppLog.elapsedMilliseconds(since: $0) } ?? 0)
+    }
+    private(set) var telemetryAudioOutput: String?
+    private(set) var telemetryDemuxerStartTime: Double?
+    private(set) var telemetryAVSyncSeconds: Double?
+    private(set) var telemetryPause: Bool?
+    private(set) var telemetryPausedForCache: Bool?
+    /// Owner intent, independent of cache, thumbnail, and system suspension.
+    var wantsPlayback: Bool { playbackRequested }
+    private(set) var ownerPlaybackIntentRevision: UInt64 = 0
+    var telemetryPlaybackRequested: Bool { wantsPlayback }
+    @ObservationIgnored private(set) var telemetryRenderedFrameCount = 0
+    @ObservationIgnored private(set) var telemetryLastRenderElapsedMs: Double?
+    @ObservationIgnored private var lastRenderedAt: ContinuousClock.Instant?
+    var telemetrySecondsSinceLastRender: Double? {
+        lastRenderedAt.map { Self.milliseconds($0.duration(to: .now)) / 1_000 }
+    }
     private(set) var duration: Double = 0
     private(set) var isSeekable: Bool = false
     /// Last URL handed to `loadURL`. Used by callers to avoid redundant
@@ -341,20 +383,28 @@ final class MPVPlayer {
     private var bufferSeconds: Int = BufferSetting.read()
     @ObservationIgnored private var activeCachePauseFloorSeconds: Double = Tuning.cachePauseFloorSeconds(for: BufferSetting.read())
     @ObservationIgnored private var activeCachePauseResumeSeconds: Double = Tuning.cachePauseResumeSeconds(for: BufferSetting.read())
-    @ObservationIgnored private var autoPausedForCacheFloor = false
+    @ObservationIgnored private var playbackControl = PlaybackControlState()
+    private var autoPausedForCacheFloor: Bool {
+        get { playbackControl.cacheSuspended }
+        set { playbackControl.cacheSuspended = newValue }
+    }
     @ObservationIgnored var focusedScaling: Bool = true   // internal: read by PlayerSlot watchdog guards for multi-view throttling decisions
     /// Set when we deliberately disabled the video track for a background
     /// thumbnail slot in multi-view. We restore it ("auto") on promotion.
-    @ObservationIgnored private(set) var videoDisabledForBackground = false
+    var videoDisabledForBackground: Bool { playbackControl.backgroundSuspended }
     private var defaultsObserver: NSObjectProtocol?
     private var mpvLogSuppression: [String: MPVLogSuppression] = [:]
     @ObservationIgnored private var lastHTTPStatusCode: Int = 0
-    @ObservationIgnored private var playbackRequested = false
+    private var playbackRequested: Bool { playbackControl.playbackRequested }
+    @ObservationIgnored private var redirectResolutionTask: Task<Void, Never>?
     @ObservationIgnored private var loadStartedAt: ContinuousClock.Instant?
     @ObservationIgnored private var bufferingStartedAt: ContinuousClock.Instant?
     @ObservationIgnored private var bufferingEventCount = 0
     @ObservationIgnored private var bufferingTotalMilliseconds = 0
-    @ObservationIgnored private var loadGeneration = 0
+    private var loadGeneration: Int { playbackControl.generation }
+    @ObservationIgnored private var itemLifecycle = MPVItemLifecycle()
+    @ObservationIgnored private var propertyRequestSerial: UInt64 = 0
+    @ObservationIgnored private var propertyRequests: [UInt64: (generation: Int, item: MPVItemLifecycle.Identity?, property: PropID)] = [:]
     @ObservationIgnored private var firstRenderedLoadGeneration = 0
     @ObservationIgnored private var displayPowerAssertion = IOPMAssertionID(0)
     @ObservationIgnored private var holdsDisplayPowerAssertion = false
@@ -366,6 +416,7 @@ final class MPVPlayer {
     @ObservationIgnored private var lastDrawableWidth: Int = 0
     @ObservationIgnored private var lastDrawableHeight: Int = 0
     @ObservationIgnored private var fileLoadedGeneration = 0
+    @ObservationIgnored private var lastFileLoadedIdentity: MPVItemLifecycle.Identity?
 
     /// In-memory cache of resolved CDN URLs. Xtream stream URLs redirect to
     /// CDN edge servers; caching the final URL avoids a ~1s HEAD request on
@@ -432,13 +483,33 @@ final class MPVPlayer {
         return nil
     }
 
-    func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false) {
+    @ObservationIgnored private(set) var usesArchiveTimestampRecovery = false
+
+    func loadURL(_ url: URL, autoplay: Bool = false, fastProbe: Bool = false, archive: Bool = false, live: Bool = false) {
+        ownerPlaybackIntentRevision &+= 1
         guard let handle else { return }
+        setRuntimeProperty(handle, "video-timing-offset", MPVRenderTiming.videoTimingOffset)
+        let eligibleLive = live && !archive && !url.isFileURL
+        startupTargetEnabled = MPVStartupTarget.enabled(forLiveLoad: eligibleLive)
+        nativeCacheOnlyEnabled = MPVNativeCacheOnly.enabled(forLiveLoad: eligibleLive)
+        usesStartupReserve = !startupTargetEnabled && MPVStartupReserve.enabled(forLiveLoad: eligibleLive)
 
         updateBufferingState(false, source: "load-replaced")
-        loadGeneration &+= 1
+        redirectResolutionTask?.cancel()
+        playbackControl.beginLoad(autoplay: autoplay)
+        itemLifecycle.invalidate(generation: loadGeneration)
         firstRenderedLoadGeneration = 0
         loadStartedAt = ContinuousClock.now
+        resetLoadTelemetry()
+        let validationActive = PlaybackValidation.isEnabled || SavedPlaybackScenario.isCapturing
+        loadProbeOptions = MPVLoadProbeOptions.configuration(url: url, live: live, archive: archive,
+            fastProbe: fastProbe, validationActive: validationActive, arguments: CommandLine.arguments)
+#if DEBUG
+        startupPhases.reset(generation: loadGeneration, enabled: validationActive)
+#endif
+        playbackControl.startupSuspended = startupTargetEnabled
+        startupTargetHold = startupTargetEnabled
+            ? StartupTargetHold(generation: loadGeneration, targetSeconds: Double(bufferSeconds)) : nil
         AppLog.playback.info("mpv load-start generation=\(self.loadGeneration, privacy: .public) url=\(url.absoluteString, privacy: .private(mask: .hash)) autoplay=\(autoplay, privacy: .public) fastProbe=\(fastProbe, privacy: .public)")
         errorMessage = nil
         resetMediaTrackState()
@@ -449,10 +520,8 @@ final class MPVPlayer {
         bufferingEventCount = 0
         bufferingTotalMilliseconds = 0
         autoPausedForCacheFloor = false
-        videoDisabledForBackground = false
         refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
-        playbackRequested = autoplay
-        isPlaying = autoplay
+        isPlaying = !playbackControl.shouldPause
         isLoading = true
         currentURL = url
         lastTelemetryFrameDrops = 0
@@ -463,7 +532,9 @@ final class MPVPlayer {
         lastDrawableWidth = 0
         lastDrawableHeight = 0
         fileLoadedGeneration = 0
+        lastFileLoadedIdentity = nil
         updateDisplayPowerAssertion()
+        if startupTargetEnabled { applyPlaybackPauseState() }
 
         // Fast-probe path is used for known local MPEG-TS sources (recording
         // files). With the regular live probe/analyze window,
@@ -473,13 +544,9 @@ final class MPVPlayer {
         // the probe window by ~16x trims the open delay without losing
         // detection. Restored to the safe HLS defaults on the next non-fast
         // load so channel streams aren't affected.
-        if fastProbe {
-            setRuntimeProperty(handle, "demuxer-lavf-probesize", "\(Tuning.fastProbeSize)")
-            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(Tuning.fastAnalyzeDuration)")
-        } else {
-            setRuntimeProperty(handle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
-            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
-        }
+        setRuntimeProperty(handle, "demuxer-lavf-probesize", "\(loadProbeOptions.probeSize)")
+        setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(loadProbeOptions.analyzeDurationSeconds)")
+        setRuntimeProperty(handle, "demuxer-lavf-probe-info", loadProbeOptions.probeInfo)
         // For HLS playlists, set the format explicitly so ffmpeg skips the
         // content-based detection step, and raise the probescore so it skips
         // low-confidence verification. Everything else (VOD .mkv/.mp4, catchup
@@ -500,20 +567,39 @@ final class MPVPlayer {
             handle, "stream-lavf-o",
             !isHLS && isNetwork ? Tuning.vodStreamLavfOptions : Tuning.liveStreamLavfOptions
         )
+        // These options are properties of the retained handle. Restore the
+        // baseline on every load before applying a validation-only override.
+        let timestampOptions = ArchiveTimestampRecovery.options(forArchiveLoad: archive)
+        usesArchiveTimestampRecovery = timestampOptions.enabled
+        setRuntimeProperty(handle, "demuxer-lavf-o", timestampOptions.lavf)
+        setRuntimeProperty(handle, "demuxer-lavf-linearize-timestamps", timestampOptions.linearize)
+        setRuntimeProperty(handle, "vid", videoDisabledForBackground ? "no" : "auto")
+
+        // Controlled transport experiment: never retry authentication/provider
+        // throttling, EOF, or unbounded reconnects. Not enabled in normal runs.
+        if isHLS, PlaybackValidation.config?.httpRetry == true {
+            setRuntimeProperty(handle, "stream-lavf-o", "rw_timeout=8000000,reconnect_on_http_error=502,reconnect_on_network_error=1,reconnect_max_retries=3,reconnect_delay_max=2,reconnect_delay_total_max=5")
+            setRuntimeProperty(handle, "demuxer-lavf-o", timestampOptions.lavf + ",reconnect_on_http_error=502,reconnect_on_network_error=1,reconnect_max_retries=3,reconnect_delay_max=2,reconnect_delay_total_max=5")
+        }
 
         // Eagerly resolve CDN redirects before handing the URL to mpv.
         // URLSession reuses connections and resolves redirects faster than
         // mpv/ffmpeg's internal HTTP stack, saving ~4s on Xtream streams.
         let capturedURL = url
         let capturedGeneration = loadGeneration
-        Task { @MainActor [weak self] in
-            guard let self, let handle = self.handle else { return }
-            guard self.loadGeneration == capturedGeneration else {
+        redirectResolutionTask = Task { @MainActor [weak self] in
+            guard !Task.isCancelled, let self, self.handle != nil else { return }
+            guard self.playbackControl.acceptsLoad(capturedGeneration) else {
                 AppLog.playback.info("mpv redirect resolution cancelled (stale generation)")
                 return
             }
+            self.noteStartupPhase(.redirectStarted, generation: capturedGeneration)
             let resolvedURL = await Self.resolveRedirect(for: capturedURL) ?? capturedURL
-            guard self.loadGeneration == capturedGeneration else { return }
+            guard !Task.isCancelled,
+                  self.playbackControl.acceptsLoad(capturedGeneration),
+                  let handle = self.handle else { return }
+            self.redirectResolutionTask = nil
+            self.noteStartupPhase(.redirectCompleted, generation: capturedGeneration)
             if resolvedURL != capturedURL {
                 AppLog.playback.info("mpv redirect resolved to=\(resolvedURL.absoluteString, privacy: .private(mask: .hash))")
                 self.currentURL = resolvedURL
@@ -521,21 +607,40 @@ final class MPVPlayer {
             let path = resolvedURL.absoluteString
             // Use a smaller readahead for faster startup; increased after first frame.
             setRuntimeProperty(handle, "demuxer-readahead-secs", "\(Tuning.startupReadAheadSeconds(for: self.bufferSeconds))")
-            command(handle, ["loadfile", path, "replace"])
-            setFlag("pause", !autoplay)
+            if self.startupTargetEnabled {
+                self.pendingStartupLoad = (path, capturedGeneration)
+                self.applyPlaybackPauseState()
+                self.startTargetLoadIfPauseConfirmed()
+            } else if let request = self.itemLifecycle.enqueue(.load(path), generation: capturedGeneration) {
+                self.submitItemCommand(request)
+            }
+            self.applyPlaybackPauseState()
         }
     }
 
-    func noteRenderedFrame(width: Int, height: Int) {
-        guard currentURL != nil, firstRenderedLoadGeneration != loadGeneration else { return }
+    func noteRenderedFrame(width: Int, height: Int, identity: MPVItemLifecycle.Identity, renderedAt: ContinuousClock.Instant) {
+        guard currentURL != nil,
+              itemLifecycle.loadedIdentity == identity,
+              playbackControl.acceptsFrame(identity.generation, fileLoadedGeneration: fileLoadedGeneration) else { return }
+        telemetryRenderedFrameCount &+= 1
+        lastRenderedAt = renderedAt
+        if let loadStartedAt {
+            telemetryLastRenderElapsedMs = Self.milliseconds(loadStartedAt.duration(to: renderedAt))
+        }
+        guard firstRenderedLoadGeneration != loadGeneration else { return }
         firstRenderedLoadGeneration = loadGeneration
         lastDrawableWidth = width
         lastDrawableHeight = height
         let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
-        if isLoading {
+        if isLoading, !startupHoldActive {
             isLoading = false
             updateDisplayPowerAssertion()
         }
+        if firstFrameElapsedMs == nil, elapsedMs >= 0 {
+            firstFrameElapsedMs = elapsedMs
+        }
+        noteStartupPhase(.firstRender, generation: identity.generation)
+        if elapsedMs >= 0 { PerfMetrics.shared.record("playback.loadToFirstFrameMs", Double(elapsedMs)) }
         AppLog.playback.info("mpv first-frame generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public) vo=\(width, privacy: .public)x\(height, privacy: .public) coded=\(self.mediaInfo.width, privacy: .public)x\(self.mediaInfo.height, privacy: .public) fileLoaded=\(self.fileLoadedGeneration == self.loadGeneration, privacy: .public)")
         // Upgrade readahead to full value now that playback is established.
         if let handle {
@@ -571,14 +676,11 @@ final class MPVPlayer {
     func nudgeVideoOutputAfterRenderContextAttach() {
         guard let handle, currentURL != nil else { return }
         let shouldDropBuffers = !(hasRenderedCurrentLoad && isPlaying)
-        setRuntimeProperty(handle, "vid", "auto")
-        videoDisabledForBackground = false
+        setRuntimeProperty(handle, "vid", videoDisabledForBackground ? "no" : "auto")
         if shouldDropBuffers {
             command(handle, ["drop-buffers"])
         }
-        setFlag("pause", false)
-        playbackRequested = true
-        isPlaying = true
+        applyPlaybackPauseState()
         updateDisplayPowerAssertion()
         AppLog.playback.info("mpv render-context handoff nudged video output dropBuffers=\(shouldDropBuffers, privacy: .public) rendered=\(self.hasRenderedCurrentLoad, privacy: .public)")
         logPlaybackSyncSnapshot("render-context-handoff")
@@ -601,38 +703,66 @@ final class MPVPlayer {
     }
 
     func play() {
-        setFlag("pause", false)
-        playbackRequested = true
-        isPlaying = true
+        ownerPlaybackIntentRevision &+= 1
+        playbackControl.requestPlayback(true)
+        refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
+        applyPlaybackPauseState()
+        isPlaying = !playbackControl.shouldPause
         updateDisplayPowerAssertion()
     }
 
     func pause() {
-        setFlag("pause", true)
-        playbackRequested = false
+        ownerPlaybackIntentRevision &+= 1
+        playbackControl.requestPlayback(false)
+        updateBufferingState(false, source: "owner-pause")
+        refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
+        applyPlaybackPauseState()
         isPlaying = false
         updateDisplayPowerAssertion()
     }
 
     func stop() {
-        guard let handle else { return }
-        playbackRequested = false
-        command(handle, ["stop"])
+        redirectResolutionTask?.cancel()
+        redirectResolutionTask = nil
+        rawTimeSample.reset()
+        videoPTSSample.reset()
+        startupPhases.reset(generation: loadGeneration, enabled: false)
+        loadProbeOptions = .baseline
+        telemetryLavfAnalyzeDurationSeconds = nil
+        telemetryLavfProbeSize = nil
+        telemetryLavfProbeInfo = nil
+        playbackControl.stop()
+        startupTargetHold = nil
+        pendingStartupLoad = nil
+        startupPauseConfirmedGeneration = nil
+        itemLifecycle.invalidate(generation: loadGeneration)
+        propertyRequests.removeAll()
+        if let request = itemLifecycle.enqueue(.stop, generation: loadGeneration) {
+            submitItemCommand(request)
+        }
+        applyPlaybackPauseState()
         isPlaying = false
         updateBufferingState(false, source: "stop")
         isLoading = false
         loadStartedAt = nil
         firstRenderedLoadGeneration = loadGeneration
+        fileLoadedGeneration = 0
+        lastFileLoadedIdentity = nil
+        currentURL = nil
         updateDisplayPowerAssertion()
     }
 
     func togglePause() {
-        isPlaying ? pause() : play()
+        playbackRequested ? pause() : play()
     }
 
     /// Pauses the lightweight cache-floor timer. Called by PlayerSlot during
     /// system sleep to avoid unnecessary work while suspended.
     func pauseBackgroundActivity() {
+        playbackControl.systemSuspended = true
+        applyPlaybackPauseState()
+        isPlaying = false
+        updateDisplayPowerAssertion()
         statePollTimer?.cancel()
         statePollTimer = nil
     }
@@ -640,6 +770,9 @@ final class MPVPlayer {
     /// Restarts the cache-floor timer if the player is still alive. Safe to
     /// call on wake even if we did not explicitly pause it.
     func resumeBackgroundActivity() {
+        playbackControl.systemSuspended = false
+        applyPlaybackPauseState()
+        updateDisplayPowerAssertion()
         if statePollTimer == nil, handle != nil {
             startCacheFloorTimer()
         }
@@ -671,8 +804,8 @@ final class MPVPlayer {
         updateBufferingState(false, source: "reuse")
         isLoading = false
         autoPausedForCacheFloor = false
-        videoDisabledForBackground = false
-        playbackRequested = false
+        playbackControl.backgroundSuspended = false
+        playbackControl.systemSuspended = false
         currentURL = nil
         isPlaying = false
         isMuted = false
@@ -686,6 +819,26 @@ final class MPVPlayer {
         loadStartedAt = nil
         firstRenderedLoadGeneration = loadGeneration
         focusedScaling = true
+        usesArchiveTimestampRecovery = false
+        usesStartupReserve = false
+        startupTargetEnabled = false
+        nativeCacheOnlyEnabled = false
+        loadProbeOptions = .baseline
+        resetLoadTelemetry()
+        setMute(false)
+        if let handle {
+            setRuntimeProperty(handle, "video-timing-offset", MPVRenderTiming.videoTimingOffset)
+            setRuntimeProperty(handle, "cache-pause-initial", "no")
+            setRuntimeProperty(handle, "demuxer-lavf-probesize", "\(loadProbeOptions.probeSize)")
+            setRuntimeProperty(handle, "demuxer-lavf-analyzeduration", "\(loadProbeOptions.analyzeDurationSeconds)")
+            setRuntimeProperty(handle, "demuxer-lavf-probe-info", loadProbeOptions.probeInfo)
+            setRuntimeProperty(handle, "vid", "auto")
+            setRuntimeProperty(handle, "stream-lavf-o", Tuning.liveStreamLavfOptions)
+            let timestamps = ArchiveTimestampRecovery.options(forArchiveLoad: false)
+            setRuntimeProperty(handle, "demuxer-lavf-o", timestamps.lavf)
+            setRuntimeProperty(handle, "demuxer-lavf-linearize-timestamps", timestamps.linearize)
+        }
+        applyPlaybackPauseState()
 
         releaseDisplayPowerAssertion()
         resetRenderContext()
@@ -745,11 +898,9 @@ final class MPVPlayer {
             focusedScaling = true
             if videoDisabledForBackground {
                 setRuntimeProperty(handle, "vid", "auto")
-                videoDisabledForBackground = false
+                playbackControl.backgroundSuspended = false
             }
-            // When (re)becoming the focused pane in multi-view, ensure it is playing
-            // (we may have auto-paused it when it was a background thumbnail).
-            setFlag("pause", false)
+            playbackControl.backgroundSuspended = false
         } else if focused {
             maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: true)
             maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: true)
@@ -759,9 +910,9 @@ final class MPVPlayer {
             focusedScaling = true
             if videoDisabledForBackground {
                 setRuntimeProperty(handle, "vid", "auto")
-                videoDisabledForBackground = false
+                playbackControl.backgroundSuspended = false
             }
-            setFlag("pause", false)
+            playbackControl.backgroundSuspended = false
         } else {
             maxBytes = Tuning.demuxerMaxBytes(for: bufferSeconds, focused: false)
             maxBackBytes = Tuning.demuxerMaxBackBytes(for: bufferSeconds, focused: false)
@@ -774,11 +925,12 @@ final class MPVPlayer {
             // Pause + drop buffers + disable video track so the decoder does
             // essentially zero work for off-screen slots. The render layer stays
             // attached; on promotion we re-enable video + unpause.
-            setFlag("pause", true)
+            playbackControl.backgroundSuspended = true
+            autoPausedForCacheFloor = false
             command(handle, ["drop-buffers"])
             setRuntimeProperty(handle, "vid", "no")
-            videoDisabledForBackground = true
         }
+        applyPlaybackPauseState()
 
         activeCachePauseFloorSeconds = Tuning.cachePauseFloorSeconds(for: cacheFloorSecs)
         activeCachePauseResumeSeconds = Tuning.cachePauseResumeSeconds(for: cacheFloorSecs)
@@ -887,7 +1039,7 @@ final class MPVPlayer {
         // but adds latency. interpolation is off — live sport at 50/60 fps
         // doesn't benefit, and it costs GPU cycles.
         setOption(newHandle, "video-sync", "audio")
-        setOption(newHandle, "video-timing-offset", "0.016")
+        setOption(newHandle, "video-timing-offset", MPVRenderTiming.videoTimingOffset)
         setOption(newHandle, "interpolation", "no")
 
         // Triple-buffering for smoother frame delivery under variable decode
@@ -929,7 +1081,16 @@ final class MPVPlayer {
         setOption(newHandle, "load-osd-console", "no")
         setOption(newHandle, "ytdl", "no")
 
-        // Audio defaults.
+        // Audio defaults. Validation-only backend experiments use the same
+        // bundled C library and preserve normal playback settings.
+        var audioOutputOverride = PlaybackValidation.config?.audioOutput
+#if DEBUG
+        audioOutputOverride = audioOutputOverride ?? SessionObservation.audioOutputOverride
+#endif
+        if let output = audioOutputOverride,
+           ["coreaudio", "avfoundation"].contains(output) {
+            setOption(newHandle, "ao", output)
+        }
         setOption(newHandle, "volume", "100")
         setOption(newHandle, "volume-max", "130")
 
@@ -957,10 +1118,9 @@ final class MPVPlayer {
         // ffmpeg stops the instant it finds stream info. The large windows
         // only matter for pathological feeds that delay stream headers.
         setOption(newHandle, "demuxer-lavf-probe-info", "auto")
-        // +genpts regenerates PTS timestamps for streams with broken/missing
-        // timing, which are common in IPTV. +igndts ignores unreliable DTS,
-        // reducing processing overhead. Together they improve both startup
-        // speed (~13%) and smoothness (eliminates timestamp-related drops).
+        // genpts fills missing PTS and igndts discards DTS when PTS exists.
+        // Neither repairs a provider clock reset interpreted as a 33-bit TS
+        // wrap; the archive-only DEBUG experiment handles that separately.
         // http_persistent reuses TCP connections across segments instead of
         // creating a new one for each HLS segment fetch. http_multiple allows
         // parallel downloads, speeding up the initial segment burst.
@@ -970,9 +1130,11 @@ final class MPVPlayer {
         // extension_picky=0: ffmpeg 8 refuses HLS segments whose filename
         // extension isn't a known media extension; IPTV providers routinely
         // serve segments with arbitrary names.
-        setOption(newHandle, "demuxer-lavf-o", "fflags=+discardcorrupt+genpts+igndts,http_persistent=1,http_multiple=1,seg_max_retry=2,extension_picky=0")
-        setOption(newHandle, "demuxer-lavf-probesize", "\(Tuning.demuxerLavfProbeSize)")
-        setOption(newHandle, "demuxer-lavf-analyzeduration", "\(Tuning.demuxerLavfAnalyzeDuration)")
+        let timestamps = ArchiveTimestampRecovery.options(forArchiveLoad: false)
+        setOption(newHandle, "demuxer-lavf-o", timestamps.lavf)
+        setOption(newHandle, "demuxer-lavf-linearize-timestamps", timestamps.linearize)
+        setOption(newHandle, "demuxer-lavf-probesize", "\(MPVLoadProbeOptions.baseline.probeSize)")
+        setOption(newHandle, "demuxer-lavf-analyzeduration", "\(MPVLoadProbeOptions.baseline.analyzeDurationSeconds)")
         setOption(newHandle, "demuxer-lavf-buffersize", "\(Tuning.demuxerLavfBufferSize)")
 
         // Network timeouts. 5 s is enough for any healthy CDN; the app's
@@ -1001,12 +1163,16 @@ final class MPVPlayer {
         mpv_observe_property(newHandle, PropID.videoCodec.rawValue, "video-codec", MPV_FORMAT_STRING)
         mpv_observe_property(newHandle, PropID.audioCodec.rawValue, "audio-codec", MPV_FORMAT_STRING)
         mpv_observe_property(newHandle, PropID.audioChannels.rawValue, "audio-params/channel-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, PropID.audioSampleRate.rawValue, "audio-params/samplerate", MPV_FORMAT_INT64)
         mpv_observe_property(newHandle, PropID.hwdec.rawValue, "hwdec-current", MPV_FORMAT_STRING)
         mpv_observe_property(newHandle, PropID.pausedForCache.rawValue, "paused-for-cache", MPV_FORMAT_FLAG)
         mpv_observe_property(newHandle, PropID.cacheSeconds.rawValue, "demuxer-cache-duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(newHandle, PropID.volume.rawValue, "volume", MPV_FORMAT_DOUBLE)
         mpv_observe_property(newHandle, PropID.mute.rawValue, "mute", MPV_FORMAT_FLAG)
         mpv_observe_property(newHandle, PropID.timePos.rawValue, "time-pos", MPV_FORMAT_DOUBLE)
+        // Some library versions expose an independent video clock. Unsupported
+        // video-pts remains unavailable, never an alias of time-pos.
+        mpv_observe_property(newHandle, PropID.videoPTS.rawValue, "video-pts", MPV_FORMAT_DOUBLE)
         mpv_observe_property(newHandle, PropID.duration.rawValue, "duration", MPV_FORMAT_DOUBLE)
         mpv_observe_property(newHandle, PropID.seekable.rawValue, "seekable", MPV_FORMAT_FLAG)
         mpv_observe_property(newHandle, PropID.videoBitrate.rawValue, "video-bitrate", MPV_FORMAT_INT64)
@@ -1015,6 +1181,9 @@ final class MPVPlayer {
         mpv_observe_property(newHandle, PropID.decoderFrameDrops.rawValue, "decoder-frame-drop-count", MPV_FORMAT_INT64)
         mpv_observe_property(newHandle, PropID.delayedFrames.rawValue, "vo-delayed-frame-count", MPV_FORMAT_INT64)
         mpv_observe_property(newHandle, PropID.mistimedFrames.rawValue, "mistimed-frame-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, PropID.audioOutput.rawValue, "current-ao", MPV_FORMAT_STRING)
+        mpv_observe_property(newHandle, PropID.avSync.rawValue, "avsync", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, PropID.demuxerStartTime.rawValue, "demuxer-start-time", MPV_FORMAT_DOUBLE)
         startEventPump(handle: newHandle)
         startCacheFloorTimer()
 
@@ -1042,6 +1211,8 @@ final class MPVPlayer {
         activeCachePauseResumeSeconds = Tuning.cachePauseResumeSeconds(for: newValue)
         refreshPlaybackTuningStats()
         guard let handle else { return }
+        setRuntimeProperty(handle, "demuxer-max-bytes", Tuning.demuxerMaxBytes(for: newValue, focused: focusedScaling))
+        setRuntimeProperty(handle, "demuxer-max-back-bytes", Tuning.demuxerMaxBackBytes(for: newValue, focused: focusedScaling))
         setRuntimeDouble(handle, "cache-secs", Tuning.cacheCapacitySeconds(for: newValue))
         setRuntimeDouble(handle, "demuxer-readahead-secs", Tuning.demuxerReadAheadSeconds(for: newValue))
         setRuntimeDouble(handle, "demuxer-hysteresis-secs", Tuning.demuxerHysteresisSeconds(for: newValue))
@@ -1049,7 +1220,10 @@ final class MPVPlayer {
     }
 
     private func destroy() {
-        videoDisabledForBackground = false
+        redirectResolutionTask?.cancel()
+        redirectResolutionTask = nil
+        playbackControl.stop()
+        playbackControl.backgroundSuspended = false
         releaseDisplayPowerAssertion()
         if let observer = defaultsObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -1059,6 +1233,7 @@ final class MPVPlayer {
         statePollTimer = nil
         eventSource?.cancel()
         eventSource = nil
+        if let handle { mpv_set_wakeup_callback(handle, nil, nil) }
         if wakeupPipe[0] >= 0 { close(wakeupPipe[0]); wakeupPipe[0] = -1 }
         if wakeupPipe[1] >= 0 { close(wakeupPipe[1]); wakeupPipe[1] = -1 }
 
@@ -1123,6 +1298,7 @@ final class MPVPlayer {
     }
 
     private func drainEvents() {
+        defer { completeBackendTeardownIfIdle() }
         guard let handle else { return }
         var pending = PendingChanges()
         while true {
@@ -1138,28 +1314,74 @@ final class MPVPlayer {
             case MPV_EVENT_SHUTDOWN:
                 applyPendingChanges(pending)
                 return
-            case MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_GET_PROPERTY_REPLY:
-                if let prop = evt.data?.assumingMemoryBound(to: mpv_event_property.self).pointee {
+            case MPV_EVENT_PROPERTY_CHANGE:
+                if let property = PropID(rawValue: evt.reply_userdata),
+                   property.isHandleProperty || itemLifecycle.activeIdentity != nil,
+                   let prop = evt.data?.assumingMemoryBound(to: mpv_event_property.self).pointee {
                     collectProperty(id: evt.reply_userdata, prop: prop, into: &pending)
                 }
+            case MPV_EVENT_GET_PROPERTY_REPLY:
+                if let request = propertyRequests.removeValue(forKey: evt.reply_userdata),
+                   playbackControl.acceptsLoad(request.generation),
+                   request.property.isHandleProperty || itemLifecycle.acceptsProperty(for: request.item),
+                   let prop = evt.data?.assumingMemoryBound(to: mpv_event_property.self).pointee {
+                    collectProperty(id: request.property.rawValue, prop: prop, into: &pending)
+                }
+            case MPV_EVENT_COMMAND_REPLY:
+                if let completion = itemLifecycle.complete(
+                    requestID: evt.reply_userdata,
+                    playlistEntryID: Self.playlistEntryID(from: evt)
+                ) {
+                    pending = PendingChanges()
+                    if let loaded = completion.loaded { handleFileLoaded(identity: loaded) }
+                    if let ended = completion.ended { handleCurrentItemEnded(ended) }
+                    if evt.error < 0, completion.request.generation == loadGeneration,
+                       case .load = completion.request.command {
+                        handleCurrentItemEnded(.init(
+                            identity: .init(generation: loadGeneration, playlistEntryID: -1),
+                            reason: .error(code: evt.error, message: String(cString: mpv_error_string(evt.error)))
+                        ))
+                    }
+                    if let next = completion.next { submitItemCommand(next) }
+                }
+            case MPV_EVENT_SET_PROPERTY_REPLY:
+                if evt.error < 0, (evt.reply_userdata & (1 << 63)) != 0 {
+                    AppLog.playback.error("mpv pause write failed code=\(evt.error, privacy: .public)")
+                }
+                if startupTargetEnabled, startupHoldActive,
+                   let write = playbackControl.inFlightPauseWrite, write.id == evt.reply_userdata {
+                    if evt.error >= 0, write.paused {
+                        startupPauseConfirmedGeneration = loadGeneration
+                    } else if evt.error < 0 {
+                        startupPauseConfirmedGeneration = nil
+                        pendingStartupLoad = nil
+                        startupTargetTimedOut = true
+                        setState(\.isLoading, false)
+                        errorMessage = "The startup pause could not be applied safely."
+                    }
+                }
+                if let write = playbackControl.completePauseWrite(id: evt.reply_userdata) {
+                    submitPauseWrite(write)
+                }
+                startTargetLoadIfPauseConfirmed()
             case MPV_EVENT_START_FILE:
-                errorMessage = nil
-                AppLog.playback.debug("mpv start-file")
+                pending = PendingChanges()
+                if let start = evt.data?.assumingMemoryBound(to: mpv_event_start_file.self).pointee {
+                    itemLifecycle.started(playlistEntryID: start.playlist_entry_id)
+                    if let identity = itemLifecycle.activeIdentity {
+                        noteStartupPhase(.startFile, generation: identity.generation)
+                    }
+                    if itemLifecycle.activeIdentity != nil { errorMessage = nil }
+                    AppLog.playback.debug("mpv start-file entry=\(start.playlist_entry_id, privacy: .public)")
+                }
             case MPV_EVENT_FILE_LOADED:
-                errorMessage = nil
-                fileLoadedGeneration = loadGeneration
-                setState(\.isLoading, false)
-                let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
-                AppLog.playback.info("mpv file-loaded generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
-                onFileLoaded?()
-                // Async reads: replies land as GET_PROPERTY_REPLY below and
-                // merge into the property pipeline. A synchronous
-                // mpv_get_property here can block behind mpv's dispatch lock
-                // while the decoder is still configuring the new file.
-                requestProperty(.pause, "pause", MPV_FORMAT_FLAG)
-                requestProperty(.fps, "container-fps", MPV_FORMAT_DOUBLE)
-                requestProperty(.estimatedFps, "estimated-vf-fps", MPV_FORMAT_DOUBLE)
+                if let loaded = itemLifecycle.loaded() {
+                    applyPendingChanges(pending)
+                    handleFileLoaded(identity: loaded)
+                }
+                pending = PendingChanges()
             case MPV_EVENT_END_FILE:
+                pending = PendingChanges()
                 if let end = evt.data?.assumingMemoryBound(to: mpv_event_end_file.self).pointee {
                     handleEndFileEvent(end)
                 }
@@ -1174,11 +1396,55 @@ final class MPVPlayer {
         }
     }
 
+    private func handleFileLoaded(identity: MPVItemLifecycle.Identity) {
+        guard playbackControl.acceptsLoad(identity.generation),
+              itemLifecycle.loadedIdentity == identity, lastFileLoadedIdentity != identity else { return }
+        errorMessage = nil
+        lastFileLoadedIdentity = identity
+        fileLoadedGeneration = identity.generation
+        noteStartupPhase(.fileLoaded, generation: identity.generation)
+        applyPlaybackPauseState()
+        if !startupHoldActive { setState(\.isLoading, false) }
+        startupTargetHold?.fileLoaded(generation: identity.generation, at: ProcessInfo.processInfo.systemUptime)
+        let elapsedMs = loadElapsedMilliseconds().map { Int($0.rounded()) } ?? -1
+        if elapsedMs >= 0 { PerfMetrics.shared.record("playback.loadToFileLoadedMs", Double(elapsedMs)) }
+        AppLog.playback.info("mpv file-loaded generation=\(identity.generation, privacy: .public) entry=\(identity.playlistEntryID, privacy: .public) elapsedMs=\(elapsedMs, privacy: .public)")
+        onFileLoaded?()
+        // Seed properties which may have changed before the command reply
+        // bound this entry. Reads are asynchronous and retain entry identity.
+        requestProperty(.pause, "pause", MPV_FORMAT_FLAG)
+        requestProperty(.width, "width", MPV_FORMAT_INT64)
+        requestProperty(.height, "height", MPV_FORMAT_INT64)
+        requestProperty(.fps, "container-fps", MPV_FORMAT_DOUBLE)
+        requestProperty(.estimatedFps, "estimated-vf-fps", MPV_FORMAT_DOUBLE)
+        requestProperty(.videoCodec, "video-codec", MPV_FORMAT_STRING)
+        requestProperty(.audioCodec, "audio-codec", MPV_FORMAT_STRING)
+        requestProperty(.audioChannels, "audio-params/channel-count", MPV_FORMAT_INT64)
+        requestProperty(.audioSampleRate, "audio-params/samplerate", MPV_FORMAT_INT64)
+        requestProperty(.hwdec, "hwdec-current", MPV_FORMAT_STRING)
+        requestProperty(.cacheSeconds, "demuxer-cache-duration", MPV_FORMAT_DOUBLE)
+        requestProperty(.pausedForCache, "paused-for-cache", MPV_FORMAT_FLAG)
+        requestProperty(.timePos, "time-pos", MPV_FORMAT_DOUBLE)
+        requestProperty(.videoPTS, "video-pts", MPV_FORMAT_DOUBLE)
+        requestProperty(.duration, "duration", MPV_FORMAT_DOUBLE)
+        requestProperty(.seekable, "seekable", MPV_FORMAT_FLAG)
+        requestProperty(.audioOutput, "current-ao", MPV_FORMAT_STRING)
+        requestProperty(.avSync, "avsync", MPV_FORMAT_DOUBLE)
+        requestProperty(.demuxerStartTime, "demuxer-start-time", MPV_FORMAT_DOUBLE)
+        requestProperty(.cachePauseInitial, "options/cache-pause-initial", MPV_FORMAT_FLAG)
+        requestProperty(.cachePauseWait, "options/cache-pause-wait", MPV_FORMAT_DOUBLE)
+        requestProperty(.lavfAnalyzeDuration, "options/demuxer-lavf-analyzeduration", MPV_FORMAT_DOUBLE)
+        requestProperty(.lavfProbeSize, "options/demuxer-lavf-probesize", MPV_FORMAT_INT64)
+        requestProperty(.lavfProbeInfo, "options/demuxer-lavf-probe-info", MPV_FORMAT_STRING)
+    }
+
     private func handleEndFileEvent(_ event: mpv_event_end_file) {
-        setState(\.isPlaying, false)
-        updateBufferingState(false, source: "end-file")
-        setState(\.isLoading, false)
-        updateDisplayPowerAssertion()
+        if event.reason == MPV_END_FILE_REASON_REDIRECT, event.playlist_insert_num_entries > 0 {
+            itemLifecycle.redirected(playlistEntryID: event.playlist_entry_id,
+                                     first: event.playlist_insert_id,
+                                     count: Int(event.playlist_insert_num_entries))
+            return
+        }
 
         let endReason: MPVEndReason
         switch event.reason {
@@ -1204,8 +1470,19 @@ final class MPVPlayer {
         default:
             endReason = .stopped
         }
+        guard let ended = itemLifecycle.ended(playlistEntryID: event.playlist_entry_id, reason: endReason) else { return }
+        handleCurrentItemEnded(ended)
+    }
+
+    private func handleCurrentItemEnded(_ ended: MPVItemLifecycle.End) {
+        guard playbackControl.acceptsLoad(ended.identity.generation) else { return }
+        let endReason = ended.reason
+        setState(\.isPlaying, false)
+        updateBufferingState(false, source: "end-file")
+        setState(\.isLoading, false)
+        updateDisplayPowerAssertion()
         lastHTTPStatusCode = 0
-        AppLog.playback.info("mpv end-file reason=\(String(describing: endReason), privacy: .public)")
+        AppLog.playback.info("mpv end-file generation=\(ended.identity.generation, privacy: .public) entry=\(ended.identity.playlistEntryID, privacy: .public) reason=\(String(describing: endReason), privacy: .public)")
 
         // If an owner has installed a recovery handler, let it decide what
         // the user sees — it may be about to silently reconnect, in which
@@ -1231,14 +1508,15 @@ final class MPVPlayer {
         let message = Self.sanitizedMPVLogMessage(rawMessage)
         // Track the last HTTP status code so handleEndFileEvent can
         // distinguish 509 from transient errors.
-        if let code = Self.extractHTTPStatusCode(message) {
+        let currentItem = itemLifecycle.activeIdentity != nil
+        if currentItem, let code = Self.extractHTTPStatusCode(message) {
             lastHTTPStatusCode = code
         }
 
         guard !message.isEmpty else { return }
 
         let category = Self.streamQualityCategory(for: message)
-        switch category {
+        switch currentItem ? category : "obsolete-item" {
         case "network", "hls", "transport":
             telemetryNetworkWarns += 1
         case "decode":
@@ -1263,7 +1541,7 @@ final class MPVPlayer {
         mpvLogSuppression[key] = MPVLogSuppression(lastEmittedAt: now, suppressedCount: 0)
         AppLog.playback.warning("mpv category=\(category, privacy: .public) \(message, privacy: .public)")
 
-        if let issue = Self.streamIssue(for: message) {
+        if currentItem, let issue = Self.streamIssue(for: message) {
             onStreamIssue?(issue)
         }
     }
@@ -1377,6 +1655,48 @@ final class MPVPlayer {
         lastHTTPStatusCode = 0
     }
 
+    private func resetLoadTelemetry() {
+        preciseCacheSample.reset()
+        rawTimeSample.reset()
+        videoPTSSample.reset()
+        startupPhases.reset(generation: loadGeneration, enabled: false)
+        telemetryLavfAnalyzeDurationSeconds = nil
+        telemetryLavfProbeSize = nil
+        telemetryLavfProbeInfo = nil
+        telemetryCachePauseInitial = nil
+        telemetryCachePauseWaitSeconds = nil
+        startupTargetHold = nil
+        pendingStartupLoad = nil
+        startupPauseConfirmedGeneration = nil
+        startupHoldReleasedAtMs = nil
+        startupHoldReleaseCacheSeconds = nil
+        startupTargetTimedOut = false
+        firstFrameElapsedMs = nil
+        cacheFloorPauseCount = 0
+        telemetryAudioOutput = nil
+        telemetryDemuxerStartTime = nil
+        telemetryAVSyncSeconds = nil
+        telemetryPause = nil
+        telemetryPausedForCache = nil
+        telemetryRenderedFrameCount = 0
+        telemetryLastRenderElapsedMs = nil
+        lastRenderedAt = nil
+        lastTelemetryFrameDrops = 0
+        lastTelemetryDecoderDrops = 0
+        lastTelemetryMistimed = 0
+        telemetryNetworkWarns = 0
+        telemetryDecodeWarns = 0
+        lastDrawableWidth = 0
+        lastDrawableHeight = 0
+        bufferingEventCount = 0
+        bufferingTotalMilliseconds = 0
+        bufferingStartedAt = nil
+        propertyRequests.removeAll()
+        var stats = MPVPlaybackStats()
+        stats.configuredBufferSeconds = bufferSeconds
+        playbackStats = stats
+    }
+
     private func startCacheFloorTimer() {
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1), leeway: .milliseconds(250))
@@ -1395,7 +1715,9 @@ final class MPVPlayer {
         // The property observer path updates `cacheSeconds` and calls
         // maintainLiveCacheFloor with the fresh value; this timer only provides
         // a cheap safety pass over the last observed cache value.
-        maintainLiveCacheFloor(cacheSeconds: cacheSeconds)
+        evaluateStartupTarget()
+        guard let seconds = telemetryExactCacheSeconds else { return }
+        maintainLiveCacheFloor(cacheSeconds: seconds)
     }
     private enum PropID: UInt64 {
         case pause = 1
@@ -1406,12 +1728,14 @@ final class MPVPlayer {
         case videoCodec
         case audioCodec
         case audioChannels
+        case audioSampleRate
         case hwdec
         case pausedForCache
         case cacheSeconds
         case volume
         case mute
         case timePos
+        case videoPTS
         case duration
         case seekable
         case videoBitrate
@@ -1420,10 +1744,27 @@ final class MPVPlayer {
         case decoderFrameDrops
         case delayedFrames
         case mistimedFrames
+        case audioOutput
+        case avSync
+        case demuxerStartTime
+        case cachePauseInitial
+        case cachePauseWait
+        case lavfAnalyzeDuration
+        case lavfProbeSize
+        case lavfProbeInfo
+
+        var isHandleProperty: Bool {
+            switch self {
+            case .pause, .volume, .mute: true
+            default: false
+            }
+        }
     }
 
     private struct PendingChanges {
         var isPlaying: Bool?
+        var paused: Bool?
+        var pausedForCache: Bool?
         var width: Int?
         var height: Int?
         var containerFps: Double?
@@ -1431,8 +1772,9 @@ final class MPVPlayer {
         var videoCodec: String?
         var audioCodec: String?
         var audioChannels: Int?
+        var audioSampleRate: Int?
         var hwdec: String?
-        var cacheSeconds: Double?
+        var cacheSeconds: Double??
         var isBuffering: Bool?
         var volume: Double?
         var isMuted: Bool?
@@ -1445,9 +1787,19 @@ final class MPVPlayer {
         var decoderFrameDrops: Int64?
         var delayedFrames: Int64?
         var mistimedFrames: Int64?
+        var audioOutput: String??
+        var avSync: Double??
+        var demuxerStartTime: Double??
+        var cachePauseInitial: Bool??
+        var cachePauseWaitSeconds: Double??
+        var lavfAnalyzeDurationSeconds: Double??
+        var lavfProbeSize: Int64??
+        var lavfProbeInfo: String??
 
         var hasChanges: Bool {
             isPlaying != nil ||
+            paused != nil ||
+            pausedForCache != nil ||
             width != nil ||
             height != nil ||
             containerFps != nil ||
@@ -1455,6 +1807,7 @@ final class MPVPlayer {
             videoCodec != nil ||
             audioCodec != nil ||
             audioChannels != nil ||
+            audioSampleRate != nil ||
             hwdec != nil ||
             cacheSeconds != nil ||
             isBuffering != nil ||
@@ -1468,7 +1821,13 @@ final class MPVPlayer {
             frameDrops != nil ||
             decoderFrameDrops != nil ||
             delayedFrames != nil ||
-            mistimedFrames != nil
+            mistimedFrames != nil ||
+            audioOutput != nil ||
+            avSync != nil ||
+            demuxerStartTime != nil ||
+            cachePauseInitial != nil ||
+            cachePauseWaitSeconds != nil ||
+            lavfAnalyzeDurationSeconds != nil || lavfProbeSize != nil || lavfProbeInfo != nil
         }
     }
 
@@ -1477,7 +1836,9 @@ final class MPVPlayer {
         switch kind {
         case .pause:
             if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
-                pending.isPlaying = data.assumingMemoryBound(to: Int32.self).pointee == 0
+                let paused = data.assumingMemoryBound(to: Int32.self).pointee != 0
+                pending.paused = paused
+                pending.isPlaying = !paused
             }
         case .width:
             pending.width = readInt(prop)
@@ -1501,16 +1862,18 @@ final class MPVPlayer {
             pending.audioCodec = readString(prop)
         case .audioChannels:
             pending.audioChannels = readInt(prop)
+        case .audioSampleRate:
+            pending.audioSampleRate = max(0, readInt(prop))
         case .hwdec:
             pending.hwdec = readString(prop)
         case .pausedForCache:
             if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
-                pending.isBuffering = data.assumingMemoryBound(to: Int32.self).pointee != 0
+                let paused = data.assumingMemoryBound(to: Int32.self).pointee != 0
+                pending.pausedForCache = paused
+                pending.isBuffering = paused
             }
         case .cacheSeconds:
-            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
-                pending.cacheSeconds = data.assumingMemoryBound(to: Double.self).pointee
-            }
+            pending.cacheSeconds = .some(readFiniteDouble(prop))
         case .volume:
             if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
                 pending.volume = data.assumingMemoryBound(to: Double.self).pointee
@@ -1520,9 +1883,12 @@ final class MPVPlayer {
                 pending.isMuted = data.assumingMemoryBound(to: Int32.self).pointee != 0
             }
         case .timePos:
-            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
-                pending.timePos = data.assumingMemoryBound(to: Double.self).pointee
-            }
+            let value = readFiniteDouble(prop)
+            rawTimeSample.observe(value, generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)
+            pending.timePos = value
+        case .videoPTS:
+            videoPTSSample.observe(readFiniteDouble(prop), generation: loadGeneration,
+                                   at: ProcessInfo.processInfo.systemUptime)
         case .duration:
             if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
                 pending.duration = data.assumingMemoryBound(to: Double.self).pointee
@@ -1543,6 +1909,27 @@ final class MPVPlayer {
             pending.delayedFrames = readInt64(prop)
         case .mistimedFrames:
             pending.mistimedFrames = readInt64(prop)
+        case .audioOutput:
+            let value = readString(prop)
+            pending.audioOutput = .some(value.isEmpty ? nil : value)
+        case .avSync:
+            pending.avSync = .some(readFiniteDouble(prop))
+        case .demuxerStartTime:
+            pending.demuxerStartTime = .some(readFiniteDouble(prop))
+        case .cachePauseInitial:
+            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
+                pending.cachePauseInitial = .some(data.assumingMemoryBound(to: Int32.self).pointee != 0)
+            } else { pending.cachePauseInitial = .some(nil) }
+        case .cachePauseWait:
+            pending.cachePauseWaitSeconds = .some(readFiniteDouble(prop).flatMap { $0 >= 0 ? $0 : nil })
+        case .lavfAnalyzeDuration:
+            pending.lavfAnalyzeDurationSeconds = .some(readFiniteDouble(prop).flatMap { $0 >= 0 ? $0 : nil })
+        case .lavfProbeSize:
+            let value = readInt64(prop)
+            pending.lavfProbeSize = .some(prop.format == MPV_FORMAT_INT64 && prop.data != nil && value > 0 ? value : nil)
+        case .lavfProbeInfo:
+            let value = readString(prop)
+            pending.lavfProbeInfo = .some(["auto", "yes", "no", "nostreams"].contains(value) ? value : nil)
         }
     }
 
@@ -1553,6 +1940,16 @@ final class MPVPlayer {
         if let isPlaying = pending.isPlaying {
             setState(\.isPlaying, isPlaying)
         }
+        if let paused = pending.paused { telemetryPause = paused }
+        if let pausedForCache = pending.pausedForCache { telemetryPausedForCache = pausedForCache }
+        if let audioOutput = pending.audioOutput { telemetryAudioOutput = audioOutput }
+        if let avSync = pending.avSync { telemetryAVSyncSeconds = avSync }
+        if let demuxerStartTime = pending.demuxerStartTime { telemetryDemuxerStartTime = demuxerStartTime }
+        if let initial = pending.cachePauseInitial { telemetryCachePauseInitial = initial }
+        if let seconds = pending.cachePauseWaitSeconds { telemetryCachePauseWaitSeconds = seconds }
+        if let seconds = pending.lavfAnalyzeDurationSeconds { telemetryLavfAnalyzeDurationSeconds = seconds }
+        if let bytes = pending.lavfProbeSize { telemetryLavfProbeSize = bytes }
+        if let mode = pending.lavfProbeInfo { telemetryLavfProbeInfo = mode }
 
         var nextMediaInfo = mediaInfo
         if let width = pending.width {
@@ -1570,6 +1967,7 @@ final class MPVPlayer {
         if let audioChannels = pending.audioChannels {
             nextMediaInfo.audioChannels = audioChannels
         }
+        if let audioSampleRate = pending.audioSampleRate { nextMediaInfo.audioSampleRate = audioSampleRate }
         if let hwdec = pending.hwdec {
             nextMediaInfo.hwdec = hwdec
         }
@@ -1607,11 +2005,14 @@ final class MPVPlayer {
             onMediaInfoChanged?(nextMediaInfo)
         }
 
-        if let cacheSeconds = pending.cacheSeconds {
-            setApproxState(\.cacheSeconds, cacheSeconds, epsilon: Tuning.cacheEpsilon)
+        if let observation = pending.cacheSeconds {
+            preciseCacheSample.observe(observation, generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)
+            if let seconds = telemetryExactCacheSeconds {
+                setApproxState(\.cacheSeconds, seconds, epsilon: Tuning.cacheEpsilon)
+            }
         }
-        if let isBuffering = pending.isBuffering {
-            updateBufferingState(isBuffering, source: "mpv")
+        if pending.isBuffering != nil {
+            updateBufferingState(effectiveBufferingState, source: "mpv")
         }
         if let volume = pending.volume {
             setApproxState(\.volume, volume, epsilon: Tuning.stateEpsilon)
@@ -1621,7 +2022,7 @@ final class MPVPlayer {
         }
         if let timePos = pending.timePos {
             setApproxState(\.timePos, timePos, epsilon: Tuning.timePosEpsilon)
-            if isLoading, timePos > 0 {
+            if isLoading, timePos > 0, !startupHoldActive {
                 setState(\.isLoading, false)
             }
         }
@@ -1661,8 +2062,9 @@ final class MPVPlayer {
             playbackStats = nextStats
         }
 
-        if let cacheSeconds = pending.cacheSeconds {
-            maintainLiveCacheFloor(cacheSeconds: cacheSeconds)
+        if pending.cacheSeconds != nil { evaluateStartupTarget() }
+        if pending.cacheSeconds != nil, let seconds = telemetryExactCacheSeconds {
+            maintainLiveCacheFloor(cacheSeconds: seconds)
         }
         updateDisplayPowerAssertion()
     }
@@ -1675,6 +2077,7 @@ final class MPVPlayer {
         if buffering {
             bufferingStartedAt = now
             bufferingEventCount += 1
+            PerfMetrics.shared.increment("playback.bufferingStalls")
             AppLog.playback.warning("buffering begin generation=\(self.loadGeneration, privacy: .public) source=\(source, privacy: .public) event=\(self.bufferingEventCount, privacy: .public) cache=\(self.cacheSeconds, privacy: .public) time=\(self.timePos, privacy: .public) loading=\(self.isLoading, privacy: .public)")
             return
         }
@@ -1683,20 +2086,25 @@ final class MPVPlayer {
         let elapsedMilliseconds = AppLog.elapsedMilliseconds(since: bufferingStartedAt, now: now)
         self.bufferingStartedAt = nil
         bufferingTotalMilliseconds += elapsedMilliseconds
+        PerfMetrics.shared.record("playback.bufferingStallMs", Double(elapsedMilliseconds))
         AppLog.playback.info("buffering end generation=\(self.loadGeneration, privacy: .public) source=\(source, privacy: .public) durationMs=\(elapsedMilliseconds, privacy: .public) totalMs=\(self.bufferingTotalMilliseconds, privacy: .public) events=\(self.bufferingEventCount, privacy: .public) cache=\(self.cacheSeconds, privacy: .public) time=\(self.timePos, privacy: .public)")
     }
 
     private func maintainLiveCacheFloor(cacheSeconds: Double) {
         guard currentURL?.isFileURL == false,
+              !nativeCacheOnlyEnabled,
+              playbackRequested,
+              !playbackControl.systemSuspended,
+              !videoDisabledForBackground,
+              !startupHoldActive,
               !isLoading,
               timePos > 0.5,
-              cacheSeconds.isFinite else { return }
+              cacheSeconds.isFinite, cacheSeconds >= 0 else { return }
 
         if autoPausedForCacheFloor {
             guard cacheSeconds >= activeCachePauseResumeSeconds else { return }
             autoPausedForCacheFloor = false
-            setFlag("pause", false)
-            updateBufferingState(false, source: "cache-floor")
+            applyPlaybackPauseState()
             refreshPlaybackTuningStats(autoPausedForCacheFloor: false)
             updateDisplayPowerAssertion()
             AppLog.playback.info("cache floor resume cache=\(cacheSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
@@ -1705,17 +2113,20 @@ final class MPVPlayer {
 
         guard isPlaying, cacheSeconds < activeCachePauseFloorSeconds else { return }
         autoPausedForCacheFloor = true
-        setFlag("pause", true)
+        applyPlaybackPauseState()
         updateBufferingState(true, source: "cache-floor")
         refreshPlaybackTuningStats(autoPausedForCacheFloor: true)
         updateDisplayPowerAssertion()
-        AppLog.playback.warning("cache floor pause cache=\(cacheSeconds, privacy: .public) floor=\(self.activeCachePauseFloorSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public)")
+        cacheFloorPauseCount += 1
+        AppLog.playback.warning("cache floor pause cache=\(cacheSeconds, privacy: .public) floor=\(self.activeCachePauseFloorSeconds, privacy: .public) resume=\(self.activeCachePauseResumeSeconds, privacy: .public) count=\(self.cacheFloorPauseCount, privacy: .public)")
     }
 
     // MARK: - Display sleep prevention
 
     private var shouldHoldDisplayPowerAssertion: Bool {
         playbackRequested &&
+            !playbackControl.systemSuspended &&
+            !videoDisabledForBackground &&
             currentURL != nil &&
             (isPlaying || isLoading || isBuffering || autoPausedForCacheFloor)
     }
@@ -1794,6 +2205,12 @@ final class MPVPlayer {
         return data.assumingMemoryBound(to: Int64.self).pointee
     }
 
+    private func readFiniteDouble(_ prop: mpv_event_property) -> Double? {
+        guard prop.format == MPV_FORMAT_DOUBLE, let data = prop.data else { return nil }
+        let value = data.assumingMemoryBound(to: Double.self).pointee
+        return value.isFinite ? value : nil
+    }
+
     private func readString(_ prop: mpv_event_property) -> String {
         guard prop.format == MPV_FORMAT_STRING, let data = prop.data else { return "" }
         let pp = data.assumingMemoryBound(to: UnsafePointer<CChar>?.self).pointee
@@ -1815,11 +2232,78 @@ final class MPVPlayer {
     // block until the core processes the request — and during startup, seeks,
     // or decoder reconfiguration mpv can hold its dispatch lock for hundreds
     // of milliseconds, which beach-balls the main thread (see checkCacheFloor).
-    // Async requests from one client handle are executed in the order they
-    // were issued, so command/property sequencing is preserved. mpv copies
-    // request data before returning. Set/command replies are ignored (the
-    // sync return values were ignored too); get replies are folded into the
-    // normal property pipeline in drainEvents.
+    // mpv copies request data before returning, but its API does not guarantee
+    // async request order. Pause writes are serialized through completion
+    // replies and reconciled again on FILE_LOADED. Get replies carry a load
+    // generation so a replaced item's result cannot update the new load.
+
+    private func applyPlaybackPauseState() {
+        updateBufferingState(effectiveBufferingState, source: "pause-intent")
+        refreshPlaybackTuningStats()
+        if let write = playbackControl.reconcilePause() {
+            submitPauseWrite(write)
+        }
+    }
+
+    private var effectiveBufferingState: Bool {
+        playbackControl.indicatesBuffering(nativePausedForCache: telemetryPausedForCache ?? false,
+                                          startupWaiting: startupHoldActive && !startupTargetTimedOut)
+    }
+
+    private func startTargetLoadIfPauseConfirmed() {
+        guard startupTargetEnabled, startupHoldActive, !startupTargetTimedOut,
+              let pending = pendingStartupLoad, pending.generation == loadGeneration,
+              startupPauseConfirmedGeneration == loadGeneration,
+              playbackControl.pauseWritesAreSettled else { return }
+        pendingStartupLoad = nil
+        if let request = itemLifecycle.enqueue(.load(pending.path), generation: pending.generation) {
+            submitItemCommand(request)
+        }
+    }
+
+    private func evaluateStartupTarget() {
+        guard startupTargetEnabled, startupHoldActive, !startupTargetTimedOut,
+              !playbackControl.systemSuspended else { return }
+        switch startupTargetHold?.evaluate(cacheSeconds: telemetryExactCacheSeconds,
+                                           generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime) {
+        case .ready(let seconds):
+            startupHoldReleasedAtMs = loadElapsedMilliseconds().map { Int($0.rounded()) }
+            startupHoldReleaseCacheSeconds = seconds
+            playbackControl.startupSuspended = false
+            setState(\.isLoading, !hasRenderedCurrentLoad)
+            applyPlaybackPauseState()
+            AppLog.playback.info("startup target release generation=\(self.loadGeneration, privacy: .public) elapsedMs=\(self.startupHoldReleasedAtMs ?? -1, privacy: .public) cache=\(seconds, privacy: .public)")
+        case .timedOut:
+            startupTargetTimedOut = true
+            setState(\.isLoading, false)
+            errorMessage = "The reported startup cache did not reach the requested target within 12 seconds."
+            applyPlaybackPauseState()
+            AppLog.playback.warning("startup target timed out generation=\(self.loadGeneration, privacy: .public)")
+        case .waiting, nil:
+            break
+        }
+    }
+
+    private func submitPauseWrite(_ write: PlaybackControlState.PauseWrite) {
+        guard let handle else {
+            _ = playbackControl.completePauseWrite(id: write.id)
+            return
+        }
+        var flag: Int32 = write.paused ? 1 : 0
+        let result = mpv_set_property_async(handle, write.id, "pause", MPV_FORMAT_FLAG, &flag)
+        if result < 0 {
+            if startupTargetEnabled, startupHoldActive {
+                pendingStartupLoad = nil
+                startupTargetTimedOut = true
+                setState(\.isLoading, false)
+                errorMessage = "The startup pause could not be queued safely."
+            }
+            AppLog.playback.error("mpv pause enqueue failed code=\(result, privacy: .public)")
+            if let next = playbackControl.completePauseWrite(id: write.id) {
+                submitPauseWrite(next)
+            }
+        }
+    }
 
     private func setRuntimeProperty(_ handle: OpaquePointer, _ name: String, _ value: String) {
         _ = name.withCString { n in
@@ -1870,18 +2354,86 @@ final class MPVPlayer {
     /// collectProperty path as observed property changes.
     private func requestProperty(_ id: PropID, _ name: String, _ format: mpv_format) {
         guard let handle else { return }
-        _ = name.withCString { n in
-            mpv_get_property_async(handle, id.rawValue, n, format)
+        propertyRequestSerial &+= 1
+        let requestID = (1 << 62) | propertyRequestSerial
+        propertyRequests[requestID] = (loadGeneration, itemLifecycle.activeIdentity, id)
+        let result = name.withCString { n in
+            mpv_get_property_async(handle, requestID, n, format)
+        }
+        if result < 0 { propertyRequests[requestID] = nil }
+    }
+
+    /// Capture refreshes remain asynchronous, including during a cache pause.
+    /// Coalesce outstanding reads rather than queuing them while the core waits.
+    func refreshDiagnosticPlaybackClocks() {
+#if DEBUG
+        guard PlaybackValidation.isEnabled || SavedPlaybackScenario.isCapturing,
+              itemLifecycle.loadedIdentity?.generation == loadGeneration else { return }
+        for (id, name) in [(PropID.timePos, "time-pos"), (.videoPTS, "video-pts")] {
+            guard !propertyRequests.values.contains(where: { $0.generation == loadGeneration && $0.property == id }) else { continue }
+            requestProperty(id, name, MPV_FORMAT_DOUBLE)
+        }
+#endif
+    }
+
+    private static func playlistEntryID(from event: mpv_event) -> Int64? {
+        guard event.error >= 0,
+              let command = event.data?.assumingMemoryBound(to: mpv_event_command.self).pointee,
+              command.result.format == MPV_FORMAT_NODE_MAP,
+              let list = command.result.u.list?.pointee,
+              let keys = list.keys, let values = list.values else { return nil }
+        for index in 0..<Int(list.num) {
+            if let key = keys[index], String(cString: key) == "playlist_entry_id",
+               values[index].format == MPV_FORMAT_INT64 {
+                return values[index].u.int64
+            }
+        }
+        return nil
+    }
+
+    private func submitItemCommand(_ request: MPVItemLifecycle.Request) {
+        guard request.generation == loadGeneration, let handle else {
+            _ = itemLifecycle.complete(requestID: request.id, playlistEntryID: nil)
+            return
+        }
+        let args: [String]
+        switch request.command {
+        case .load(let path):
+            // Bind startup settings to this actual playlist entry. An async
+            // property write racing loadfile cannot prove which load used it.
+            // mpv 0.38+ puts per-file options after the insertion index.
+            var startup = "cache-pause-initial=\(usesStartupReserve ? "yes" : "no"),cache-pause-wait=\(Tuning.cachePauseWaitSeconds(for: bufferSeconds)),\(loadProbeOptions.perFileOptions)"
+            if startupTargetEnabled { startup += ",pause=yes" }
+            args = ["loadfile", path, "replace", "-1", startup]
+        case .stop: args = ["stop"]
+        }
+        let result = command(handle, args, replyID: request.id)
+        if result >= 0, case .load = request.command {
+            noteStartupPhase(.loadSubmitted, generation: request.generation)
+        }
+        if result < 0 {
+            let completion = itemLifecycle.complete(requestID: request.id, playlistEntryID: nil)
+            if case .load = request.command {
+                handleCurrentItemEnded(.init(identity: .init(generation: request.generation, playlistEntryID: -1),
+                                             reason: .error(code: result, message: String(cString: mpv_error_string(result)))))
+            }
+            if let next = completion?.next { submitItemCommand(next) }
         }
     }
 
-    private func command(_ handle: OpaquePointer, _ args: [String]) {
+    private func noteStartupPhase(_ phase: MPVStartupPhases.Phase, generation: Int) {
+        guard let elapsed = loadElapsedMilliseconds() else { return }
+        startupPhases.note(phase, generation: generation, elapsedMilliseconds: elapsed)
+    }
+
+    @discardableResult
+    private func command(_ handle: OpaquePointer, _ args: [String], replyID: UInt64 = 0) -> Int32 {
         let duped: [UnsafeMutablePointer<CChar>?] = args.map { strdup($0) }
         var cStrings: [UnsafePointer<CChar>?] = duped.map { UnsafePointer($0) }
         cStrings.append(nil)
         defer { duped.forEach { if let p = $0 { free(p) } } }
-        cStrings.withUnsafeMutableBufferPointer { buf in
-            _ = mpv_command_async(handle, 0, buf.baseAddress)
+        return cStrings.withUnsafeMutableBufferPointer { buf in
+            mpv_command_async(handle, replyID, buf.baseAddress)
         }
     }
 

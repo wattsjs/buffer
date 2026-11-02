@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 nonisolated enum StreamHealthEvent: String, Codable, Sendable {
     case http509
@@ -82,6 +83,7 @@ nonisolated struct StreamHealth: Codable, Hashable, Sendable {
 /// channel out-of-band (keyed by `Channel.id`) so the Channel cache schema
 /// doesn't need to bump every time we adjust probe fields.
 nonisolated struct StreamProbe: Codable, Hashable, Sendable {
+    enum MetadataProvenance: String, Codable, Sendable { case streamProbe, passivePlayback }
     enum Status: String, Codable, Sendable {
         case ok
         case offline       // probe failed to open (network/auth/404)
@@ -92,7 +94,7 @@ nonisolated struct StreamProbe: Codable, Hashable, Sendable {
 
     var status: Status
     var probedAt: Date
-    var probeSeconds: Double         // how long the probe took (rough latency signal)
+    var probeSeconds: Double         // duration of the probe operation, never broadcast delay
 
     var width: Int
     var height: Int
@@ -107,6 +109,25 @@ nonisolated struct StreamProbe: Codable, Hashable, Sendable {
     var hasAudio: Bool
     var errorMessage: String?
     var streamHealth: StreamHealth = StreamHealth()
+    var metadataProvenance: MetadataProvenance?
+    var metadataObservedAt: Date?
+    /// Legacy records have no revision binding. Their status cannot establish
+    /// whether a current physical endpoint is available or failed.
+    var endpointFingerprint: String? = nil
+    struct PassivePlaybackEvidence: Codable, Hashable, Sendable {
+        var windowStartedAt: Date
+        var lastObservedAt: Date
+        var healthySeconds: Double
+        var bufferingSeconds: Double
+        /// Missing on legacy records; only an ordinary live media owner may
+        /// assert this. Archive/VOD and diagnostic trials never train quality.
+        var ordinaryLive: Bool? = nil
+    }
+    var passivePlaybackEvidence: PassivePlaybackEvidence?
+
+    static func endpointFingerprint(for url: URL) -> String {
+        SHA256.hash(data: Data(url.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
 
     var resolutionLabel: String {
         guard width > 0, height > 0 else { return "" }
@@ -119,7 +140,7 @@ nonisolated struct StreamProbe: Codable, Hashable, Sendable {
     }
 
     var latencyLabel: String {
-        let reportedLatency = liveLatencySeconds ?? (probeSeconds > 0 ? probeSeconds : nil)
+        let reportedLatency = liveLatencySeconds
         guard let reportedLatency,
               reportedLatency > 0,
               reportedLatency.isFinite else {
@@ -158,9 +179,12 @@ nonisolated struct StreamProbe: Codable, Hashable, Sendable {
     /// often, so a week-long cache is fine — the user can force a refresh by
     /// playing the channel (playback updates the record from mpv).
     static let freshness: TimeInterval = 7 * 24 * 60 * 60
+    static let failureFreshness: TimeInterval = 15 * 60
 
     var isFresh: Bool {
-        Date().timeIntervalSince(probedAt) < Self.freshness
+        let age = Date().timeIntervalSince(probedAt)
+        let limit = status == .ok ? Self.freshness : Self.failureFreshness
+        return age >= 0 && age < limit
     }
 
     private static func shorthand(forHeight h: Int) -> String? {
@@ -194,6 +218,9 @@ extension StreamProbe {
         case hasAudio
         case errorMessage
         case streamHealth
+        case metadataProvenance, metadataObservedAt
+        case passivePlaybackEvidence
+        case endpointFingerprint
     }
 
     nonisolated init(from decoder: Decoder) throws {
@@ -214,6 +241,10 @@ extension StreamProbe {
         hasAudio = try c.decode(Bool.self, forKey: .hasAudio)
         errorMessage = try c.decodeIfPresent(String.self, forKey: .errorMessage)
         streamHealth = try c.decodeIfPresent(StreamHealth.self, forKey: .streamHealth) ?? StreamHealth()
+        metadataProvenance = try c.decodeIfPresent(MetadataProvenance.self, forKey: .metadataProvenance)
+        metadataObservedAt = try c.decodeIfPresent(Date.self, forKey: .metadataObservedAt)
+        passivePlaybackEvidence = try c.decodeIfPresent(PassivePlaybackEvidence.self, forKey: .passivePlaybackEvidence)
+        endpointFingerprint = try c.decodeIfPresent(String.self, forKey: .endpointFingerprint)
     }
 
     nonisolated func encode(to encoder: Encoder) throws {
@@ -234,6 +265,10 @@ extension StreamProbe {
         try c.encode(hasAudio, forKey: .hasAudio)
         try c.encodeIfPresent(errorMessage, forKey: .errorMessage)
         try c.encode(streamHealth, forKey: .streamHealth)
+        try c.encodeIfPresent(metadataProvenance, forKey: .metadataProvenance)
+        try c.encodeIfPresent(metadataObservedAt, forKey: .metadataObservedAt)
+        try c.encodeIfPresent(passivePlaybackEvidence, forKey: .passivePlaybackEvidence)
+        try c.encodeIfPresent(endpointFingerprint, forKey: .endpointFingerprint)
     }
 
     /// Map the C result struct into a Swift value. Strings are read up to the

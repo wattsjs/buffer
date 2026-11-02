@@ -64,6 +64,7 @@ struct PlayerView: View {
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(ExternalPlayer.selectedPlayerKey) private var selectedPlayer: ExternalPlayerKind = .none
+    @AppStorage("buffer_media_info_display") private var mediaInfoSetting: MediaInfoDisplay = .expanded
 
     // Exactly one of these two is populated, keyed by `mode`.
     @State private var channelSession: PlayerSession?
@@ -93,6 +94,7 @@ struct PlayerView: View {
     /// press or a seek back near the edge.
     @State private var liveLatched: Bool
     @State private var lastVODProgressSaveAt: Date?
+    @State private var externalRequestTask: Task<Void, Never>?
 
     // MARK: - Init
 
@@ -152,6 +154,7 @@ struct PlayerView: View {
     private var isMulti: Bool { session?.isMulti ?? false }
     private var supportsRewind: Bool {
         guard let s = session else { return false }
+        guard channel?.sourceOwnership?.logicalChannelID == nil else { return false }
         return !s.isMulti && (channel?.supportsRewind ?? false)
     }
 
@@ -333,9 +336,15 @@ struct PlayerView: View {
         }
         .preferredColorScheme(.dark)
         .environment(\.colorScheme, .dark)
+        .environment(\.epgActionModel, viewModel)
         .frame(minWidth: 640, minHeight: 360)
         .onAppear { handleOnAppear() }
         .onDisappear { handleOnDisappear() }
+        .onChange(of: mediaInfoSetting) { _, display in
+            if chromeState.mediaInfoDisplay != display {
+                chromeState.mediaInfoDisplay = display
+            }
+        }
         .onChange(of: session?.externalRequest) { _, request in
             guard let request, let s = session else { return }
             s.externalRequest = nil
@@ -361,6 +370,10 @@ struct PlayerView: View {
     private func handleOnAppear() {
         if let s = session {
             s.focusedSlot.onCatchupClipEnded = { handleCatchupClipEnded() }
+            // Publish playback ownership before loading. Metadata probes can
+            // then defer their extra provider connection while video is open.
+            PlayerSessionRegistry.shared.setActive(s)
+            viewModel?.configureSmartRecovery(for: s.focusedSlot)
             switch initialIntent {
             case .live:
                 s.start()
@@ -374,12 +387,11 @@ struct PlayerView: View {
                 // archive load — otherwise mpv briefly opens the live URL,
                 // tears it down, then opens the catchup URL.
                 let willCatchup = supportsRewind
-                s.start(skipInitialLoad: willCatchup)
+                s.start(skipInitialLoad: true)
                 if willCatchup {
                     startCatchup(at: start)
                 }
             }
-            PlayerSessionRegistry.shared.setActive(s)
         }
         if let p = playback {
             Task { @MainActor in
@@ -393,6 +405,7 @@ struct PlayerView: View {
     }
 
     private func handleOnDisappear() {
+        externalRequestTask?.cancel()
         saveVODProgressIfNeeded(force: true)
         liveReconciliationTask?.cancel()
         liveReconciliationTask = nil
@@ -448,6 +461,10 @@ struct PlayerView: View {
     @ViewBuilder
     private var channelAndProgramCard: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if let message = session?.focusedSlot.sourceChangeMessage {
+                Label(message, systemImage: "arrow.triangle.swap")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             if let channel {
                 HStack(spacing: 12) {
                     if let logo = channel.logoURL {
@@ -689,13 +706,15 @@ struct PlayerView: View {
         let manager = RecordingManager.shared
         if manager.isLiveRecording(forChannel: c.streamURL) {
             if let entry = manager.recordings.first(where: { rec in
-                rec.status == .recording && rec.channelID == c.id && rec.source == .live
+                rec.status == .recording && rec.source == .live &&
+                    ((c.sourceChannelIdentity != nil && rec.sourceOwnership?.channelIdentity == c.sourceChannelIdentity) ||
+                     (rec.sourceOwnership == nil && rec.channelID == c.id && rec.streamURL == c.streamURL))
             }) {
                 manager.stopLiveRecording(id: entry.id)
             }
             return
         }
-        guard let playlistID = vm.activePlaylistID else { return }
+        guard let playlistID = c.sourceChannelIdentity?.sourceID ?? vm.activePlaylistID else { return }
         let capturedChannel = c
         let capturedProgram = displayedProgram
         Task { @MainActor in
@@ -704,6 +723,7 @@ struct PlayerView: View {
                 channel: capturedChannel,
                 program: capturedProgram
             )
+            if let error = manager.capacityErrorMessage { vm.showSmartActionUnavailable(error) }
         }
     }
 
@@ -1670,15 +1690,17 @@ struct PlayerView: View {
     /// Begin archive playback at `start`, anchoring the transport timeline
     /// to the EPG program airing at that moment (or an ad-hoc 2 h window
     /// when no guide data matches).
-    private func startCatchup(at start: Date) {
-        guard let slot = session?.focusedSlot else { return }
+    private func startCatchup(at start: Date, resetFailureCount: Bool = true) {
+        guard supportsRewind, let slot = session?.focusedSlot else { return }
+        if resetFailureCount { consecutiveInstantCatchupEOFs = 0 }
         let timeline = catchupTimeline(containing: start)
         slot.playCatchup(from: start, timeline: timeline.interval, programID: timeline.programID)
         liveLatched = false
     }
 
     private func playArchive(program: EPGProgram) {
-        guard let slot = session?.focusedSlot else { return }
+        guard supportsRewind, let slot = session?.focusedSlot else { return }
+        consecutiveInstantCatchupEOFs = 0
         slot.playCatchup(
             from: program.start,
             timeline: DateInterval(start: program.start, end: program.end),
@@ -1716,19 +1738,21 @@ struct PlayerView: View {
     private func handleCatchupClipEnded() {
         guard let slot = session?.focusedSlot, let c = slot.catchup else { return }
 
-        // Broken archives can EOF instantly on every clip; after a few
-        // consecutive duds stop walking program-by-program toward live.
-        if slot.player.timePos < 5 {
-            consecutiveInstantCatchupEOFs += 1
-        } else {
-            consecutiveInstantCatchupEOFs = 0
-        }
-
-        if consecutiveInstantCatchupEOFs >= 3 || c.timeline.end >= Date().addingTimeInterval(-90) {
-            consecutiveInstantCatchupEOFs = 0
+        let decision = CatchupClipContinuationPolicy.decision(
+            previousImmediateEOFs: consecutiveInstantCatchupEOFs,
+            positionSeconds: slot.player.timePos, timelineEnd: c.timeline.end)
+        consecutiveInstantCatchupEOFs = decision.consecutiveImmediateEOFs
+        switch decision.action {
+        case .replayUnavailable:
+            slot.stopUnavailableReplay()
+            liveLatched = false
+            return
+        case .returnToLive:
             slot.returnToLive()
             liveLatched = true
             return
+        case .continueArchive:
+            break
         }
         if let next = archivedProgram(after: c.timeline.end) {
             // The next program may have started before this clip's timeline
@@ -1742,26 +1766,32 @@ struct PlayerView: View {
             liveLatched = false
         } else {
             // No guide data past the clip — keep going with an ad-hoc window.
-            startCatchup(at: c.timeline.end)
+            startCatchup(at: c.timeline.end, resetFailureCount: false)
         }
     }
 
     /// Handles a request delivered to this already-open window (user clicked
     /// the channel or a program somewhere in the main window).
     private func apply(_ request: PlaybackRequest) {
-        guard let slot = session?.focusedSlot else { return }
-        switch request.intent {
-        case .live:
-            if isCatchup {
-                slot.returnToLive()
+        externalRequestTask?.cancel()
+        externalRequestTask = Task { @MainActor in
+            guard let slot = session?.focusedSlot else { return }
+            let changed = slot.channel.sourceChannelIdentity != request.channel.sourceChannelIdentity ||
+                slot.channel.streamURL != request.channel.streamURL
+            // The same endpoint can acquire a new guide/catchup binding.
+            // Its replacement fast path refreshes metadata without reloading.
+            guard await slot.replacePlaybackChannel(request.channel), !Task.isCancelled else { return }
+            viewModel?.configureSmartRecovery(for: slot)
+            switch request.intent {
+            case .live:
+                if changed { slot.loadInitialLive() }
+                else if isCatchup { slot.returnToLive() }
                 liveLatched = true
-            }
-        case .catchup(let start):
-            guard supportsRewind else { return }
-            startCatchup(at: start)
-        case .resume(let positionSeconds):
-            if isOnDemandMode, positionSeconds > 0 {
-                slot.player.seek(to: positionSeconds)
+            case .catchup(let start):
+                guard supportsRewind else { return }
+                startCatchup(at: start)
+            case .resume(let positionSeconds):
+                slot.resumeOnDemand(to: positionSeconds, reload: changed)
             }
         }
     }
@@ -1834,7 +1864,8 @@ struct PlayerView: View {
     }
 
     private func seekByShortcut(_ delta: Double) {
-        if isRecordingMode {
+        if isRecordingMode || isOnDemandMode {
+            guard player.isSeekable else { return }
             let total = playback?.totalDuration ?? player.duration
             let target = (player.timePos + delta).clamped(to: 0...max(total, 0))
             player.seek(to: target)
@@ -1937,17 +1968,22 @@ private struct ChannelPickerPopover: View {
     @FocusState private var searchFocused: Bool
 
     private var filteredChannels: [Channel] {
-        let existing = Set(session.slots.map(\.channel.id))
-        let pool = viewModel.channels.filter { !existing.contains($0.id) }
+        let existing = Set(session.slots.map { $0.channel.preferenceIdentity })
+        let pool = viewModel.displayedChannels.filter { !existing.contains($0.preferenceIdentity) }
         if query.isEmpty { return pool }
         return pool.filter { $0.name.localizedCaseInsensitiveContains(query) }
     }
 
     private func add(_ channel: Channel) {
+        guard let request = viewModel.resolvePlaybackRequest(.live(channel)) else { return }
+        let channel = request.channel
         session.addChannel(
             channel,
             currentProgram: viewModel.currentProgram(for: channel)
         )
+        if let slot = session.slots.first(where: { $0.channel.preferenceIdentity == channel.preferenceIdentity }) {
+            viewModel.configureSmartRecovery(for: slot)
+        }
         query = ""
         // Keep the picker open so several channels can be added in a row;
         // close automatically once the grid is full.
@@ -2178,7 +2214,16 @@ struct WindowAccessor: NSViewRepresentable {
             }
 
             state.onWindow?(window)
-            window.level = state.isPinned ? .floating : .normal
+            let diagnosticPlayer = SavedPlaybackScenario.isCapturing || PlaybackValidation.isEnabled
+            window.level = (state.isPinned || diagnosticPlayer) ? .floating : .normal
+            if diagnosticPlayer {
+                // Keep this opt-in diagnostic window visible while the user
+                // works in another Space or a full-screen application.
+                var behavior = window.collectionBehavior
+                behavior.remove(.fullScreenPrimary)
+                behavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
+                window.collectionBehavior = behavior
+            }
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
             window.isMovableByWindowBackground = true

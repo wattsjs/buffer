@@ -18,22 +18,32 @@ struct ChannelSidebarView: View {
         }.count
     }
 
-    private var playlistSelectionBinding: Binding<UUID> {
-        Binding(
-            get: { viewModel.activePlaylistID ?? viewModel.playlists.first?.id ?? UUID() },
-            set: { viewModel.setActivePlaylist(id: $0) }
-        )
+    private var playlistName: String {
+        if viewModel.isSmartSportsActive { return "Smart Channels" }
+        let name = viewModel.playlists.first(where: { $0.id == viewModel.activePlaylistID })?.name ?? ""
+        return name.isEmpty ? "Source" : name
     }
 
     @ViewBuilder
     private var playlistPicker: some View {
-        if viewModel.playlists.count > 1, let active = viewModel.activePlaylist {
+        // The selected source's metadata is available before Keychain access.
+        // Keep switching available while credentials for one source wait.
+        if !viewModel.playlists.isEmpty {
             Menu {
+                Button {
+                    viewModel.activateSmartSports()
+                } label: {
+                    Label("Smart Channels", systemImage: viewModel.isSmartSportsActive ? "checkmark" : "sportscourt")
+                }
+                if viewModel.isSmartSportsActive {
+                    Button("Review Smart Sports…") { openWindow(id: "smart-sports-reviews") }
+                }
+                Divider()
                 ForEach(viewModel.playlists) { playlist in
                     Button {
-                        playlistSelectionBinding.wrappedValue = playlist.id
+                        viewModel.chooseSource(id: playlist.id)
                     } label: {
-                        if playlist.id == active.id {
+                        if !viewModel.isSmartSportsActive && playlist.id == viewModel.activePlaylistID {
                             Label(
                                 playlist.name.isEmpty ? "Untitled Playlist" : playlist.name,
                                 systemImage: "checkmark"
@@ -47,13 +57,13 @@ struct ChannelSidebarView: View {
                 Button("Manage Sources…") { openWindow(id: "settings") }
             } label: {
                 PlaylistPickerLabel(
-                    name: active.name.isEmpty ? "Source" : active.name
+                    name: playlistName
                 )
             }
             .menuStyle(.button)
             .menuIndicator(.hidden)
             .buttonStyle(.plain)
-            .help("Switch source")
+            .help("Switch playlist")
         }
     }
 
@@ -83,7 +93,7 @@ struct ChannelSidebarView: View {
 
     var body: some View {
         List(selection: $viewModel.selection) {
-            if viewModel.playlists.count > 1 {
+            if !viewModel.playlists.isEmpty {
                 Section {
                     playlistPicker
                 }

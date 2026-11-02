@@ -11,8 +11,12 @@ enum ImageLoader {
         config.imageDecodingQueue.maxConcurrentOperationCount = 2
         config.isProgressiveDecodingEnabled = false
         config.isTaskCoalescingEnabled = true
+        config.makeImageDecoder = { context in makeImageDecoder(for: context) }
 
         let dataLoaderConfig = URLSessionConfiguration.default
+        // Nuke's DataCache owns the encoded-image cache. Replacing its
+        // configured loader must not re-enable a second URLCache.
+        dataLoaderConfig.urlCache = nil
         dataLoaderConfig.timeoutIntervalForRequest = 15
         dataLoaderConfig.httpAdditionalHeaders = [
             "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
@@ -28,6 +32,27 @@ enum ImageLoader {
         ImageDecoderRegistry.shared.register(ImageDecoders.Default.init)
     }
 
+    static func artworkRequest(
+        for url: URL,
+        size: CGSize,
+        displayScale: CGFloat,
+        contentMode: ImageProcessingOptions.ContentMode
+    ) -> ImageRequest {
+        // Decode directly to the displayed pixels. The view supplies scale;
+        // Nuke's request/cache identity includes these thumbnail options.
+        return ArtworkImageDecoder.request(
+            for: url,
+            size: size,
+            displayScale: displayScale,
+            contentMode: contentMode
+        )
+    }
+
+    nonisolated static func makeImageDecoder(for context: ImageDecodingContext) -> (any ImageDecoding)? {
+        if let decoder = ArtworkImageDecoder(context: context) { return decoder }
+        return ImageDecoderRegistry.shared.decoder(for: context)
+    }
+
     // MARK: - Failure memo
     //
     // Nuke has no built-in failure caching, so every re-instantiated LazyImage
@@ -35,14 +60,10 @@ enum ImageLoader {
     // cascade into a hot loop. We track recent failures here and let callers
     // skip the fetch entirely until the TTL elapses.
 
-    private static let failureLock = NSLock()
-    private static var failures: [URL: Date] = [:]
-    private static let failureTTL: TimeInterval = 10 * 60
+    private static let failures = RecentImageFailures()
 
     static func markFailed(_ url: URL) {
-        failureLock.lock()
-        failures[url] = Date()
-        failureLock.unlock()
+        failures.insert(url)
     }
 
     static func markFailed(_ url: URL, unlessCancelled error: Error) {
@@ -51,14 +72,7 @@ enum ImageLoader {
     }
 
     static func isFailed(_ url: URL) -> Bool {
-        failureLock.lock()
-        defer { failureLock.unlock() }
-        guard let when = failures[url] else { return false }
-        if Date().timeIntervalSince(when) > failureTTL {
-            failures.removeValue(forKey: url)
-            return false
-        }
-        return true
+        failures.contains(url)
     }
 
     private static func isCancellation(_ error: Error) -> Bool {

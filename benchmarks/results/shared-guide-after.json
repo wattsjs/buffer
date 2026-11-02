@@ -1,0 +1,80 @@
+{
+  "fixture": "buffer-production-paths-v2",
+  "measurements": [
+    {
+      "checksum": 1000,
+      "name": "playlist-parse-1000",
+      "samplesMs": [
+        8.7815,
+        8.725167,
+        8.743917,
+        8.838167,
+        8.479,
+        8.25075,
+        8.416208
+      ]
+    },
+    {
+      "checksum": 1000,
+      "name": "xmltv-parse-1000",
+      "samplesMs": [
+        3.008375,
+        3.049958,
+        3.148625,
+        2.964958,
+        2.915917,
+        3.00225,
+        3.055083
+      ]
+    },
+    {
+      "checksum": 480,
+      "name": "guide-lookup-480",
+      "samplesMs": [
+        3.525375,
+        3.573875,
+        3.468333,
+        3.567875,
+        3.532708,
+        3.535,
+        3.668458
+      ]
+    },
+    {
+      "checksum": 49000,
+      "name": "sports-index-48000",
+      "samplesMs": [
+        108.855375,
+        108.031958,
+        110.912625,
+        120.635667,
+        117.328,
+        109.528875,
+        106.549459
+      ]
+    },
+    {
+      "checksum": 98000,
+      "name": "sports-shared-guide-96000",
+      "samplesMs": [
+        119.95625,
+        119.218084,
+        119.360791,
+        119.946875,
+        120.351042,
+        119.653917,
+        121.107542
+      ]
+    }
+  ],
+  "schema": 2,
+  "machine": {
+    "arch": "arm64",
+    "os": "27.0"
+  },
+  "configuration": "Debug-Onone",
+  "commit": "c0db442fa80bf058e69f927c50858cfdb559566b",
+  "worktreeDiffSHA256": "ff963887b5a3f6f2521a6de4e6d89656615fec7415f42c67f40b1e8eb162d02c",
+  "binarySHA256": "d3cb841864ab03da8f69c6358bd3c59f2c250c2dc7f1d3c7362279b873828577",
+  "recordedAt": "2026-10-04T09:34:15.703490+00:00"
+}

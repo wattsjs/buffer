@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Canonical sport event model
 
-nonisolated struct SportEvent: Identifiable, Sendable {
+nonisolated struct SportEvent: Identifiable, Sendable, Codable {
     let id: String
     let sport: Sport
     let league: League
@@ -41,12 +41,12 @@ nonisolated struct SportEvent: Identifiable, Sendable {
     }
 }
 
-nonisolated struct LeaderInfo: Sendable {
+nonisolated struct LeaderInfo: Sendable, Codable {
     let name: String               // "Ludvig Åberg"
     let score: String              // "-8"
 }
 
-nonisolated struct TeamInfo: Sendable {
+nonisolated struct TeamInfo: Sendable, Codable {
     let name: String               // "Celtics"
     let abbreviation: String       // "BOS"
     let displayName: String        // "Boston Celtics"
@@ -65,7 +65,7 @@ nonisolated struct TeamInfo: Sendable {
 
 // MARK: - Sport & League taxonomy
 
-nonisolated enum Sport: String, CaseIterable, Sendable, Identifiable {
+nonisolated enum Sport: String, CaseIterable, Sendable, Identifiable, Codable {
     case football = "Football"
     case basketball = "Basketball"
     case baseball = "Baseball"
@@ -109,7 +109,7 @@ nonisolated enum Sport: String, CaseIterable, Sendable, Identifiable {
     }
 }
 
-nonisolated struct League: Sendable, Hashable, Identifiable {
+nonisolated struct League: Sendable, Hashable, Identifiable, Codable {
     let sport: Sport
     let slug: String               // ESPN path component e.g. "nfl"
     let shortName: String          // "NFL"
@@ -335,7 +335,7 @@ nonisolated struct League: Sendable, Hashable, Identifiable {
 
 // MARK: - Event status
 
-nonisolated enum EventStatus: Sendable {
+nonisolated enum EventStatus: Sendable, Codable {
     case scheduled
     case live(detail: String?)      // "2nd Half 67'"
     case halftime

@@ -59,6 +59,7 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
     let epgChannelID: String?
     let catchup: CatchupInfo?
     let contentType: ChannelContentType
+    let sourceOwnership: ChannelSourceOwnership?
 
     init(
         id: String,
@@ -68,7 +69,8 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
         streamURL: URL,
         epgChannelID: String?,
         catchup: CatchupInfo? = nil,
-        contentType: ChannelContentType = .live
+        contentType: ChannelContentType = .live,
+        sourceOwnership: ChannelSourceOwnership? = nil
     ) {
         self.id = id
         self.name = name
@@ -78,7 +80,14 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
         self.epgChannelID = epgChannelID
         self.catchup = catchup
         self.contentType = contentType
+        self.sourceOwnership = sourceOwnership
     }
+
+    var sourceChannelIdentity: SourceChannelIdentity? { sourceOwnership?.channelIdentity }
+
+    /// Use for preferences/actions that can span configured sources. Legacy
+    /// cached channels decode without ownership and retain their former ID.
+    var preferenceIdentity: String { sourceOwnership?.preferenceIdentity ?? id }
 
     var supportsRewind: Bool {
         contentType == .live && (catchup?.days ?? 0) > 0
@@ -109,10 +118,10 @@ nonisolated struct Channel: Identifiable, Hashable, Codable, Sendable {
     var isOnDemand: Bool { contentType == .vod }
 
     func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
+        hasher.combine(preferenceIdentity)
     }
 
     static func == (lhs: Channel, rhs: Channel) -> Bool {
-        lhs.id == rhs.id
+        lhs.preferenceIdentity == rhs.preferenceIdentity
     }
 }

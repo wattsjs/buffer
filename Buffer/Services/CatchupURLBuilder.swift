@@ -1,6 +1,30 @@
 import Foundation
 
 enum CatchupURLBuilder {
+    struct Request {
+        let url: URL
+        /// Actual time encoded by the provider URL, which may have minute
+        /// precision. This is the origin for player position/wall-clock math.
+        let loadedStart: Date
+        let initialSeekSeconds: TimeInterval
+    }
+
+    static func request(for channel: Channel, start: Date, duration: TimeInterval) -> Request? {
+        guard start.timeIntervalSince1970.isFinite, duration.isFinite else { return nil }
+        let template = channel.catchup?.source ?? ""
+        let secondsEncoded = ["${start}", "${S}", "{S}"].contains { template.contains($0) }
+        let minutePrecision = channel.catchup?.kind == .xc && !secondsEncoded
+        let loadedStart = minutePrecision
+            ? Date(timeIntervalSince1970: floor(start.timeIntervalSince1970 / 60) * 60)
+            : Date(timeIntervalSince1970: floor(start.timeIntervalSince1970))
+        let offset = start.timeIntervalSince(loadedStart)
+        // Round the request length up for minute-only providers, retaining
+        // the intended end when the URL start was rounded down.
+        let requestDuration = minutePrecision ? ceil((duration + offset) / 60) * 60 : duration + offset
+        guard let url = url(for: channel, start: loadedStart, duration: requestDuration) else { return nil }
+        return Request(url: url, loadedStart: loadedStart, initialSeekSeconds: offset)
+    }
+
     /// Build a catchup URL to play the segment starting at `start` for `duration` seconds.
     /// Returns nil if the channel has no catchup info or the template can't be satisfied.
     static func url(for channel: Channel, start: Date, duration: TimeInterval) -> URL? {

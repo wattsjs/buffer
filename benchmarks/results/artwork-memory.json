@@ -1,0 +1,239 @@
+{
+  "schemaVersion": 1,
+  "fixture": "artwork-4k-jpeg-v1",
+  "fixtureSHA256": "e61090316ace3e16c81e71ee0e116e82bae04a3dd8c4699082bf60ba5314b1b6",
+  "sourceHashes": {
+    "Buffer/Support/RecentImageFailures.swift": "e1cbcaa68a92ee761ca35520ac1f5085939396a824110465dd7f27d3ad3afbcf",
+    "Buffer/Services/ArtworkImageDecoder.swift": "00b704f32d3e09d30e88165e57f6783ba1ac6073fdd209a03ef40dcf57a01179",
+    "Buffer/Services/ImageLoader.swift": "53649dbb66bf437831a7b392055354386b129948e65bf00037db870fc638f6cb",
+    "benchmarks/image_decode_benchmark.swift": "0dffafadea7f8421e2875bf172206d9edc476f54854b220d996c6ea8184d7c9c"
+  },
+  "executableSHA256": "ab8ce310abf59548980f7234851064ce6cc27f08c813b79d6fd049e86ddba43f",
+  "nukeObjectSHA256": "f14fb5236fd470deaf5de957b4584879d84777e002cac33076ab640fc895b36e",
+  "configuration": "Standalone Swift -O driver + built Nuke Debug object",
+  "recordedAt": "2026-10-04T11:47:03.828237+00:00",
+  "trials": [
+    {
+      "trial": 0,
+      "resize": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "resize",
+        "peakRSSBytes": 26656768,
+        "samplesMs": [
+          10.642375,
+          8.262292,
+          8.62575,
+          8.129125,
+          8.409208,
+          8.216459,
+          8.957542,
+          8.12075,
+          9.220917,
+          8.642208
+        ],
+        "width": 512,
+        "medianMs": 8.517479
+      },
+      "thumbnail": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "thumbnail",
+        "peakRSSBytes": 31834112,
+        "samplesMs": [
+          2.894958,
+          2.812959,
+          2.805291,
+          2.753333,
+          2.732666,
+          2.707584,
+          2.556834,
+          2.638125,
+          2.671458,
+          2.6905
+        ],
+        "width": 512,
+        "medianMs": 2.7201250000000003
+      }
+    },
+    {
+      "trial": 1,
+      "thumbnail": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "thumbnail",
+        "peakRSSBytes": 31883264,
+        "samplesMs": [
+          2.62375,
+          2.664833,
+          2.699208,
+          2.520083,
+          2.622542,
+          2.446375,
+          2.476208,
+          2.608875,
+          2.597208,
+          2.651042
+        ],
+        "width": 512,
+        "medianMs": 2.6157085
+      },
+      "resize": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "resize",
+        "peakRSSBytes": 26624000,
+        "samplesMs": [
+          11.445458,
+          8.366959,
+          9.358042,
+          8.296,
+          8.131583,
+          8.197417,
+          8.139292,
+          8.542584,
+          8.160125,
+          8.456958
+        ],
+        "width": 512,
+        "medianMs": 8.3314795
+      }
+    },
+    {
+      "trial": 2,
+      "resize": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "resize",
+        "peakRSSBytes": 26656768,
+        "samplesMs": [
+          8.289333,
+          8.3165,
+          8.2845,
+          10.263,
+          8.310042,
+          8.796333,
+          10.633583,
+          8.759042,
+          8.72225,
+          9.20625
+        ],
+        "width": 512,
+        "medianMs": 8.740646000000002
+      },
+      "thumbnail": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "thumbnail",
+        "peakRSSBytes": 31883264,
+        "samplesMs": [
+          3.11625,
+          2.848291,
+          2.873667,
+          2.872459,
+          2.735375,
+          2.712167,
+          2.735042,
+          2.875041,
+          2.718667,
+          2.719667
+        ],
+        "width": 512,
+        "medianMs": 2.791833
+      }
+    },
+    {
+      "trial": 3,
+      "thumbnail": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "thumbnail",
+        "peakRSSBytes": 31899648,
+        "samplesMs": [
+          2.71725,
+          2.735625,
+          2.754042,
+          2.810709,
+          2.572667,
+          2.579708,
+          2.489583,
+          2.510083,
+          2.658292,
+          2.671208
+        ],
+        "width": 512,
+        "medianMs": 2.6647499999999997
+      },
+      "resize": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "resize",
+        "peakRSSBytes": 26820608,
+        "samplesMs": [
+          8.320042,
+          8.335584,
+          8.313541,
+          8.374042,
+          8.262167,
+          9.917125,
+          11.1735,
+          8.597041,
+          8.431458,
+          8.592167
+        ],
+        "width": 512,
+        "medianMs": 8.40275
+      }
+    },
+    {
+      "trial": 4,
+      "resize": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "resize",
+        "peakRSSBytes": 26656768,
+        "samplesMs": [
+          8.373333,
+          8.516458,
+          8.38325,
+          9.62925,
+          8.708375,
+          9.312875,
+          8.582833,
+          8.9535,
+          8.631917,
+          9.823166
+        ],
+        "width": 512,
+        "medianMs": 8.670145999999999
+      },
+      "thumbnail": {
+        "height": 384,
+        "inputBytes": 233473,
+        "mode": "thumbnail",
+        "peakRSSBytes": 31817728,
+        "samplesMs": [
+          3.022542,
+          3.123917,
+          2.867541,
+          2.726208,
+          2.818958,
+          2.824083,
+          2.69925,
+          2.678541,
+          2.676833,
+          2.566
+        ],
+        "width": 512,
+        "medianMs": 2.772583
+      }
+    }
+  ],
+  "limitations": "Decode/resize surface only, synthetic JPEG, no network. RSS includes framework working set and can increase despite lower CPU time.",
+  "resizeMedianMs": 8.517479,
+  "resizeMedianPeakRSSBytes": 26656768,
+  "thumbnailMedianMs": 2.7201250000000003,
+  "thumbnailMedianPeakRSSBytes": 31883264,
+  "changeFraction": -0.6806420068661161,
+  "regression": false
+}

@@ -1,0 +1,109 @@
+{
+  "architecture": "arm64",
+  "baseline_git_ref": "c0db442fa80bf058e69f927c50858cfdb559566b",
+  "baseline_patch_sha256": "b9ae53adf71cb98c7ff15dccb46265e1eb0ccd405a57e84fe438a10370378687",
+  "baseline_probe_source_sha256": "13b3b69a6cec7e8e17b894d5d93c324acd2bcf1c10baa7aa23c8d0d1ff6c2488",
+  "baseline_source_sha256": "510a775bc77e5c685a50361cd249eb32d7957d6cc9b64d116715bf7192e43825",
+  "configuration": "standalone swiftc default -Onone; same compiler and harness before/after",
+  "executable_sha256": {
+    "after": "b5049e665c07bc8f4729fda90478821d79b284230693a00f461ba160013b4d7f",
+    "before": "5ccbe76f42807197f4797fa431ca5b36620f1f1c19a4b4a4ffeab98e3ff1177a"
+  },
+  "limitations": [
+    "Hidden standalone AppKit window with synthetic row metadata; no provider, decoder or full app measured",
+    "Scroll fixture drives 100 real NSClipView bounds changes after warm-up; no manual metadata callbacks",
+    "Header baseline reproduces previous formatting body; all titles/positions are checked for equivalence",
+    "Baseline grid lifecycle bodies have only probe entrypoint wrappers added"
+  ],
+  "medians": {
+    "headers_cached_ms": 0.074459,
+    "headers_previous_ms": 84.266083,
+    "scroll_after_ms": 1.4955,
+    "scroll_before_ms": 122.040083
+  },
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "results": {
+    "after": {
+      "fixture": "epg-appkit-horizontal-100x-672-blocks-v1",
+      "overlay_entries": 21,
+      "provider_calls": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "rows": 1000,
+      "samples_ms": [
+        1.67925,
+        1.542875,
+        1.668458,
+        1.4955,
+        1.483625,
+        1.482458,
+        1.46025
+      ],
+      "visible_rows": 9
+    },
+    "before": {
+      "fixture": "epg-appkit-horizontal-100x-672-blocks-v1",
+      "overlay_entries": 21,
+      "provider_calls": [
+        2079,
+        2100,
+        2100,
+        2100,
+        2100,
+        2100,
+        2100
+      ],
+      "rows": 1000,
+      "samples_ms": [
+        122.742833,
+        132.994917,
+        128.194667,
+        121.347875,
+        120.610667,
+        121.032166,
+        122.040083
+      ],
+      "visible_rows": 9
+    },
+    "headers": {
+      "cached_samples_ms": [
+        0.081666,
+        0.070292,
+        0.072541,
+        0.074459,
+        0.072833,
+        0.077959,
+        0.076291
+      ],
+      "fixture": "epg-header-100-ticks-694-labels-v1",
+      "previous_samples_ms": [
+        88.850458,
+        84.266083,
+        84.6725,
+        84.111375,
+        84.53375,
+        84.070542,
+        83.629875
+      ],
+      "ticks": 100,
+      "titles": 694
+    }
+  },
+  "schema": 1,
+  "source_sha256": {
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Support/EPGTimeStripCache.swift": "abc74bbfbdcd876ba013d64aa0c2ae7781caa1d8b92c080af802f685cde87235",
+    "Buffer/Support/EPGTimelineInputs.swift": "12a1bdfbdc81c5b62a2f1d3c4e51950395ad3b598ba61d3d1b6aa2e26e9c782f",
+    "Buffer/Views/EPGScrollGrid.swift": "e616aba1df275743ba56ce11a2d57ae64c899f64342d853c01e525fcffc9f3d2",
+    "benchmarks/epg_grid_tests.swift": "976eb9bf40619270fac71df896d3dc59cd411f116243f476cc1f786d662c34a1"
+  },
+  "swift": "Apple Swift version 6.4 (swiftlang-6.4.0.33.1 clang-2100.3.33.1)\nTarget: arm64-apple-macosx27.0.0",
+  "timestamp_utc": "2026-10-04T11:05:04.217867+00:00"
+}

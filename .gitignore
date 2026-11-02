@@ -10,3 +10,4 @@ traces/
 **/xcuserdata/
 *.xcuserstate
 .logs/
+__pycache__/

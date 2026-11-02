@@ -1,0 +1,316 @@
+{
+  "schemaVersion": 1,
+  "fixture": "parser-identity-v1",
+  "configuration": "debug",
+  "cases": [
+    {
+      "kind": "m3u",
+      "count": 50000,
+      "descriptionBytes": 0,
+      "after": [
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 62537728,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            499.906,
+            489.0855,
+            491.527917,
+            495.3335,
+            495.590667,
+            493.216792,
+            503.661292
+          ],
+          "medianMs": 495.3335
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 62570496,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            497.32175,
+            494.969417,
+            489.506458,
+            490.191333,
+            494.640792,
+            494.776917,
+            496.568125
+          ],
+          "medianMs": 494.776917
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 62554112,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            500.785167,
+            494.3405,
+            497.728417,
+            499.19725,
+            497.670167,
+            500.31875,
+            500.319042
+          ],
+          "medianMs": 499.19725
+        }
+      ],
+      "before": [
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 62619648,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            505.448875,
+            501.631334,
+            499.463833,
+            501.238833,
+            498.951083,
+            499.095084,
+            500.083333
+          ],
+          "medianMs": 500.083333
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 62554112,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            505.026541,
+            500.18025,
+            501.825792,
+            504.34025,
+            506.624,
+            503.055958,
+            504.953292
+          ],
+          "medianMs": 504.34025
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 6655568,
+          "kind": "m3u",
+          "peakRSSBytes": 62554112,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            503.558708,
+            497.3615,
+            498.644458,
+            498.474416,
+            498.998875,
+            499.316958,
+            499.477959
+          ],
+          "medianMs": 498.998875
+        }
+      ],
+      "medianMs": 495.3335,
+      "medianPeakRSSBytes": 62554112,
+      "baselineMedianMs": 500.083333,
+      "changeFraction": -0.009498082992499879,
+      "regression": false
+    },
+    {
+      "kind": "m3u-idless",
+      "count": 50000,
+      "descriptionBytes": 0,
+      "after": [
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 5516678,
+          "kind": "m3u-idless",
+          "peakRSSBytes": 64716800,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            490.001916,
+            487.837791,
+            489.761209,
+            487.620708,
+            486.863084,
+            502.276208,
+            488.484625
+          ],
+          "medianMs": 488.484625
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 5516678,
+          "kind": "m3u-idless",
+          "peakRSSBytes": 64733184,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            496.91,
+            492.184542,
+            483.500625,
+            485.705,
+            485.473292,
+            485.024125,
+            489.958583
+          ],
+          "medianMs": 485.705
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 5516678,
+          "kind": "m3u-idless",
+          "peakRSSBytes": 64716800,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            492.935084,
+            483.506167,
+            488.736792,
+            488.607667,
+            489.196583,
+            486.227292,
+            486.027625
+          ],
+          "medianMs": 488.607667
+        }
+      ],
+      "before": [
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 5516678,
+          "kind": "m3u-idless",
+          "peakRSSBytes": 64339968,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            461.568,
+            459.52825,
+            460.429375,
+            459.095209,
+            461.947,
+            461.906875,
+            456.386458
+          ],
+          "medianMs": 460.429375
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 5516678,
+          "kind": "m3u-idless",
+          "peakRSSBytes": 64274432,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            459.445084,
+            459.596292,
+            460.351791,
+            459.187209,
+            460.108375,
+            460.276792,
+            470.436166
+          ],
+          "medianMs": 460.108375
+        },
+        {
+          "capacity": 92521,
+          "checksum": 1877780,
+          "count": 50000,
+          "elementStride": 136,
+          "inputBytes": 5516678,
+          "kind": "m3u-idless",
+          "peakRSSBytes": 64323584,
+          "requestedCount": 50000,
+          "reservedElementBytes": 12582856,
+          "samplesMs": [
+            464.826834,
+            467.726792,
+            469.197,
+            468.58575,
+            465.690834,
+            466.061334,
+            462.542916
+          ],
+          "medianMs": 466.061334
+        }
+      ],
+      "medianMs": 488.484625,
+      "medianPeakRSSBytes": 64716800,
+      "baselineMedianMs": 460.429375,
+      "changeFraction": 0.06093279778250471,
+      "regression": false
+    }
+  ],
+  "trials": 3,
+  "samples": 7,
+  "absoluteToleranceMs": 0.05,
+  "recordedAt": "2026-10-04T12:32:28.290245+00:00",
+  "sourceHashes": {
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/VODItem.swift": "dba3e220799c91d3496b653613b4393f5d0f5f8054a11d935f6b4cdd86f9964f",
+    "Buffer/Support/AppLog.swift": "c71fdc6554240bf102d6b29687c0c3841b17e862f63531471e4c9c95a55e6233",
+    "benchmarks/parser_memory_benchmark.swift": "c582ebd286588cff88237d2eb62ba1f9377d1a89c8bb47985a7766ec5fc1c860",
+    "Buffer/Services/XMLTVParser.swift": "2ea5e5edd5a4da717a086411214137efb2d63eb59ba030e60213eb2c49848beb",
+    "Buffer/Services/M3UParser.swift": "fc29867b129af5616190987641583271b0f2247dfc4fd764afb38c6e3ee46383",
+    "Buffer/Support/ChannelIdentityEncoding.h": "b48be886a54cdd4bfb0482ae55a9f21b2805b2b55e2d58e7d77bc1f5afffbd7a"
+  },
+  "executableSHA256": "6a6d979ac3c658b98c1cfca2a7176d1883029918f04492efd6fc0eda9de4e120",
+  "compiler": "Apple Swift version 6.4 (swiftlang-6.4.0.33.1 clang-2100.3.33.1)\nTarget: arm64-apple-macosx27.0.0",
+  "limitations": "Synthetic fixtures, standalone production parsers; RSS includes fixture generation and allocator reuse. Reserved element bytes are not resident-memory bytes.",
+  "beforeSourceHashes": {
+    "Buffer/Models/EPGProgram.swift": "b5306bc67a09b0068ea68f72dc9a5cf4117c877c4be954ebd9e533814486e927",
+    "Buffer/Models/Channel.swift": "30ba05e7f97e3c13f54ac77b897f4a9113554ec18ec4a89fd7321569e8959314",
+    "Buffer/Models/VODItem.swift": "dba3e220799c91d3496b653613b4393f5d0f5f8054a11d935f6b4cdd86f9964f",
+    "Buffer/Support/AppLog.swift": "c71fdc6554240bf102d6b29687c0c3841b17e862f63531471e4c9c95a55e6233",
+    "benchmarks/parser_memory_benchmark.swift": "c582ebd286588cff88237d2eb62ba1f9377d1a89c8bb47985a7766ec5fc1c860",
+    "Buffer/Services/XMLTVParser.swift": "2ea5e5edd5a4da717a086411214137efb2d63eb59ba030e60213eb2c49848beb",
+    ".local/bench/M3UParser-identity-before.swift": "68010ea992c8721342f6a83109ef2ed6a9406172af8bb059c7f573df9e4499fd",
+    "Buffer/Support/ChannelIdentityEncoding.h": "b48be886a54cdd4bfb0482ae55a9f21b2805b2b55e2d58e7d77bc1f5afffbd7a"
+  },
+  "beforeExecutableSHA256": "e45558313aaec689b93c9d161b370ef39a7630327c122abed6113a9a0f71b0fd",
+  "regression": false
+}

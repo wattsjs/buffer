@@ -10,24 +10,46 @@ nonisolated struct XMLTVParser {
     static func parse(from url: URL) async throws -> [EPGProgram] {
         // Perform local file reads inside the detached task (Agent 03) so
         // large XMLTV guides never block the main thread on import/switch.
-        return try await Task.detached(priority: .userInitiated) {
+        try Task.checkCancellation()
+        let worker = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
             let fetchStarted = ContinuousClock.now
-            let data: Data
-            if url.isFileURL {
-                data = try Data(contentsOf: url)
-            } else {
-                data = try await fetchRemoteGuideData(from: url)
+            guard url.isFileURL else {
+                // Remote guides parse while they download; parse time is
+                // hidden behind the transfer instead of following it.
+                let result = try await StreamingGuideParse.run(url: url, configuration: guideSessionConfiguration)
+                try Task.checkCancellation()
+                let totalMs = AppLog.elapsedMilliseconds(since: fetchStarted)
+                PerfMetrics.shared.record("guide.xmltv.fetchAndParseMs", Double(totalMs))
+                PerfMetrics.shared.record("guide.xmltv.firstByteMs", Double(result.firstByteMs))
+                PerfMetrics.shared.record("guide.xmltv.parseCpuMs", Double(result.parseMs))
+                AppLog.sync.info("XMLTV loaded bytes=\(result.bytes, privacy: .public) fetchMs=\(totalMs, privacy: .public) parseMs=\(result.parseMs, privacy: .public) firstByteMs=\(result.firstByteMs, privacy: .public) tailParseMs=\(result.tailParseMs, privacy: .public) streamed=true programs=\(result.programs.count, privacy: .public)")
+                return result.programs
             }
+            let data = try Data(contentsOf: url)
+            try Task.checkCancellation()
             let fetchMs = AppLog.elapsedMilliseconds(since: fetchStarted)
             let parseStarted = ContinuousClock.now
-            let programs = parse(data: data)
+            let programs = parseData(data, cancellationEnabled: true)
+            try Task.checkCancellation()
             AppLog.sync.info("XMLTV loaded bytes=\(data.count, privacy: .public) fetchMs=\(fetchMs, privacy: .public) parseMs=\(AppLog.elapsedMilliseconds(since: parseStarted), privacy: .public) programs=\(programs.count, privacy: .public)")
             return programs
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            let result = try await worker.value
+            try Task.checkCancellation()
+            return result
+        } onCancel: {
+            worker.cancel()
+        }
     }
 
     static func parse(data: Data) -> [EPGProgram] {
-        let context = XMLTVSAXContext()
+        parseData(data, cancellationEnabled: false)
+    }
+
+    private static func parseData(_ data: Data, cancellationEnabled: Bool) -> [EPGProgram] {
+        let context = XMLTVSAXContext(initialCapacity: min(data.count / 256, 524288))
         let ctxPtr = Unmanaged.passUnretained(context).toOpaque()
         var sax = saxHandler
 
@@ -36,10 +58,12 @@ nonisolated struct XMLTVParser {
             let chars = base.assumingMemoryBound(to: CChar.self)
 
             withUnsafeMutablePointer(to: &sax) { saxPtr in
-                // Seed the push parser with the first slice — libxml2 needs at
-                // least a few bytes up front to sniff the encoding, and giving
-                // it the whole buffer in one shot is both legal and cheapest.
-                let seedLen = Int32(min(raw.count, Int(Int32.max)))
+                // Async imports use bounded slices so a source switch can
+                // stop CPU work as well as its network request. Synchronous
+                // callers keep the existing single-buffer fast path.
+                let chunkSize = cancellationEnabled ? 64 * 1024 : Int(Int32.max)
+                let seedLen = Int32(min(raw.count, chunkSize))
+                guard !cancellationEnabled || !Task.isCancelled else { return }
                 guard let parserCtxt = xmlCreatePushParserCtxt(
                     saxPtr,
                     ctxPtr,
@@ -55,6 +79,14 @@ nonisolated struct XMLTVParser {
                     | kXMLParseNoNet
                 _ = xmlCtxtUseOptions(parserCtxt, options)
 
+                var offset = Int(seedLen)
+                while offset < raw.count {
+                    guard !cancellationEnabled || !Task.isCancelled else { return }
+                    let length = min(raw.count - offset, chunkSize)
+                    _ = xmlParseChunk(parserCtxt, chars.advanced(by: offset), Int32(length), 0)
+                    offset += length
+                }
+                guard !cancellationEnabled || !Task.isCancelled else { return }
                 _ = xmlParseChunk(parserCtxt, nil, 0, 1)
             }
         }
@@ -64,31 +96,124 @@ nonisolated struct XMLTVParser {
 }
 
 private extension XMLTVParser {
-    static func fetchRemoteGuideData(from url: URL) async throws -> Data {
-        var request = URLRequest(
-            url: url,
-            cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
-            timeoutInterval: 90
-        )
-        request.setValue("no-cache, no-store, max-age=0", forHTTPHeaderField: "Cache-Control")
-        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
-
-        let (data, response) = try await guideSession.data(for: request)
-        if let http = response as? HTTPURLResponse,
-           !(200..<400).contains(http.statusCode) {
-            throw URLError(.badServerResponse)
-        }
-        return data
-    }
-
-    static let guideSession: URLSession = {
+    static var guideSessionConfiguration: URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
         config.timeoutIntervalForRequest = 90
         config.timeoutIntervalForResource = 180
-        return URLSession(configuration: config)
-    }()
+        return config
+    }
+}
+
+/// Feeds each received network chunk straight into a libxml2 push parser on
+/// the session's serial delegate queue. Produces the same programmes as
+/// buffering the whole document and parsing it afterwards.
+nonisolated private final class StreamingGuideParse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    struct Result: Sendable {
+        let programs: [EPGProgram]
+        let bytes: Int
+        let firstByteMs: Int
+        let parseMs: Int
+        let tailParseMs: Int
+    }
+
+    private let started = ContinuousClock.now
+    private let context = XMLTVSAXContext(initialCapacity: 65_536)
+    private var parser: xmlParserCtxtPtr?
+    private var bytes = 0
+    private var firstByteMs = -1
+    private var parseDuration: Duration = .zero
+    private var failure: Error?
+    private var continuation: CheckedContinuation<Result, Error>?
+
+    static func run(url: URL, configuration: URLSessionConfiguration) async throws -> Result {
+        let delegate = StreamingGuideParse()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
+        defer { session.finishTasksAndInvalidate() }
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 90)
+        request.setValue("no-cache, no-store, max-age=0", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        let task = session.dataTask(with: request)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                queue.addOperation {
+                    delegate.continuation = continuation
+                    task.resume()
+                }
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    deinit {
+        if let parser { xmlFreeParserCtxt(parser) }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if let http = response as? HTTPURLResponse, !(200..<400).contains(http.statusCode) {
+            failure = URLError(.badServerResponse)
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard failure == nil, !data.isEmpty else { return }
+        if firstByteMs < 0 { firstByteMs = AppLog.elapsedMilliseconds(since: started) }
+        bytes += data.count
+        let parseStarted = ContinuousClock.now
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            let chars = base.assumingMemoryBound(to: CChar.self)
+            if let parser {
+                _ = xmlParseChunk(parser, chars, Int32(raw.count), 0)
+                return
+            }
+            var sax = saxHandler
+            let ctxPtr = Unmanaged.passUnretained(context).toOpaque()
+            // libxml2 copies the handler table into the new context.
+            parser = withUnsafeMutablePointer(to: &sax) { saxPtr in
+                xmlCreatePushParserCtxt(saxPtr, ctxPtr, chars, Int32(raw.count), nil)
+            }
+            if let parser {
+                _ = xmlCtxtUseOptions(parser, kXMLParseRecover | kXMLParseNoError | kXMLParseNoWarning | kXMLParseNoNet)
+            }
+        }
+        parseDuration += parseStarted.duration(to: .now)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let continuation else { return }
+        self.continuation = nil
+        if let error = failure ?? error {
+            continuation.resume(throwing: error)
+            return
+        }
+        let tailStarted = ContinuousClock.now
+        if let parser { _ = xmlParseChunk(parser, nil, 0, 1) }
+        let tail = tailStarted.duration(to: .now)
+        parseDuration += tail
+        continuation.resume(returning: Result(
+            programs: context.programs,
+            bytes: bytes,
+            firstByteMs: max(0, firstByteMs),
+            parseMs: Self.milliseconds(parseDuration),
+            tailParseMs: Self.milliseconds(tail)
+        ))
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Int {
+        let parts = duration.components
+        return Int(parts.seconds * 1_000 + parts.attoseconds / 1_000_000_000_000_000)
+    }
 }
 
 // MARK: - libxml2 parser options (subset we care about)
@@ -151,10 +276,12 @@ nonisolated private final class XMLTVSAXContext: @unchecked Sendable {
     private var titleBytes: [UInt8] = []
     private var descBytes: [UInt8] = []
 
-    init() {
-        // Real Xtream guides can have 300K+ programmes (109MB for 327K seen in wild).
-        // 512K capacity avoids reallocation for large guides while keeping memory ~4MB.
-        programs.reserveCapacity(524288)
+    init(initialCapacity: Int) {
+        // Size the initial buffer to the input, rather than reserving 512K
+        // entries even for a small guide. EPGProgram's four Strings and two
+        // Dates occupy 80 bytes per entry on arm64, before String payloads.
+        // This is a growth hint; compact or namespaced XML can grow normally.
+        programs.reserveCapacity(initialCapacity)
         titleBytes.reserveCapacity(128)
         descBytes.reserveCapacity(512)
     }
@@ -177,23 +304,36 @@ nonisolated private final class XMLTVSAXContext: @unchecked Sendable {
 
             // SAX2 attribute layout: 5 entries per attribute —
             // (localname, prefix, URI, value_start, value_end).
-            // XMLTV generators consistently output: start, stop, channel.
-            // We index directly by position to avoid per-attribute cstrEquals overhead.
-            let startVal = attributes[3]
-            let startEnd = attributes[4]
-            let stopVal  = attributes[8]
-            let stopEnd  = attributes[9]
-            let chanVal  = attributes[13]
-            let chanEnd  = attributes[14]
-
-            if let s = startVal, let e = startEnd, e > s {
-                currentStart = parseXMLTVDate(s, length: e - s)
+            // Attribute order is not significant in XML. Providers also add
+            // optional attributes, so positions cannot identify these fields.
+            // Verify the common three-attribute order before taking its fast
+            // path; reordered/extra/namespaced fields retain the general loop.
+            if nbAttributes == 3,
+               attributes[1] == nil, attributes[6] == nil, attributes[11] == nil,
+               let startName = attributes[0], let stopName = attributes[5], let channelName = attributes[10],
+               cstrEquals(startName, "start"), cstrEquals(stopName, "stop"), cstrEquals(channelName, "channel") {
+                if let s = attributes[3], let e = attributes[4], e > s {
+                    currentStart = parseXMLTVDate(s, length: e - s)
+                }
+                if let s = attributes[8], let e = attributes[9], e > s {
+                    currentEnd = parseXMLTVDate(s, length: e - s)
+                }
+                if let s = attributes[13], let e = attributes[14], e > s {
+                    currentChannelID = decodeUTF8(s, length: e - s)
+                }
+                return
             }
-            if let s = stopVal, let e = stopEnd, e > s {
-                currentEnd = parseXMLTVDate(s, length: e - s)
-            }
-            if let s = chanVal, let e = chanEnd, e > s {
-                currentChannelID = decodeUTF8(s, length: e - s)
+            for index in 0..<nbAttributes {
+                let base = index * 5
+                guard let name = attributes[base], attributes[base + 1] == nil,
+                      let s = attributes[base + 3], let e = attributes[base + 4], e > s else { continue }
+                if cstrEquals(name, "start") {
+                    currentStart = parseXMLTVDate(s, length: e - s)
+                } else if cstrEquals(name, "stop") {
+                    currentEnd = parseXMLTVDate(s, length: e - s)
+                } else if cstrEquals(name, "channel") {
+                    currentChannelID = decodeUTF8(s, length: e - s)
+                }
             }
             return
         }
@@ -214,7 +354,7 @@ nonisolated private final class XMLTVSAXContext: @unchecked Sendable {
                 inProgramme = false
                 field = .none
             }
-            guard let start = currentStart, let end = currentEnd else { return }
+            guard let start = currentStart, let end = currentEnd, !currentChannelID.isEmpty else { return }
             let title = trimmedUTF8String(titleBytes)
             let desc = trimmedUTF8String(descBytes)
             programs.append(
@@ -248,13 +388,13 @@ nonisolated private final class XMLTVSAXContext: @unchecked Sendable {
 
 // MARK: - Helpers
 
-/// Compare a libxml2 string against a Swift StaticString using memcmp.
-/// memcmp is SIMD-accelerated on Apple Silicon, beating a byte-by-byte loop
-/// for the 4–9 byte element names used in XMLTV.
+/// Check length before memcmp so short/unknown names never read beyond their
+/// terminating byte (including optional attributes in provider XML).
 @inline(__always)
 nonisolated private func cstrEquals(_ a: UnsafePointer<xmlChar>, _ b: StaticString) -> Bool {
     let bLen = b.utf8CodeUnitCount
-    return memcmp(a, b.utf8Start, bLen) == 0 && a[bLen] == 0
+    guard a[0] == b.utf8Start[0] else { return false }
+    return xmlStrlen(a) == bLen && memcmp(a, b.utf8Start, bLen) == 0
 }
 
 @inline(__always)
