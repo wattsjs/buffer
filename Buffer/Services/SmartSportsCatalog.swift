@@ -10,6 +10,8 @@ nonisolated struct SmartSportsCatalog: Sendable {
     /// Feed lookups happen once per feed on every rebuild; with automatic
     /// grouping there are thousands, so a linear scan becomes quadratic.
     private let feedIndex: [String: Int]
+    /// Ranking facts for every variant, feed-major, as flat columns.
+    private let rank: VariantRankColumns
 
     init(playlistID: String, name: String, feeds: [SmartSportsFeed],
          reviewItems: [SmartSportsReviewItem], overrides: SmartSportsOverrides) {
@@ -19,6 +21,7 @@ nonisolated struct SmartSportsCatalog: Sendable {
         self.reviewItems = reviewItems
         self.overrides = overrides
         feedIndex = Dictionary(feeds.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        rank = VariantRankColumns(feeds: feeds)
     }
 
     func feed(id: String) -> SmartSportsFeed? {
@@ -42,64 +45,114 @@ nonisolated struct SmartSportsCatalog: Sendable {
         overrides: SmartSportsOverrides = .init(),
         observations: [SmartSportsEndpointKey: SmartSportsObservation] = [:]
     ) -> Self {
-        var current: [SmartSportsEndpointKey: Channel] = [:]
+        // Current endpoints as one flat table: a key resolves to an index
+        // once, and seen/duplicate state and observations live in columns.
+        var endpointIndex: [SmartSportsEndpointKey: Int32] = [:]
+        var endpoints: [Channel] = []
         var sourceNames: [UUID: String] = [:]
-        var duplicateKeys: Set<SmartSportsEndpointKey> = []
+        let duplicate: UInt8 = 1, seen: UInt8 = 2
+        var endpointFlags: [UInt8] = []
+        let channelCount = snapshots.reduce(0) { $0 + $1.channels.count }
+        endpointIndex.reserveCapacity(channelCount); endpoints.reserveCapacity(channelCount)
+        endpointFlags.reserveCapacity(channelCount)
         for snapshot in snapshots {
             sourceNames[snapshot.sourceID] = snapshot.sourceName
             for channel in snapshot.channels {
                 let key = SmartSportsEndpointKey(sourceID: snapshot.sourceID,
                     nativeID: channel.sourceChannelIdentity?.nativeID ?? channel.id)
-                if current.updateValue(channel, forKey: key) != nil { duplicateKeys.insert(key) }
+                if let existing = endpointIndex[key] {
+                    // The latest row wins; the key is marked duplicate.
+                    endpoints[Int(existing)] = channel
+                    endpointFlags[Int(existing)] |= duplicate
+                } else {
+                    endpointIndex[key] = Int32(endpoints.count)
+                    endpoints.append(channel)
+                    endpointFlags.append(0)
+                }
             }
+        }
+        // Observations bound to an endpoint slot; one hash per observation.
+        var observationSlot = [Int32](repeating: -1, count: endpoints.count)
+        var observationList: [SmartSportsObservation] = []
+        for (key, observation) in observations {
+            guard let index = endpointIndex[key] else { continue }
+            observationSlot[Int(index)] = Int32(observationList.count)
+            observationList.append(observation)
+        }
+        var seenMissing: Set<SmartSportsEndpointKey> = []
+        func wasSeen(_ key: SmartSportsEndpointKey) -> Bool {
+            if let index = endpointIndex[key] { return endpointFlags[Int(index)] & seen != 0 }
+            return seenMissing.contains(key)
         }
         let held = Dictionary(definition.heldEndpoints.map { ($0.key, $0.reason) },
                               uniquingKeysWith: { first, _ in first })
-        var byFeed: [String: [SmartSportsVariant]] = [:]
+        // One bucket per distinct feed ID, addressed by slot rather than by
+        // hashing the feed ID for every endpoint.
+        var slotByFeedID: [String: Int] = [:]
+        slotByFeedID.reserveCapacity(definition.feeds.count + overrides.customFeeds.count)
+        for id in definition.feeds.map(\.id) + overrides.customFeeds.map(\.id) where slotByFeedID[id] == nil {
+            slotByFeedID[id] = slotByFeedID.count
+        }
+        var buckets = [[SmartSportsVariant]](repeating: [], count: slotByFeedID.count)
         var review: [SmartSportsEndpointKey: SmartSportsReviewItem] = [:]
-        var seenKeys: Set<SmartSportsEndpointKey> = []
-        let validFeedIDs = Set(definition.feeds.map(\.id) + overrides.customFeeds.map(\.id))
+        // Raw override keys are only built when some override is keyed by them.
+        let hasKeyedOverrides = !overrides.links.isEmpty || !overrides.rejectedEndpointKeys.isEmpty
+            || !overrides.acceptedIdentities.isEmpty
+        var rawPrefixes: [UUID: String] = [:]
+        func rawKey(_ key: SmartSportsEndpointKey) -> String {
+            if let prefix = rawPrefixes[key.sourceID] { return prefix + key.nativeID }
+            let prefix = key.sourceID.uuidString.lowercased() + "|"
+            rawPrefixes[key.sourceID] = prefix
+            return prefix + key.nativeID
+        }
 
-        func add(key: SmartSportsEndpointKey, feedID originalFeedID: String,
+        func add(key: SmartSportsEndpointKey, feedID originalFeedID: String, slot originalSlot: Int?,
                  expected: SmartSportsMetadataIdentity, sourceName: String,
                  advertisedFormat: String, advertisedFPS: Double?,
                  legacyObservation: SmartSportsObservation?) {
-            guard seenKeys.insert(key).inserted else { return }
-            let manualLink = overrides.links[key.rawValue]
+            let index = endpointIndex[key].map(Int.init)
+            if let index {
+                guard endpointFlags[index] & seen == 0 else { return }
+                endpointFlags[index] |= seen
+            } else {
+                guard seenMissing.insert(key).inserted else { return }
+            }
+            let raw = hasKeyedOverrides ? rawKey(key) : nil
+            let manualLink = raw.flatMap { overrides.links[$0] }
+            let accepted = raw.flatMap { overrides.acceptedIdentities[$0] }
             let feedID = manualLink?.feedID ?? originalFeedID
-            guard validFeedIDs.contains(feedID) else {
+            guard let slot = manualLink == nil ? (originalSlot ?? slotByFeedID[feedID]) : slotByFeedID[feedID] else {
                 review[key] = .init(key: key, feedID: nil, reason: "Manual destination is unavailable.",
                                     state: .heldForReview)
                 return
             }
-            let expectedIdentity = manualLink?.identity ?? overrides.acceptedIdentities[key.rawValue] ?? expected
-            let channel = current[key]
+            let expectedIdentity = manualLink?.identity ?? accepted ?? expected
+            let channel = index.map { endpoints[$0] }
             let state: SmartSportsMembershipState
             let reason: String?
-            if overrides.rejectedEndpointKeys.contains(key.rawValue) {
+            if let raw, overrides.rejectedEndpointKeys.contains(raw) {
                 state = .rejected; reason = "Excluded by your review."
-            } else if let heldReason = held[key], manualLink == nil {
+            } else if !held.isEmpty, let heldReason = held[key], manualLink == nil {
                 state = .heldForReview; reason = heldReason
-            } else if duplicateKeys.contains(key) {
+            } else if let index, endpointFlags[index] & duplicate != 0 {
                 state = .duplicateNativeID; reason = "Source returned this native ID more than once."
             } else if let channel {
                 if channel.contentType != .live || !expectedIdentity.matches(.init(channel: channel)) {
                     state = .changedIdentity
                     reason = "Name, group, guide binding or content type changed; review before using this endpoint."
                 } else {
-                    state = manualLink != nil || overrides.acceptedIdentities[key.rawValue] != nil
-                        ? .manuallyReviewed : .metadataCandidate
+                    state = manualLink != nil || accepted != nil ? .manuallyReviewed : .metadataCandidate
                     reason = nil
                 }
             } else {
                 state = .missing; reason = "Endpoint is absent from the current configured source."
             }
-            let observation: SmartSportsObservation? = observations[key].flatMap { observation in
-                guard let channel,
-                      observation.endpointFingerprint == endpointFingerprint(for: channel) else { return nil }
-                return observation
+            var observation: SmartSportsObservation?
+            if let index, let channel, observationSlot[index] >= 0 {
+                let candidate = observationList[Int(observationSlot[index])]
+                if candidate.endpointFingerprint == endpointFingerprint(for: channel) { observation = candidate }
             }
-            byFeed[feedID, default: []].append(.init(key: key, feedID: feedID,
+            buckets[slot].append(.init(key: key, feedID: feedID,
                 sourceName: sourceNames[key.sourceID] ?? sourceName,
                 expectedIdentity: expectedIdentity, physicalChannel: channel,
                 state: state, advertisedFormat: advertisedFormat, advertisedFPS: advertisedFPS,
@@ -110,6 +163,7 @@ nonisolated struct SmartSportsCatalog: Sendable {
         let dateParser = ISO8601DateFormatter()
         dateParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         for feed in definition.feeds {
+            let slot = slotByFeedID[feed.id]
             for variant in feed.variants {
                 // Legacy format data did not record endpoint revision or playback mode.
                 // Keep it visible as provenance, but never use it to rank current quality.
@@ -118,7 +172,7 @@ nonisolated struct SmartSportsCatalog: Sendable {
                     legacy = .init(observedAt: date, provenance: .legacyCachedFormat,
                                    width: variant.width, height: variant.height, fps: variant.fps)
                 } else { legacy = nil }
-                add(key: variant.key, feedID: feed.id, expected: variant.identity,
+                add(key: variant.key, feedID: feed.id, slot: slot, expected: variant.identity,
                     sourceName: variant.sourceName, advertisedFormat: variant.advertisedFormat,
                     advertisedFPS: variant.advertisedFPS, legacyObservation: legacy)
             }
@@ -127,11 +181,11 @@ nonisolated struct SmartSportsCatalog: Sendable {
         // preserve the reviewed metadata so later native-ID reuse is detected.
         for (rawKey, link) in overrides.links {
             guard let key = key(from: rawKey) else { continue }
-            add(key: key, feedID: link.feedID, expected: link.identity,
+            add(key: key, feedID: link.feedID, slot: nil, expected: link.identity,
                 sourceName: sourceNames[key.sourceID] ?? "Unavailable source",
                 advertisedFormat: "", advertisedFPS: nil, legacyObservation: nil)
         }
-        for (key, reason) in held where !seenKeys.contains(key) {
+        for (key, reason) in held where !wasSeen(key) {
             let rejected = overrides.rejectedEndpointKeys.contains(key.rawValue)
             review[key] = .init(key: key, feedID: nil,
                 reason: rejected ? "Excluded by your review. " + reason : reason,
@@ -141,12 +195,12 @@ nonisolated struct SmartSportsCatalog: Sendable {
         var feeds = definition.feeds.map { feed in
             SmartSportsFeed(id: feed.id, name: feed.name, country: feed.country,
                 language: feed.language, edition: feed.edition, guideStatus: feed.guideStatus,
-                caveats: feed.caveats, variants: byFeed[feed.id] ?? [])
+                caveats: feed.caveats, variants: buckets[slotByFeedID[feed.id]!])
         }
         feeds += overrides.customFeeds.map { feed in
             SmartSportsFeed(id: feed.id, name: feed.name, country: feed.country,
                 language: feed.language, edition: feed.edition, guideStatus: "Manual link",
-                caveats: [], variants: byFeed[feed.id] ?? [])
+                caveats: [], variants: buckets[slotByFeedID[feed.id]!])
         }
         return .init(playlistID: definition.playlistID, name: definition.name, feeds: feeds,
                      reviewItems: review.values.sorted { $0.id < $1.id }, overrides: overrides)
@@ -157,16 +211,12 @@ nonisolated struct SmartSportsCatalog: Sendable {
     }
 
     func selection(for feedID: String, context: SmartSportsSelectionContext = .init()) -> SmartSportsSelection? {
-        let candidates = variants(for: feedID).filter { isEligible($0, context: context) }
+        guard let index = feedIndex[feedID] else { return nil }
+        let variants = feeds[index].variants
+        let ranked = rankedVariants(feed: index, context: context)
+        guard let first = ranked.first else { return nil }
+        let selected = variants[first]
         let preferred = overrides.preferredVariants[feedID]
-        let ranked = candidates.sorted { lhs, rhs in
-            let lhsFailed = context.recentFailedEndpoints.contains(lhs.key)
-            let rhsFailed = context.recentFailedEndpoints.contains(rhs.key)
-            if lhsFailed != rhsFailed { return !lhsFailed }
-            if lhs.id == preferred || rhs.id == preferred { return lhs.id == preferred }
-            return ranksBefore(lhs, rhs, context: context)
-        }
-        guard let selected = ranked.first else { return nil }
         var reasons = [selected.id == preferred ? "Your source choice" : "Eligible current source"]
         if context.recentFailedEndpoints.contains(selected.key) {
             reasons.append("Recent source observation failed; no unfailed eligible alternative is known.")
@@ -190,8 +240,69 @@ nonisolated struct SmartSportsCatalog: Sendable {
             reasons.append(failed ? "Your preferred source recently failed; trying another eligible source. Preference retained."
                 : "Your preferred source is currently ineligible; preference retained.")
         }
-        return .init(feedID: feedID, selected: selected, alternatives: Array(ranked.dropFirst()),
+        return .init(feedID: feedID, selected: selected, alternatives: ranked.dropFirst().map { variants[$0] },
                      reasons: reasons, uncertainty: uncertainty)
+    }
+
+    /// The variant `selection(for:context:)` would pick, without building
+    /// its explanation; what a display pass over every feed needs.
+    func selectedVariant(for feedID: String, context: SmartSportsSelectionContext = .init()) -> SmartSportsVariant? {
+        guard let index = feedIndex[feedID] else { return nil }
+        return selectedVariant(feedAt: index, context: context)
+    }
+
+    /// `selectedVariant(for:)` by position in `feeds`; no lookup, no heap.
+    func selectedVariant(feedAt index: Int, context: SmartSportsSelectionContext = .init()) -> SmartSportsVariant? {
+        withRankedVariants(feed: index, context: context) { ranked in
+            ranked.first.map { feeds[index].variants[Int($0.offset)] }
+        }
+    }
+
+    private func rankedVariants(feed index: Int, context: SmartSportsSelectionContext) -> [Int] {
+        withRankedVariants(feed: index, context: context) { ranked in ranked.map { Int($0.offset) } }
+    }
+
+    /// One eligible candidate with everything its comparisons read.
+    private struct RankedCandidate {
+        var offset: Int32
+        var failed: Bool
+        var preferred: Bool
+        var facts: VariantRankColumns.Facts
+    }
+
+    /// Eligible variants of one feed, best first, in a stack buffer. The
+    /// comparator is the historical one over precomputed facts, and the
+    /// standard library sort orders the buffer exactly as it ordered the
+    /// variants themselves.
+    private func withRankedVariants<R>(feed index: Int, context: SmartSportsSelectionContext,
+                                       _ body: (UnsafeMutableBufferPointer<RankedCandidate>) -> R) -> R {
+        let feed = feeds[index]
+        let variants = feed.variants
+        let base = Int(rank.feedStart[index])
+        let now = context.now.timeIntervalSinceReferenceDate
+        let usefulHeight = Int32(clamping: max(1, context.usefulHeight))
+        let preferred = overrides.preferredVariants.isEmpty ? nil : overrides.preferredVariants[feed.id]
+        return withUnsafeTemporaryAllocation(of: RankedCandidate.self, capacity: max(1, variants.count)) { buffer in
+            var count = 0
+            for offset in variants.indices where isEligible(variants[offset], ordinal: base + offset, context: context) {
+                let failed = !context.recentFailedEndpoints.isEmpty && context.recentFailedEndpoints.contains(variants[offset].key)
+                let isPreferred = preferred != nil && variants[offset].id == preferred
+                (buffer.baseAddress! + count).initialize(to: RankedCandidate(
+                    offset: Int32(offset), failed: failed, preferred: isPreferred,
+                    facts: rank.facts(ordinal: base + offset, now: now, usefulHeight: usefulHeight)))
+                count += 1
+            }
+            var ranked = UnsafeMutableBufferPointer(rebasing: buffer[0..<count])
+            if count > 1 {
+                ranked.sort { l, r in
+                    if l.failed != r.failed { return !l.failed }
+                    if l.preferred || r.preferred { return l.preferred }
+                    return rank.ranksBefore(l.facts, r.facts, variants[Int(l.offset)].key, variants[Int(r.offset)].key)
+                }
+            }
+            defer { ranked.deinitialize() }
+            return body(ranked)
+        }
     }
 
     /// Guide choice has no dependency on which endpoint won playback selection.
@@ -199,32 +310,100 @@ nonisolated struct SmartSportsCatalog: Sendable {
     func guideSelection(for feedID: String,
                         programs: [SmartSportsEndpointKey: [EPGProgram]],
                         now: Date = Date()) -> SmartSportsGuideSelection? {
-        let preferred = overrides.preferredGuides[feedID]
-        let candidates = variants(for: feedID).compactMap { variant -> (SmartSportsVariant, SourceGuideBinding, [EPGProgram])? in
-            guard let binding = variant.guideBinding,
-                  !Self.isSuspiciousGuideID(binding.epgChannelID),
-                  let rows = programs[variant.key] else { return nil }
-            let matching = rows.filter {
-                $0.channelID == binding.epgChannelID && $0.end > $0.start
-                    && $0.start.timeIntervalSince1970.isFinite && $0.end.timeIntervalSince1970.isFinite
-                    && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }.sorted { $0.start < $1.start }
-            guard !matching.isEmpty else { return nil }
-            return (variant, binding, matching)
-        }.sorted { lhs, rhs in
-            if lhs.0.id == preferred || rhs.0.id == preferred { return lhs.0.id == preferred }
-            let lhsCurrent = lhs.2.contains { $0.start <= now && $0.end > now }
-            let rhsCurrent = rhs.2.contains { $0.start <= now && $0.end > now }
-            if lhsCurrent != rhsCurrent { return lhsCurrent }
-            let lhsFuture = lhs.2.filter { $0.end > now && $0.start < now.addingTimeInterval(24 * 3600) }.count
-            let rhsFuture = rhs.2.filter { $0.end > now && $0.start < now.addingTimeInterval(24 * 3600) }.count
-            if lhsFuture != rhsFuture { return lhsFuture > rhsFuture }
-            return lhs.0.id < rhs.0.id
+        guard let index = feedIndex[feedID] else { return nil }
+        let variants = feeds[index].variants
+        let preferred = overrides.preferredGuides.isEmpty ? nil : overrides.preferredGuides[feedID]
+        struct Candidate {
+            let offset: Int
+            let binding: SourceGuideBinding
+            let rows: [EPGProgram]
+            let isPreferred: Bool
+            let current: Bool
+            let upcoming: Int
         }
-        guard let result = candidates.first else { return nil }
-        let status = feed(id: feedID)?.guideStatus
-        return .init(key: result.0.key, binding: result.1, programs: result.2,
+        let nowValue = now.timeIntervalSinceReferenceDate
+        let horizon = now.addingTimeInterval(24 * 3600).timeIntervalSinceReferenceDate
+        var candidates: [Candidate] = []
+        for offset in variants.indices {
+            guard let binding = variants[offset].guideBinding,
+                  let rows = programs[variants[offset].key],
+                  !Self.isSuspiciousGuideID(binding.epgChannelID) else { continue }
+            let guide = Self.guideRows(rows, channelID: binding.epgChannelID, now: nowValue, horizon: horizon)
+            guard !guide.rows.isEmpty else { continue }
+            candidates.append(Candidate(offset: offset, binding: binding, rows: guide.rows,
+                isPreferred: preferred != nil && variants[offset].id == preferred,
+                current: guide.current, upcoming: guide.upcoming))
+        }
+        let best: Candidate?
+        if candidates.count <= 1 {
+            best = candidates.first
+        } else {
+            best = candidates.sorted { lhs, rhs in
+                if lhs.isPreferred || rhs.isPreferred { return lhs.isPreferred }
+                if lhs.current != rhs.current { return lhs.current }
+                if lhs.upcoming != rhs.upcoming { return lhs.upcoming > rhs.upcoming }
+                return Self.idPrecedes(variants[lhs.offset].key, variants[rhs.offset].key)
+            }.first
+        }
+        guard let result = best else { return nil }
+        let status = feeds[index].guideStatus
+        return .init(key: variants[result.offset].key, binding: result.binding, programs: result.rows,
                      timingNeedsReview: status == "Timing review" || status == "Schedule review")
+    }
+
+    /// Valid rows for one guide ID in start order, plus whether one is on
+    /// now and how many fall in the next day. Provider guides arrive valid
+    /// and sorted, so that case shares the original storage in one pass.
+    private static func guideRows(_ rows: [EPGProgram], channelID: String, now: Double, horizon: Double)
+        -> (rows: [EPGProgram], current: Bool, upcoming: Int) {
+        var current = false, upcoming = 0
+        var previous = -Double.infinity
+        var clean = true
+        for row in rows {
+            let start = row.start.timeIntervalSinceReferenceDate, end = row.end.timeIntervalSinceReferenceDate
+            guard row.channelID == channelID, end > start, start.isFinite, end.isFinite,
+                  hasVisibleText(row.title) else { clean = false; continue }
+            if start < previous { clean = false }
+            previous = start
+            if start <= now && end > now { current = true }
+            if end > now && start < horizon { upcoming += 1 }
+        }
+        if clean { return (rows, current, upcoming) }
+        var matching: [EPGProgram] = []
+        matching.reserveCapacity(rows.count)
+        var ordered = true
+        previous = -Double.infinity
+        for row in rows {
+            let start = row.start.timeIntervalSinceReferenceDate, end = row.end.timeIntervalSinceReferenceDate
+            guard row.channelID == channelID, end > start, start.isFinite, end.isFinite,
+                  hasVisibleText(row.title) else { continue }
+            if start < previous { ordered = false }
+            previous = start
+            matching.append(row)
+        }
+        return (ordered ? matching : matching.sorted { $0.start < $1.start }, current, upcoming)
+    }
+
+    /// `!title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty`.
+    private static func hasVisibleText(_ title: String) -> Bool {
+        let ascii = title.utf8.withContiguousStorageIfAvailable { bytes -> Bool? in
+            for b in bytes {
+                if b >= 0x80 { return nil }
+                if !(b == 0x20 || (b >= 0x09 && b <= 0x0D)) { return true }
+            }
+            return false
+        } ?? nil
+        if let ascii { return ascii }
+        return !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// `lhs.rawValue < rhs.rawValue` without building either string: the
+    /// lowercase UUID text is fixed-width, so it decides first.
+    static func idPrecedes(_ lhs: SmartSportsEndpointKey, _ rhs: SmartSportsEndpointKey) -> Bool {
+        if lhs.sourceID != rhs.sourceID {
+            return lhs.sourceID.uuidString.lowercased() < rhs.sourceID.uuidString.lowercased()
+        }
+        return lhs.nativeID < rhs.nativeID
     }
 
     static func key(from rawValue: String) -> SmartSportsEndpointKey? {
@@ -236,23 +415,59 @@ nonisolated struct SmartSportsCatalog: Sendable {
     }
 
     static func endpointFingerprint(for channel: Channel) -> String {
-        let digest = SHA256.hash(data: Data(channel.streamURL.absoluteString.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        HexDigest.string(SHA256.hash(data: Data(channel.streamURL.absoluteString.utf8)))
     }
 
     static func isSuspiciousGuideID(_ guideID: String) -> Bool {
+        let ascii = guideID.utf8.withContiguousStorageIfAvailable { g -> Bool? in
+            guard g.allSatisfy({ $0 < 0x80 && $0 != 0x0D }) else { return nil }
+            return suspiciousASCII(g)
+        } ?? nil
+        if let ascii { return ascii }
         let id = guideID.lowercased()
         return id.hasSuffix(".bossdummy") || id.hasSuffix(".p13")
             || id.hasPrefix("dummy") || id.hasPrefix("event:") || id.hasPrefix("stan/event")
             || id.contains("bosssports.") || id.hasSuffix(".ncaabgames1")
-            || id.range(of: "\\.v[0-9]*$", options: .regularExpression) != nil
+            || hasVersionSuffix(id)
     }
 
-    private func isEligible(_ variant: SmartSportsVariant, context: SmartSportsSelectionContext) -> Bool {
-        guard variant.isPlayable, let channel = variant.physicalChannel,
-              !context.unavailableSources.contains(variant.key.sourceID),
-              !context.unavailableEndpoints.contains(variant.key) else { return false }
-        if let observation = variant.observation, usableFormat(observation, now: context.now) {
+    private static let suspiciousSuffixes = [".bossdummy", ".p13", ".ncaabgames1"].map { Array($0.utf8) }
+    private static let suspiciousPrefixes = ["dummy", "event:", "stan/event"].map { Array($0.utf8) }
+    private static let suspiciousInfix = Array("bosssports.".utf8)
+
+    /// The same tests on lowercased ASCII bytes, without allocating.
+    private static func suspiciousASCII(_ g: UnsafeBufferPointer<UInt8>) -> Bool {
+        @inline(__always) func lower(_ b: UInt8) -> UInt8 { b >= 65 && b <= 90 ? b | 0x20 : b }
+        @inline(__always) func matches(_ pattern: [UInt8], at offset: Int) -> Bool {
+            guard offset >= 0, offset + pattern.count <= g.count else { return false }
+            for k in 0..<pattern.count where lower(g[offset + k]) != pattern[k] { return false }
+            return true
+        }
+        for suffix in suspiciousSuffixes where matches(suffix, at: g.count - suffix.count) { return true }
+        for prefix in suspiciousPrefixes where matches(prefix, at: 0) { return true }
+        if g.count >= suspiciousInfix.count {
+            for offset in 0...(g.count - suspiciousInfix.count) where matches(suspiciousInfix, at: offset) { return true }
+        }
+        var i = g.count
+        while i > 0, g[i - 1] >= 0x30, g[i - 1] <= 0x39 { i -= 1 }
+        return i >= 2 && lower(g[i - 1]) == UInt8(ascii: "v") && g[i - 2] == UInt8(ascii: ".")
+    }
+
+    /// `range(of: "\\.v[0-9]*$", options: .regularExpression) != nil` without
+    /// compiling a regex per call. Foundation anchors `$` at the very end.
+    private static func hasVersionSuffix(_ id: String) -> Bool {
+        var scalars = id.unicodeScalars.reversed().makeIterator()
+        var next = scalars.next()
+        while let digit = next, digit.value >= 0x30, digit.value <= 0x39 { next = scalars.next() }
+        return next == "v" && scalars.next() == "."
+    }
+
+    private func isEligible(_ variant: SmartSportsVariant, ordinal: Int, context: SmartSportsSelectionContext) -> Bool {
+        guard variant.isPlayable, let channel = variant.physicalChannel else { return false }
+        if !context.unavailableSources.isEmpty, context.unavailableSources.contains(variant.key.sourceID) { return false }
+        if !context.unavailableEndpoints.isEmpty, context.unavailableEndpoints.contains(variant.key) { return false }
+        if rank.hasUsableFormat(ordinal: ordinal, now: context.now.timeIntervalSinceReferenceDate),
+           let observation = variant.observation {
             if let codec = observation.videoCodec,
                context.unsupportedVideoCodecs.contains(codec.lowercased()) { return false }
             if observation.hdr == true && !context.supportsHDR { return false }
@@ -268,39 +483,122 @@ nonisolated struct SmartSportsCatalog: Sendable {
     private func usableFormat(_ observation: SmartSportsObservation, now: Date) -> Bool {
         observation.provenance != .legacyCachedFormat && observation.isFresh(now: now, maximumAge: 14 * 86400)
     }
+}
 
-    private func ranksBefore(_ lhs: SmartSportsVariant, _ rhs: SmartSportsVariant,
-                             context: SmartSportsSelectionContext) -> Bool {
-        let lhsReliability = lhs.observation?.reliabilityClass(now: context.now) ?? 1
-        let rhsReliability = rhs.observation?.reliabilityClass(now: context.now) ?? 1
-        if lhsReliability != rhsReliability { return lhsReliability > rhsReliability }
-        let lo = lhs.observation.flatMap { usableFormat($0, now: context.now) ? $0 : nil }
-        let ro = rhs.observation.flatMap { usableFormat($0, now: context.now) ? $0 : nil }
-        // Live delay in 3 s steps: a clearly closer live edge wins before
-        // picture quality; small measurement jitter does not reorder feeds.
-        let lhsDelay = lo?.liveDelaySeconds.flatMap { $0.isFinite && $0 >= 0 ? Int($0 / 3) : nil }
-        let rhsDelay = ro?.liveDelaySeconds.flatMap { $0.isFinite && $0 >= 0 ? Int($0 / 3) : nil }
-        if let lhsDelay, let rhsDelay, lhsDelay != rhsDelay { return lhsDelay < rhsDelay }
-        let lhsMotion = lo?.fps.flatMap { $0.isFinite && $0 > 0 ? min($0, 60) : nil }
-        let rhsMotion = ro?.fps.flatMap { $0.isFinite && $0 > 0 ? min($0, 60) : nil }
-        // Missing format stays explicitly unknown; it receives no invented FPS.
-        if lhsMotion != rhsMotion {
-            if let lhsMotion, let rhsMotion { return lhsMotion > rhsMotion }
-            return lhsMotion != nil
+/// Ranking facts for every catalog variant as flat columns, one row per
+/// variant in feed-major order. Built once per catalog; a selection reads a
+/// handful of integers per candidate instead of unwrapping observations and
+/// redoing date arithmetic in every comparison.
+nonisolated struct VariantRankColumns: Sendable {
+    /// Source ordinal in the upper 32 bits, catalog variant ordinal below,
+    /// so source checks never dereference the variant.
+    typealias Handle = UInt64
+
+    /// Context-resolved facts for one candidate; sentinels mean unknown
+    /// (delay/rate -1, motion/startup NaN, height 0).
+    struct Facts {
+        var reliability: Int8
+        var delay: Int
+        var motion: Double
+        var height: Int
+        var rate: Int
+        var startup: Double
+    }
+
+    private static let observed: UInt8 = 1, countsForReliability: UInt8 = 2, legacy: UInt8 = 4
+
+    private(set) var feedStart: [UInt32] = [0]
+    private(set) var handles: [Handle] = []
+    private var flags: [UInt8] = []
+    private var observedAt: [Double] = []
+    private var baseReliability: [Int8] = []
+    private var delayBucket: [Int] = []
+    private var motion: [Double] = []
+    private var height: [Int] = []
+    private var rateBucket: [Int] = []
+    private var startup: [Double] = []
+
+    init(feeds: [SmartSportsFeed]) {
+        let total = feeds.reduce(0) { $0 + $1.variants.count }
+        feedStart.reserveCapacity(feeds.count + 1)
+        handles.reserveCapacity(total); flags.reserveCapacity(total); observedAt.reserveCapacity(total)
+        baseReliability.reserveCapacity(total); delayBucket.reserveCapacity(total); motion.reserveCapacity(total)
+        height.reserveCapacity(total); rateBucket.reserveCapacity(total); startup.reserveCapacity(total)
+        var sourceOrdinals: [UUID: UInt64] = [:]
+        for feed in feeds {
+            for variant in feed.variants {
+                let source: UInt64
+                if let known = sourceOrdinals[variant.key.sourceID] { source = known } else {
+                    source = UInt64(sourceOrdinals.count)
+                    sourceOrdinals[variant.key.sourceID] = source
+                }
+                handles.append(source << 32 | UInt64(handles.count))
+                guard let o = variant.observation else {
+                    flags.append(0); observedAt.append(.nan); baseReliability.append(1)
+                    delayBucket.append(-1); motion.append(.nan); height.append(0); rateBucket.append(-1); startup.append(.nan)
+                    continue
+                }
+                var f = Self.observed
+                if o.provenance != .formatProbe && o.provenance != .legacyCachedFormat { f |= Self.countsForReliability }
+                if o.provenance == .legacyCachedFormat { f |= Self.legacy }
+                flags.append(f)
+                observedAt.append(o.observedAt.timeIntervalSinceReferenceDate)
+                // `reliabilityClass` once freshness is established.
+                var reliability: Int8 = 1
+                if o.failures > 0 || o.stalledSeconds > 3 { reliability = 0 }
+                else if let dropped = o.droppedFrames, let rendered = o.renderedFrames, rendered > 0,
+                        Double(dropped) / Double(rendered) > 0.02 { reliability = 0 }
+                else if o.provenance == .passivePlayback && o.playedSeconds >= 180 && o.stalledSeconds <= 0.5 { reliability = 2 }
+                baseReliability.append(reliability)
+                // Live delay in 3 s steps, bitrate in 2 Mb/s steps.
+                delayBucket.append(o.liveDelaySeconds.flatMap { $0.isFinite && $0 >= 0 ? Int($0 / 3) : nil } ?? -1)
+                motion.append(o.fps.flatMap { $0.isFinite && $0 > 0 ? min($0, 60) : nil } ?? .nan)
+                height.append(o.height.flatMap { $0 > 0 ? $0 : nil } ?? 0)
+                rateBucket.append(o.bitRate.flatMap { $0 > 0 ? Int(min($0, 40_000_000) / 2_000_000) : nil } ?? -1)
+                startup.append(o.startupSeconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil } ?? .nan)
+            }
+            feedStart.append(UInt32(handles.count))
         }
-        let lhsHeight = lo?.height.flatMap { $0 > 0 ? min($0, max(1, context.usefulHeight)) : nil }
-        let rhsHeight = ro?.height.flatMap { $0 > 0 ? min($0, max(1, context.usefulHeight)) : nil }
-        if lhsHeight != rhsHeight {
-            if let lhsHeight, let rhsHeight { return lhsHeight > rhsHeight }
-            return lhsHeight != nil
-        }
-        // Same resolution: higher bitrate in 2 Mb/s steps.
-        let lhsRate = lo?.bitRate.flatMap { $0 > 0 ? Int(min($0, 40_000_000) / 2_000_000) : nil }
-        let rhsRate = ro?.bitRate.flatMap { $0 > 0 ? Int(min($0, 40_000_000) / 2_000_000) : nil }
-        if let lhsRate, let rhsRate, lhsRate != rhsRate { return lhsRate > rhsRate }
-        let lhsStartup = lo?.startupSeconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        let rhsStartup = ro?.startupSeconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        if let lhsStartup, let rhsStartup, lhsStartup != rhsStartup { return lhsStartup < rhsStartup }
-        return lhs.id < rhs.id
+    }
+
+    @inline(__always) private static func fresh(_ age: Double, _ maximum: Double) -> Bool {
+        age >= -60 && age <= maximum
+    }
+
+    /// Observation present, not legacy, and at most 14 days old.
+    func hasUsableFormat(ordinal o: Int, now: Double) -> Bool {
+        flags[o] & Self.observed != 0 && flags[o] & Self.legacy == 0 && Self.fresh(now - observedAt[o], 14 * 86400)
+    }
+
+    func facts(ordinal o: Int, now: Double, usefulHeight: Int32) -> Facts {
+        var result = Facts(reliability: 1, delay: -1, motion: .nan, height: 0, rate: -1, startup: .nan)
+        let f = flags[o]
+        guard f & Self.observed != 0 else { return result }
+        let age = now - observedAt[o]
+        if f & Self.countsForReliability != 0 && Self.fresh(age, 24 * 3600) { result.reliability = baseReliability[o] }
+        guard f & Self.legacy == 0, Self.fresh(age, 14 * 86400) else { return result }
+        result.delay = delayBucket[o]
+        result.motion = motion[o]
+        result.height = height[o] > 0 ? min(height[o], Int(usefulHeight)) : 0
+        result.rate = rateBucket[o]
+        result.startup = startup[o]
+        return result
+    }
+
+    /// Reliability, then a clearly closer live edge, motion, useful height,
+    /// bitrate and startup; missing measurements never receive invented
+    /// values, and the endpoint ID breaks ties.
+    func ranksBefore(_ l: Facts, _ r: Facts, _ lk: SmartSportsEndpointKey, _ rk: SmartSportsEndpointKey) -> Bool {
+        if l.reliability != r.reliability { return l.reliability > r.reliability }
+        if l.delay >= 0, r.delay >= 0, l.delay != r.delay { return l.delay < r.delay }
+        let lm = !l.motion.isNaN, rm = !r.motion.isNaN
+        if lm != rm { return lm }
+        if lm, l.motion != r.motion { return l.motion > r.motion }
+        let lh = l.height > 0, rh = r.height > 0
+        if lh != rh { return lh }
+        if lh, l.height != r.height { return l.height > r.height }
+        if l.rate >= 0, r.rate >= 0, l.rate != r.rate { return l.rate > r.rate }
+        if !l.startup.isNaN, !r.startup.isNaN, l.startup != r.startup { return l.startup < r.startup }
+        return SmartSportsCatalog.idPrecedes(lk, rk)
     }
 }

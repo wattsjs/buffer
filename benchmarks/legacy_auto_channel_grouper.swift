@@ -1,5 +1,8 @@
 import Foundation
 
+// Frozen copy of AutoChannelGrouper before the data-oriented rewrite: the equivalence
+// oracle for smart_channels_benchmark.swift (-D LEGACY_ORACLE). Not shipped.
+
 /// Groups the same broadcast channel across configured sources into Smart
 /// feeds, so one row plays whichever account currently has the best stream.
 /// Pure metadata grouping: candidates still pass the catalog's identity,

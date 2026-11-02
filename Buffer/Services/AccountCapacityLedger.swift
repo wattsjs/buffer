@@ -29,9 +29,16 @@ extension SourceAccountKey {
             return
         }
         let bytes = (try? JSONEncoder().encode(fields)) ?? Data()
-        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
-        self.init(opaqueValue: "account:" + digest)
+        var hex: [UInt8] = []
+        hex.reserveCapacity(64)
+        for byte in SHA256.hash(data: bytes) {
+            hex.append(Self.hexDigits[Int(byte >> 4)])
+            hex.append(Self.hexDigits[Int(byte & 0xF)])
+        }
+        self.init(opaqueValue: "account:" + String(decoding: hex, as: UTF8.self))
     }
+
+    nonisolated private static let hexDigits = Array("0123456789abcdef".utf8)
 
     nonisolated private static func canonicalEndpoint(_ raw: String) -> String? {
         guard var components = URLComponents(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
