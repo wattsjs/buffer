@@ -126,8 +126,15 @@ nonisolated struct StreamProbe: Codable, Hashable, Sendable {
     var passivePlaybackEvidence: PassivePlaybackEvidence?
 
     static func endpointFingerprint(for url: URL) -> String {
-        SHA256.hash(data: Data(url.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined()
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for byte in SHA256.hash(data: Data(url.absoluteString.utf8)) {
+            out.append(hexDigits[Int(byte >> 4)])
+            out.append(hexDigits[Int(byte & 0xF)])
+        }
+        return String(decoding: out, as: UTF8.self)
     }
+    private static let hexDigits = Array("0123456789abcdef".utf8)
 
     var resolutionLabel: String {
         guard width > 0, height > 0 else { return "" }

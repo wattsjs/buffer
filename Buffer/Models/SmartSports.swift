@@ -20,15 +20,84 @@ nonisolated struct SmartSportsMetadataIdentity: Codable, Hashable, Sendable {
     }
 
     func matches(_ other: Self) -> Bool {
-        Self.normalized(name) == Self.normalized(other.name)
-            && Self.normalized(group) == Self.normalized(other.group)
-            && epgChannelID?.trimmingCharacters(in: .whitespacesAndNewlines)
-                == other.epgChannelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.sameNormalized(name, other.name) && Self.sameNormalized(group, other.group)
+            && Self.sameTrimmedGuide(epgChannelID, other.epgChannelID)
     }
 
     private static func normalized(_ value: String) -> String {
         value.precomposedStringWithCompatibilityMapping.lowercased()
             .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    /// Byte classes for plain ASCII, from the same predicates the String
+    /// path uses: bit 0 `Character.isWhitespace`, bit 1 whitespacesAndNewlines.
+    private static let asciiSpace: [UInt8] = (0..<128).map { value in
+        let scalar = Unicode.Scalar(UInt8(value))
+        return (Character(scalar).isWhitespace ? 1 : 0) | (CharacterSet.whitespacesAndNewlines.contains(scalar) ? 2 : 0)
+    }
+
+    /// `normalized(a) == normalized(b)` without allocating: compares
+    /// lowercased whitespace-separated tokens of plain-ASCII text in place.
+    static func sameNormalized(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        let fast = a.utf8.withContiguousStorageIfAvailable { x in
+            b.utf8.withContiguousStorageIfAvailable { y -> Bool? in
+                guard x.allSatisfy({ $0 < 0x80 }), y.allSatisfy({ $0 < 0x80 }) else { return nil }
+                var i = 0, j = 0
+                let n = x.count, m = y.count
+                @inline(__always) func space(_ c: UInt8) -> Bool { asciiSpace[Int(c)] & 1 != 0 }
+                @inline(__always) func lower(_ c: UInt8) -> UInt8 { c >= 65 && c <= 90 ? c | 0x20 : c }
+                while true {
+                    while i < n, space(x[i]) { i += 1 }
+                    while j < m, space(y[j]) { j += 1 }
+                    if i == n || j == m { return i == n && j == m }
+                    while i < n, j < m, !space(x[i]), !space(y[j]) {
+                        if lower(x[i]) != lower(y[j]) { return false }
+                        i += 1; j += 1
+                    }
+                    let xEnd = i == n || space(x[i]), yEnd = j == m || space(y[j])
+                    if xEnd != yEnd { return false }
+                }
+            } ?? nil
+        } ?? nil
+        if let fast { return fast }
+        return normalized(a) == normalized(b)
+    }
+
+    /// Optional guide IDs equal after trimming whitespace and newlines.
+    static func sameTrimmedGuide(_ a: String?, _ b: String?) -> Bool {
+        guard let a, let b else { return a == nil && b == nil }
+        if a == b { return true }
+        let fast = a.utf8.withContiguousStorageIfAvailable { x in
+            b.utf8.withContiguousStorageIfAvailable { y -> Bool? in
+                guard x.allSatisfy({ $0 < 0x80 && $0 != 0x0D }), y.allSatisfy({ $0 < 0x80 && $0 != 0x0D }) else { return nil }
+                @inline(__always) func trim(_ z: UnsafeBufferPointer<UInt8>) -> Range<Int> {
+                    var lo = 0, hi = z.count
+                    while lo < hi, asciiSpace[Int(z[lo])] & 2 != 0 { lo += 1 }
+                    while hi > lo, asciiSpace[Int(z[hi - 1])] & 2 != 0 { hi -= 1 }
+                    return lo..<hi
+                }
+                let rx = trim(x), ry = trim(y)
+                return rx.count == ry.count && zip(rx, ry).allSatisfy { x[$0] == y[$1] }
+            } ?? nil
+        } ?? nil
+        if let fast { return fast }
+        return a.trimmingCharacters(in: .whitespacesAndNewlines) == b.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Lowercase hex of a digest without per-byte `String(format:)`.
+nonisolated enum HexDigest {
+    private static let digits = Array("0123456789abcdef".utf8)
+
+    static func string<D: Sequence>(_ bytes: D) -> String where D.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in bytes {
+            out.append(digits[Int(b >> 4)])
+            out.append(digits[Int(b & 0xF)])
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 }
 

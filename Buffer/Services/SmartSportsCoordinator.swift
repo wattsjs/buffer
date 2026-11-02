@@ -32,9 +32,9 @@ final class SmartSportsCoordinator {
     @ObservationIgnored private var curatedDefinition: SmartSportsDefinition?
     @ObservationIgnored private let autoDiscovery: (@Sendable (SmartAutoDiscoveryRequest) async -> SmartAutoDiscoveryResult)?
     static let autoAggregationKey = "smartAutoAggregation"
-    /// Grouping depends only on channel lists, never on guide data, so a
-    /// guide-only refresh reuses the previous discovery.
-    @ObservationIgnored private var autoDiscoveryCache: (signature: Int, result: SmartAutoDiscoveryResult)?
+    /// Bumped by every rebuild; a detached rebuild publishes only if no
+    /// newer one started while it ran.
+    @ObservationIgnored private var rebuildGeneration: UInt64 = 0
 
     static let automaticBase = SmartSportsDefinition(schemaVersion: 1, playlistID: playlistID,
         name: "Smart Channels", provenance: "Automatic cross-account grouping", feeds: [], heldEndpoints: [])
@@ -66,33 +66,15 @@ final class SmartSportsCoordinator {
         return changed
     }
 
-    /// Source caches may have changed while Smart was inactive.
-    func invalidateAutoDiscovery() { autoDiscoveryCache = nil }
+    /// Discovery runs on every refresh (it is a flat linear pass), so there
+    /// is no memo to invalidate; kept for callers that signal source changes.
+    func invalidateAutoDiscovery() {}
 
     /// Saves the filter; the caller refreshes so feeds regroup under it.
     func setFilter(_ next: SmartChannelFilter) {
         guard next != filter else { return }
         filter = next
         next.save()
-        autoDiscoveryCache = nil
-    }
-
-    private static func discoverySignature(configurations: [ServerConfig], activeConfig: ServerConfig?,
-                                           activeChannels: [Channel]) -> Int {
-        var hasher = Hasher()
-        for config in configurations {
-            hasher.combine(config.id)
-            hasher.combine(config.password.isEmpty ? "" : DataCache.cacheKey(for: config))
-        }
-        hasher.combine(activeConfig.map { DataCache.cacheKey(for: $0) })
-        hasher.combine(activeChannels.count)
-        for channel in activeChannels {
-            hasher.combine(channel.id)
-            hasher.combine(channel.name)
-            hasher.combine(channel.group)
-            hasher.combine(channel.streamURL)
-        }
-        return hasher.finalize()
     }
     @ObservationIgnored private var state = SmartSportsCatalogStore.State()
     @ObservationIgnored private var loadedSources: [UUID: SmartSportsLoadedSource] = [:]
@@ -151,21 +133,9 @@ final class SmartSportsCoordinator {
             guard epoch == refreshEpoch, !Task.isCancelled, let curated = curatedDefinition else { return }
             if let autoDiscovery, UserDefaults.standard.object(forKey: Self.autoAggregationKey) as? Bool ?? true {
                 let curatedKeys = Set(curated.feeds.flatMap { $0.variants.map(\.key) } + curated.heldEndpoints.map(\.key))
-                var signatureHasher = Hasher()
-                signatureHasher.combine(Self.discoverySignature(configurations: configurations,
-                    activeConfig: activeConfig, activeChannels: activeChannels))
-                signatureHasher.combine((try? JSONEncoder().encode(filter)) ?? Data())
-                let signature = signatureHasher.finalize()
-                let discovered: SmartAutoDiscoveryResult
-                if let cached = autoDiscoveryCache, cached.signature == signature {
-                    discovered = cached.result
-                    PerfMetrics.shared.increment("smart.autoDiscovery.reused")
-                } else {
-                    discovered = await autoDiscovery(.init(configurations: configurations, activeConfig: activeConfig,
-                        activeChannels: activeChannels, curatedKeys: curatedKeys, filter: filter))
-                    guard epoch == refreshEpoch, !Task.isCancelled else { return }
-                    autoDiscoveryCache = (signature, discovered)
-                }
+                let discovered = await autoDiscovery(.init(configurations: configurations, activeConfig: activeConfig,
+                    activeChannels: activeChannels, curatedKeys: curatedKeys, filter: filter))
+                guard epoch == refreshEpoch, !Task.isCancelled else { return }
                 configurations = discovered.resolvedConfigurations
                 if !discovered.inventory.isEmpty { regionInventory = discovered.inventory }
                 definition = SmartSportsDefinition(schemaVersion: curated.schemaVersion, playlistID: curated.playlistID,
@@ -196,7 +166,7 @@ final class SmartSportsCoordinator {
                 return DataCache.cacheKey(for: current) == DataCache.cacheKey(for: loaded.config)
             }
             sourceIssues = [:]
-            if loadedSources.count != previousSourceCount { rebuild() }
+            if loadedSources.count != previousSourceCount { await rebuildDetached() }
             let allowed = Set(definition.feeds.flatMap { $0.variants.map(\.key) }
                 + definition.heldEndpoints.map(\.key)
                 + state.overrides.links.keys.compactMap { SmartSportsCatalog.key(from: $0) })
@@ -209,7 +179,7 @@ final class SmartSportsCoordinator {
                 }.value
                 guard epoch == refreshEpoch, !Task.isCancelled else { return }
                 loadedSources[activeConfig.id] = active
-                rebuild()
+                await rebuildDetached()
             }
             let result = await snapshotLoader(.init(configurations: configurations,
                 definition: definition, overrides: state.overrides, activeConfig: activeConfig,
@@ -250,7 +220,8 @@ final class SmartSportsCoordinator {
                 errorMessage = usedWarm ? "Some source caches could not refresh. Showing their last available listings."
                     : "Some sources are unavailable. Refresh their original playlists to load current data."
             }
-            rebuild()
+            await rebuildDetached()
+            guard epoch == refreshEpoch, !Task.isCancelled else { return }
             isLoading = false
         } catch {
             guard epoch == refreshEpoch, !Task.isCancelled else { return }
@@ -517,7 +488,7 @@ final class SmartSportsCoordinator {
             let latest = try await store.load()
             // Do not replace local override edits that may be in flight.
             state.observations = latest.observations
-            rebuild()
+            await rebuildDetached()
         } catch { errorMessage = "Playback observation could not be saved." }
     }
 
@@ -526,7 +497,7 @@ final class SmartSportsCoordinator {
     }
 
     private func persistOverrides() async {
-        rebuild()
+        await rebuildDetached()
         let overrides = state.overrides
         do { try await store.save(overrides: overrides) }
         catch { errorMessage = "Your Smart Channels review could not be saved." }
@@ -537,26 +508,6 @@ final class SmartSportsCoordinator {
     func refreshObservationsIfNeeded() {
         guard let version = probeVersion?(), version != observedProbeVersion else { return }
         rebuild()
-    }
-
-    /// Saved observations plus current endpoint-bound probe and passive
-    /// playback measurements; the newer of the two wins per endpoint.
-    private func currentObservations(sources: [SmartSportsLoadedSource]) -> [SmartSportsEndpointKey: SmartSportsObservation] {
-        var merged = state.keyedObservations
-        guard let probeLookup else { return merged }
-        observedProbeVersion = probeVersion?()
-        let now = Date()
-        for source in sources {
-            for channel in source.snapshot.channels {
-                guard let key = channel.sourceChannelIdentity, let probe = probeLookup(channel),
-                      probe.endpointFingerprint == StreamProbe.endpointFingerprint(for: channel.streamURL),
-                      var observation = Self.observation(from: probe, now: now) else { continue }
-                if let stored = merged[key], stored.observedAt >= observation.observedAt { continue }
-                observation.endpointFingerprint = SmartSportsCatalog.endpointFingerprint(for: channel)
-                merged[key] = observation
-            }
-        }
-        return merged
     }
 
     nonisolated static func observation(from probe: StreamProbe, now: Date) -> SmartSportsObservation? {
@@ -586,46 +537,129 @@ final class SmartSportsCoordinator {
         return observation
     }
 
+    /// Everything a rebuild reads, captured on the main actor in one cheap
+    /// pass so the heavy work can run anywhere.
+    nonisolated struct RebuildInput: Sendable {
+        let definition: SmartSportsDefinition
+        let sources: [SmartSportsLoadedSource]
+        let overrides: SmartSportsOverrides
+        let storedObservations: [String: SmartSportsObservation]
+        /// Current probe records per loaded endpoint, not yet bound to an
+        /// endpoint revision (fingerprinting happens off the main actor).
+        let probes: [(channel: Channel, probe: StreamProbe)]
+        let filter: SmartChannelFilter
+    }
+
+    nonisolated struct RebuildOutput: Sendable {
+        let catalog: SmartSportsCatalog
+        let channels: [Channel]
+        let displayed: [String: [EPGProgram]]
+        let observationsMs: Double
+        let reconcileMs: Double
+        let totalMs: Double
+    }
+
+    /// Rebuilds synchronously; for callers that act on the result at once
+    /// (a play request right after new measurements).
     private func rebuild() {
-        guard let definition else { return }
-        let rebuildStarted = ContinuousClock.now
+        guard let input = rebuildInput() else { return }
+        rebuildGeneration &+= 1
+        publish(Self.build(input))
+    }
+
+    /// Rebuilds off the main actor and publishes unless a newer rebuild
+    /// started meanwhile. The main actor only captures inputs and assigns.
+    private func rebuildDetached() async {
+        guard let input = rebuildInput() else { return }
+        rebuildGeneration &+= 1
+        let generation = rebuildGeneration
+        let output = await Task.detached(priority: .userInitiated) { Self.build(input) }.value
+        guard generation == rebuildGeneration else { return }
+        publish(output)
+    }
+
+    private func rebuildInput() -> RebuildInput? {
+        guard let definition else { return nil }
         let sources = loadedSources.values.sorted { $0.config.id.uuidString < $1.config.id.uuidString }
-        let observations = currentObservations(sources: sources)
-        let observationsMs = PerfMetrics.milliseconds(since: rebuildStarted)
-        let catalog = definition.reconcile(snapshots: sources.map(\.snapshot),
-            overrides: state.overrides, observations: observations)
-        let reconcileMs = PerfMetrics.milliseconds(since: rebuildStarted) - observationsMs
-        defer {
-            let totalMs = PerfMetrics.milliseconds(since: rebuildStarted)
-            PerfMetrics.shared.record("smart.rebuild.totalMs", totalMs)
-            AppLog.sync.info("Smart rebuild feeds=\(catalog.feeds.count, privacy: .public) observationsMs=\(Int(observationsMs), privacy: .public) reconcileMs=\(Int(reconcileMs), privacy: .public) totalMs=\(Int(totalMs), privacy: .public)")
+        var probes: [(channel: Channel, probe: StreamProbe)] = []
+        if let probeLookup {
+            observedProbeVersion = probeVersion?()
+            for source in sources {
+                for channel in source.snapshot.channels where channel.sourceChannelIdentity != nil {
+                    if let probe = probeLookup(channel) { probes.append((channel, probe)) }
+                }
+            }
         }
+        return RebuildInput(definition: definition, sources: sources, overrides: state.overrides,
+                            storedObservations: state.observations, probes: probes, filter: filter)
+    }
+
+    private func publish(_ output: RebuildOutput) {
+        PerfMetrics.shared.record("smart.rebuild.totalMs", output.totalMs)
+        AppLog.sync.info("Smart rebuild feeds=\(output.catalog.feeds.count, privacy: .public) observationsMs=\(Int(output.observationsMs), privacy: .public) reconcileMs=\(Int(output.reconcileMs), privacy: .public) totalMs=\(Int(output.totalMs), privacy: .public)")
+        catalog = output.catalog
+        displayedChannels = output.channels
+        displayedPrograms = output.displayed
+        revision &+= 1
+        onChange?()
+    }
+
+    /// Saved observations plus current endpoint-bound probe and passive
+    /// playback measurements; the newer of the two wins per endpoint.
+    nonisolated static func currentObservations(_ input: RebuildInput, now: Date = Date())
+        -> [SmartSportsEndpointKey: SmartSportsObservation] {
+        var merged = SmartSportsCatalogStore.State(observations: input.storedObservations).keyedObservations
+        for (channel, probe) in input.probes {
+            guard let key = channel.sourceChannelIdentity, let recorded = probe.endpointFingerprint else { continue }
+            // One digest serves both checks: the probe's endpoint binding and
+            // the observation's revision are the same stream URL digest.
+            let fingerprint = StreamProbe.endpointFingerprint(for: channel.streamURL)
+            guard recorded == fingerprint, var observation = observation(from: probe, now: now) else { continue }
+            if let stored = merged[key], stored.observedAt >= observation.observedAt { continue }
+            observation.endpointFingerprint = fingerprint
+            merged[key] = observation
+        }
+        return merged
+    }
+
+    nonisolated static func build(_ input: RebuildInput) -> RebuildOutput {
+        let started = ContinuousClock.now
+        let observations = currentObservations(input)
+        let observationsMs = PerfMetrics.milliseconds(since: started)
+        let catalog = input.definition.reconcile(snapshots: input.sources.map(\.snapshot),
+            overrides: input.overrides, observations: observations)
+        let reconcileMs = PerfMetrics.milliseconds(since: started) - observationsMs
+        var programsBySource: [UUID: [String: [EPGProgram]]] = [:]
+        for source in input.sources { programsBySource[source.config.id] = source.programs }
         var byEndpoint: [SmartSportsEndpointKey: [EPGProgram]] = [:]
         for feed in catalog.feeds {
             for variant in feed.variants {
                 guard let guideID = variant.physicalChannel?.epgChannelID else { continue }
-                byEndpoint[variant.key] = loadedSources[variant.key.sourceID]?.programs[guideID] ?? []
+                byEndpoint[variant.key] = programsBySource[variant.key.sourceID]?[guideID] ?? []
             }
         }
         var channels: [Channel] = []
         var displayed: [String: [EPGProgram]] = [:]
-        for feed in catalog.feeds {
-            let category = AutoChannelGrouper.isAutomatic(feedID: feed.id) ? feed.edition : "Sports"
-            guard filter.allows(region: feed.country, category: category) else { continue }
+        let now = Date()
+        for (index, feed) in catalog.feeds.enumerated() {
+            let automatic = AutoChannelGrouper.isAutomatic(feedID: feed.id)
+            let category = automatic ? feed.edition : "Sports"
+            guard input.filter.allows(region: feed.country, category: category) else { continue }
             // Display existing endpoints even when a capacity budget is busy;
             // the action and media owner perform the actual reservation gate.
-            guard let selected = catalog.selection(for: feed.id)?.selected,
+            guard let selected = catalog.selectedVariant(feedAt: index, context: .init(now: now)),
                   let physical = selected.physicalChannel,
                   let ownership = physical.sourceOwnership else { continue }
-            let guide = catalog.guideSelection(for: feed.id, programs: byEndpoint)
+            let guide = catalog.guideSelection(for: feed.id, programs: byEndpoint, now: now)
             let lookupKey = "smart-guide:" + feed.id
             if let guide {
+                let prefix = guide.key.rawValue + "|"
                 displayed[lookupKey] = guide.programs.map { program in
-                    EPGProgram(id: guide.key.rawValue + "|" + program.id, channelID: lookupKey,
+                    EPGProgram(id: prefix + program.id, channelID: lookupKey,
                         title: program.title, description: program.description, start: program.start, end: program.end)
                 }
             }
-            let group = AutoChannelGrouper.isAutomatic(feedID: feed.id) ? "\(feed.country) | \(feed.edition)" : "\(feed.country) | Sports"
+            let group = automatic ? "\(feed.country) | \(feed.edition)" : "\(feed.country) | Sports"
             channels.append(Channel(id: feed.id, name: feed.name, logoURL: physical.logoURL,
                 group: group, streamURL: physical.streamURL,
                 epgChannelID: lookupKey,
@@ -637,10 +671,8 @@ final class SmartSportsCoordinator {
                 sourceOwnership: .init(channelIdentity: ownership.channelIdentity, accountKey: ownership.accountKey,
                     logicalChannelID: feed.id, guideBinding: guide?.binding ?? ownership.guideBinding)))
         }
-        self.catalog = catalog
-        displayedChannels = channels
-        displayedPrograms = displayed
-        revision &+= 1
-        onChange?()
+        return RebuildOutput(catalog: catalog, channels: channels, displayed: displayed,
+                             observationsMs: observationsMs, reconcileMs: reconcileMs,
+                             totalMs: PerfMetrics.milliseconds(since: started))
     }
 }

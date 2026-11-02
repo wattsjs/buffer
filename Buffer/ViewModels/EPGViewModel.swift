@@ -447,23 +447,27 @@ class EPGViewModel {
         refreshAccountCapacityForProbing()
         let preferred = Set(recentChannelIDs).union(favoriteChannelIDs)
         let filtering = smartSports.filter.isEnabled
-        let ordered = catalog.feeds.sorted { lhs, rhs in
-            let l = preferred.contains(lhs.id), r = preferred.contains(rhs.id)
-            if l != r { return l }
-            let ls = !AutoChannelGrouper.isAutomatic(feedID: lhs.id) || lhs.edition == "Sports"
-            let rs = !AutoChannelGrouper.isAutomatic(feedID: rhs.id) || rhs.edition == "Sports"
-            return ls && !rs
+        // Preferred sport, other preferred, other sport, the rest; catalog
+        // order within each class. One class byte per feed, computed once,
+        // instead of hashing feed IDs in every sort comparison.
+        let feeds = catalog.feeds
+        var classes = [UInt8](repeating: 0, count: feeds.count)
+        for (index, feed) in feeds.enumerated() {
+            let sporting = !AutoChannelGrouper.isAutomatic(feedID: feed.id) || feed.edition == "Sports"
+            classes[index] = (preferred.contains(feed.id) ? 0 : 2) + (sporting ? 0 : 1)
         }
         var requested = 0
-        for feed in ordered {
-            let sporting = !AutoChannelGrouper.isAutomatic(feedID: feed.id) || feed.edition == "Sports"
-            guard preferred.contains(feed.id) || sporting || filtering else { continue }
-            for variant in feed.availableVariants {
-                guard let channel = variant.physicalChannel else { continue }
-                StreamProbeService.shared.requestProbe(for: channel, priority: .utility)
-                requested += 1
+        requesting: for rank in UInt8(0)...3 {
+            for index in feeds.indices where classes[index] == rank {
+                // Classes 0-2 are preferred or sporting; the rest need a filter.
+                guard rank < 3 || filtering else { continue }
+                for variant in feeds[index].availableVariants {
+                    guard let channel = variant.physicalChannel else { continue }
+                    StreamProbeService.shared.requestProbe(for: channel, priority: .utility)
+                    requested += 1
+                }
+                if requested >= 600 { break requesting }
             }
-            if requested >= 600 { break }
         }
         PerfMetrics.shared.record("probe.smartRequested", Double(requested))
     }
