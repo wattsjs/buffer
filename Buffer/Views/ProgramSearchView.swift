@@ -1,15 +1,5 @@
 import SwiftUI
 
-nonisolated struct ProgramSearchEntry: Sendable {
-    let id: String
-    let epgID: String
-    let programIndex: Int
-    let channelID: String
-    let titleLower: String
-    let start: Date
-    let end: Date
-}
-
 nonisolated struct ChannelSearchEntry: Sendable {
     let channel: Channel
     let nameLower: String
@@ -58,10 +48,12 @@ final class ProgramSearchController {
     var vodResults: [VODSearchResult] = []
     var isSearching: Bool = false
 
-    private var programEntries: [ProgramSearchEntry] = []
-    private var programStore: [String: [EPGProgram]] = [:]
+    private var programIndex = ProgramSearchIndex()
+    /// Index guide slot -> position in `channelList`, or -1 when the guide's
+    /// channel is not in the current channel list. Rebuilt per index update.
+    private var programSlotChannel: [Int32] = []
+    private var channelList: [Channel] = []
     private var channelEntries: [ChannelSearchEntry] = []
-    private var channelByID: [String: Channel] = [:]
     private var vodEntries: [VODSearchEntry] = []
     private var currentTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
@@ -75,15 +67,21 @@ final class ProgramSearchController {
     }
 
     func updateIndex(
-        programs: [ProgramSearchEntry],
-        programStore: [String: [EPGProgram]],
+        programs: ProgramSearchIndex,
+        programStore: [String: [EPGProgram]] = [:],
         channels: [Channel],
         vodItems: [VODItem],
         vodSeries: [VODSeries]
     ) {
-        self.programEntries = programs
-        self.programStore = programStore
-        self.channelByID = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // `programStore` is retained by the index itself; kept for callers.
+        self.programIndex = programs
+        self.channelList = channels
+        var positionByID: [String: Int32] = [:]
+        positionByID.reserveCapacity(channels.count)
+        for (position, channel) in channels.enumerated() where positionByID[channel.id] == nil {
+            positionByID[channel.id] = Int32(position)
+        }
+        self.programSlotChannel = programs.channelIDs.map { positionByID[$0] ?? -1 }
         self.channelEntries = channels.map {
             ChannelSearchEntry(channel: $0, nameLower: $0.name.lowercased())
         }
@@ -149,87 +147,33 @@ final class ProgramSearchController {
             return
         }
 
-        let programSnapshot = programEntries
-        let programStoreSnapshot = programStore
+        let programIndexSnapshot = programIndex
+        let slotChannelSnapshot = programSlotChannel
+        let channelListSnapshot = channelList
         let channelSnapshot = channelEntries
-        let channelByIDSnapshot = channelByID
         let vodSnapshot = vodEntries
         let now = Date()
 
-        currentTask = Task.detached(priority: .userInitiated) { [trimmed, programSnapshot, programStoreSnapshot, channelSnapshot, channelByIDSnapshot, vodSnapshot, now] in
+        currentTask = Task.detached(priority: .userInitiated) { [trimmed, programIndexSnapshot, slotChannelSnapshot, channelListSnapshot, channelSnapshot, vodSnapshot, now] in
             let tokens = trimmed
                 .split(whereSeparator: { $0 == " " || $0 == "\t" })
                 .map(String.init)
 
             // MARK: Program matches
-            var programHits: [ProgramSearchResult] = []
-            programHits.reserveCapacity(256)
-
-            var checkCounter = 0
-            for entry in programSnapshot {
-                checkCounter += 1
-                if checkCounter & 4095 == 0, Task.isCancelled { return }
-
-                let title = entry.titleLower
-                var allMatch = true
-                for token in tokens {
-                    if !title.contains(token) {
-                        allMatch = false
-                        break
-                    }
-                }
-                if !allMatch { continue }
-
-                var score: Double = 0
-                if title.hasPrefix(trimmed) {
-                    score += 120
-                } else if title.contains(trimmed) {
-                    score += 70
-                } else {
-                    score += 10
-                }
-
-                let start = entry.start
-                let end = entry.end
-                guard let channel = channelByIDSnapshot[entry.channelID] else { continue }
-                if start <= now && end > now {
-                    score += 80
-                } else if start > now {
-                    let minutes = start.timeIntervalSince(now) / 60
-                    if minutes < 24 * 60 {
-                        score += 40 - (minutes / (24 * 60)) * 40
-                    } else if minutes < 7 * 24 * 60 {
-                        score += 4
-                    }
-                } else {
-                    score -= 40
-                }
-
-                guard let p = Self.program(for: entry, in: programStoreSnapshot) else { continue }
-                programHits.append(ProgramSearchResult(program: p, channel: channel, score: score))
-            }
-
+            let normalized = ProgramSearchIndex.normalize(trimmed)
+            let hits = programIndexSnapshot.search(
+                phrase: Array(normalized.utf8),
+                tokens: normalized.split(whereSeparator: { $0 == " " || $0 == "\t" }).map { Array($0.utf8) },
+                now: now,
+                slotChannel: slotChannelSnapshot
+            )
             if Task.isCancelled { return }
-            programHits.sort { lhs, rhs in
-                if lhs.score != rhs.score { return lhs.score > rhs.score }
-                let lFuture = lhs.program.end > now
-                let rFuture = rhs.program.end > now
-                if lFuture != rFuture { return lFuture }
-                if lFuture {
-                    return lhs.program.start < rhs.program.start
-                } else {
-                    return lhs.program.start > rhs.program.start
-                }
-            }
-            var seenProgramIDs = Set<String>()
-            seenProgramIDs.reserveCapacity(min(programHits.count, 300))
             var cappedPrograms: [ProgramSearchResult] = []
-            cappedPrograms.reserveCapacity(min(programHits.count, 300))
-            for hit in programHits {
-                if cappedPrograms.count >= 300 { break }
-                if seenProgramIDs.insert(hit.id).inserted {
-                    cappedPrograms.append(hit)
-                }
+            cappedPrograms.reserveCapacity(hits.count)
+            for hit in hits {
+                let (program, slot) = programIndexSnapshot.program(ordinal: Int(hit.ordinal))
+                let channel = channelListSnapshot[Int(slotChannelSnapshot[slot])]
+                cappedPrograms.append(ProgramSearchResult(program: program, channel: channel, score: hit.score))
             }
 
             // MARK: Channel matches
@@ -304,18 +248,6 @@ final class ProgramSearchController {
                 self.isSearching = false
             }
         }
-    }
-
-    nonisolated private static func program(
-        for entry: ProgramSearchEntry,
-        in store: [String: [EPGProgram]]
-    ) -> EPGProgram? {
-        guard let programs = store[entry.epgID] else { return nil }
-        if programs.indices.contains(entry.programIndex) {
-            let candidate = programs[entry.programIndex]
-            if candidate.id == entry.id { return candidate }
-        }
-        return programs.first { $0.id == entry.id }
     }
 }
 

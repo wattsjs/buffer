@@ -18,6 +18,7 @@ nonisolated enum PlaybackValidation { static let isEnabled = false }
     var version: Int { 0 }
     func requestProbe(for channel: Channel, priority: TaskPriority = .utility) {}
     func retryQueuedProbes() {}
+    var onCapacityStatusStale: (@MainActor (SourceAccountKey) -> Void)?
 }
 @MainActor final class PlayerSlot {
     func configureLiveAlternatives(_ channels: [Channel], resolver: ((SourceChannelIdentity) -> Channel?)? = nil) {}
@@ -83,15 +84,6 @@ nonisolated enum ServerPasswordStore {
         }
     }
     static func deletePasswordAsync(for id: UUID) async -> Bool { deletePassword(for: id) }
-}
-nonisolated struct ProgramSearchEntry: Sendable {
-    let id: String
-    let epgID: String
-    let programIndex: Int
-    let channelID: String
-    let titleLower: String
-    let start: Date
-    let end: Date
 }
 nonisolated enum DataCache {
     struct CachedChannels: Sendable { let savedAt: Date; let channels: [Channel] }
