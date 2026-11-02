@@ -221,14 +221,14 @@ final class MPVPlayer {
     @ObservationIgnored private var startupTargetHold: StartupTargetHold?
     @ObservationIgnored private var pendingStartupLoad: (path: String, generation: Int)?
     @ObservationIgnored private var startupPauseConfirmedGeneration: Int?
-    private(set) var telemetryCachePauseInitial: Bool?
-    private(set) var telemetryCachePauseWaitSeconds: Double?
+    @ObservationIgnored private(set) var telemetryCachePauseInitial: Bool?
+    @ObservationIgnored private(set) var telemetryCachePauseWaitSeconds: Double?
     @ObservationIgnored private var loadProbeOptions = MPVLoadProbeOptions.baseline
     var liveAnalysisEnabled: Bool { loadProbeOptions.liveAnalysisRequestedSeconds != nil }
     var liveAnalysisRequestedSeconds: Double? { loadProbeOptions.liveAnalysisRequestedSeconds }
-    private(set) var telemetryLavfAnalyzeDurationSeconds: Double?
-    private(set) var telemetryLavfProbeSize: Int64?
-    private(set) var telemetryLavfProbeInfo: String?
+    @ObservationIgnored private(set) var telemetryLavfAnalyzeDurationSeconds: Double?
+    @ObservationIgnored private(set) var telemetryLavfProbeSize: Int64?
+    @ObservationIgnored private(set) var telemetryLavfProbeInfo: String?
     @ObservationIgnored private var startupPhases = MPVStartupPhases()
     var telemetryStartupPhaseTimingsMilliseconds: [String: Double] { startupPhases.timingsMilliseconds }
     @ObservationIgnored private var rawTimeSample = PlaybackClockSample()
@@ -284,11 +284,11 @@ final class MPVPlayer {
     var telemetryBufferingMilliseconds: Int {
         bufferingTotalMilliseconds + (bufferingStartedAt.map { AppLog.elapsedMilliseconds(since: $0) } ?? 0)
     }
-    private(set) var telemetryAudioOutput: String?
-    private(set) var telemetryDemuxerStartTime: Double?
-    private(set) var telemetryAVSyncSeconds: Double?
-    private(set) var telemetryPause: Bool?
-    private(set) var telemetryPausedForCache: Bool?
+    @ObservationIgnored private(set) var telemetryAudioOutput: String?
+    @ObservationIgnored private(set) var telemetryDemuxerStartTime: Double?
+    @ObservationIgnored private(set) var telemetryAVSyncSeconds: Double?
+    @ObservationIgnored private(set) var telemetryPause: Bool?
+    @ObservationIgnored private(set) var telemetryPausedForCache: Bool?
     /// Owner intent, independent of cache, thumbnail, and system suspension.
     var wantsPlayback: Bool { playbackRequested }
     private(set) var ownerPlaybackIntentRevision: UInt64 = 0
@@ -372,8 +372,8 @@ final class MPVPlayer {
         isSeekable && duration > 0
     }
 
-    private var containerFps: Double = 0
-    private var estimatedFps: Double = 0
+    @ObservationIgnored private var containerFps: Double = 0
+    @ObservationIgnored private var estimatedFps: Double = 0
 
     private var handle: OpaquePointer?
     private(set) var renderContext: OpaquePointer?
@@ -409,8 +409,8 @@ final class MPVPlayer {
     @ObservationIgnored private var itemLifecycle = MPVItemLifecycle() {
         didSet { renderTarget.update(itemIdentity: itemLifecycle.loadedIdentity) }
     }
-    @ObservationIgnored private var propertyRequestSerial: UInt64 = 0
-    @ObservationIgnored private var propertyRequests: [UInt64: (generation: Int, item: MPVItemLifecycle.Identity?, property: PropID)] = [:]
+    /// Outstanding async property reads: fixed ring indexed by serial & mask.
+    @ObservationIgnored private var propertyRequests = MPVPropertyRequestRing()
     @ObservationIgnored private var firstRenderedLoadGeneration = 0
     @ObservationIgnored private var displayPowerAssertion = IOPMAssertionID(0)
     @ObservationIgnored private var holdsDisplayPowerAssertion = false
@@ -1159,36 +1159,39 @@ final class MPVPlayer {
             return
         }
 
-        // Observe playback + media-info properties
-        mpv_observe_property(newHandle, PropID.pause.rawValue, "pause", MPV_FORMAT_FLAG)
-        mpv_observe_property(newHandle, PropID.width.rawValue, "width", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.height.rawValue, "height", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.fps.rawValue, "container-fps", MPV_FORMAT_DOUBLE)
-        mpv_observe_property(newHandle, PropID.estimatedFps.rawValue, "estimated-vf-fps", MPV_FORMAT_DOUBLE)
-        mpv_observe_property(newHandle, PropID.videoCodec.rawValue, "video-codec", MPV_FORMAT_STRING)
-        mpv_observe_property(newHandle, PropID.audioCodec.rawValue, "audio-codec", MPV_FORMAT_STRING)
-        mpv_observe_property(newHandle, PropID.audioChannels.rawValue, "audio-params/channel-count", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.audioSampleRate.rawValue, "audio-params/samplerate", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.hwdec.rawValue, "hwdec-current", MPV_FORMAT_STRING)
-        mpv_observe_property(newHandle, PropID.pausedForCache.rawValue, "paused-for-cache", MPV_FORMAT_FLAG)
-        mpv_observe_property(newHandle, PropID.cacheSeconds.rawValue, "demuxer-cache-duration", MPV_FORMAT_DOUBLE)
-        mpv_observe_property(newHandle, PropID.volume.rawValue, "volume", MPV_FORMAT_DOUBLE)
-        mpv_observe_property(newHandle, PropID.mute.rawValue, "mute", MPV_FORMAT_FLAG)
-        mpv_observe_property(newHandle, PropID.timePos.rawValue, "time-pos", MPV_FORMAT_DOUBLE)
+        // Observe playback + media-info properties. Userdata is the
+        // MPVProperty raw value, which indexes the flat dispatch batch.
+        assert(MPV_FORMAT_STRING.rawValue == MPVFormatCode.string && MPV_FORMAT_FLAG.rawValue == MPVFormatCode.flag
+               && MPV_FORMAT_INT64.rawValue == MPVFormatCode.int64 && MPV_FORMAT_DOUBLE.rawValue == MPVFormatCode.double)
+        mpv_observe_property(newHandle, MPVProperty.pause.userdata, "pause", MPV_FORMAT_FLAG)
+        mpv_observe_property(newHandle, MPVProperty.width.userdata, "width", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.height.userdata, "height", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.fps.userdata, "container-fps", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.estimatedFps.userdata, "estimated-vf-fps", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.videoCodec.userdata, "video-codec", MPV_FORMAT_STRING)
+        mpv_observe_property(newHandle, MPVProperty.audioCodec.userdata, "audio-codec", MPV_FORMAT_STRING)
+        mpv_observe_property(newHandle, MPVProperty.audioChannels.userdata, "audio-params/channel-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.audioSampleRate.userdata, "audio-params/samplerate", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.hwdec.userdata, "hwdec-current", MPV_FORMAT_STRING)
+        mpv_observe_property(newHandle, MPVProperty.pausedForCache.userdata, "paused-for-cache", MPV_FORMAT_FLAG)
+        mpv_observe_property(newHandle, MPVProperty.cacheSeconds.userdata, "demuxer-cache-duration", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.volume.userdata, "volume", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.mute.userdata, "mute", MPV_FORMAT_FLAG)
+        mpv_observe_property(newHandle, MPVProperty.timePos.userdata, "time-pos", MPV_FORMAT_DOUBLE)
         // Some library versions expose an independent video clock. Unsupported
         // video-pts remains unavailable, never an alias of time-pos.
-        mpv_observe_property(newHandle, PropID.videoPTS.rawValue, "video-pts", MPV_FORMAT_DOUBLE)
-        mpv_observe_property(newHandle, PropID.duration.rawValue, "duration", MPV_FORMAT_DOUBLE)
-        mpv_observe_property(newHandle, PropID.seekable.rawValue, "seekable", MPV_FORMAT_FLAG)
-        mpv_observe_property(newHandle, PropID.videoBitrate.rawValue, "video-bitrate", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.audioBitrate.rawValue, "audio-bitrate", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.frameDrops.rawValue, "frame-drop-count", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.decoderFrameDrops.rawValue, "decoder-frame-drop-count", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.delayedFrames.rawValue, "vo-delayed-frame-count", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.mistimedFrames.rawValue, "mistimed-frame-count", MPV_FORMAT_INT64)
-        mpv_observe_property(newHandle, PropID.audioOutput.rawValue, "current-ao", MPV_FORMAT_STRING)
-        mpv_observe_property(newHandle, PropID.avSync.rawValue, "avsync", MPV_FORMAT_DOUBLE)
-        mpv_observe_property(newHandle, PropID.demuxerStartTime.rawValue, "demuxer-start-time", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.videoPTS.userdata, "video-pts", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.duration.userdata, "duration", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.seekable.userdata, "seekable", MPV_FORMAT_FLAG)
+        mpv_observe_property(newHandle, MPVProperty.videoBitrate.userdata, "video-bitrate", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.audioBitrate.userdata, "audio-bitrate", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.frameDrops.userdata, "frame-drop-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.decoderFrameDrops.userdata, "decoder-frame-drop-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.delayedFrames.userdata, "vo-delayed-frame-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.mistimedFrames.userdata, "mistimed-frame-count", MPV_FORMAT_INT64)
+        mpv_observe_property(newHandle, MPVProperty.audioOutput.userdata, "current-ao", MPV_FORMAT_STRING)
+        mpv_observe_property(newHandle, MPVProperty.avSync.userdata, "avsync", MPV_FORMAT_DOUBLE)
+        mpv_observe_property(newHandle, MPVProperty.demuxerStartTime.userdata, "demuxer-start-time", MPV_FORMAT_DOUBLE)
         startEventPump(handle: newHandle)
         startCacheFloorTimer()
 
@@ -1279,9 +1282,8 @@ final class MPVPlayer {
 
         let source = DispatchSource.makeReadSource(fileDescriptor: readFD, queue: .main)
         source.setEventHandler { [weak self] in
-            var drain = [UInt8](repeating: 0, count: 64)
-            _ = drain.withUnsafeMutableBufferPointer {
-                read(readFD, $0.baseAddress, $0.count)
+            withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 64) { buffer in
+                _ = read(readFD, buffer.baseAddress, buffer.count)
             }
             self?.drainEvents()
         }
@@ -1301,39 +1303,42 @@ final class MPVPlayer {
     private func drainEvents() {
         defer { completeBackendTeardownIfIdle() }
         guard let handle else { return }
-        var pending = PendingChanges()
+        // One stack-resident SoA batch per wakeup; a reset clears two masks.
+        var pending = MPVPropertyBatch()
+        // Monotonic receipt time, read at most once per wakeup.
+        var uptime = Double.nan
         while true {
             let evtPtr = mpv_wait_event(handle, 0)
             guard let evt = evtPtr?.pointee else {
-                applyPendingChanges(pending)
+                applyPendingChanges(&pending, uptime: &uptime)
                 return
             }
             switch evt.event_id {
             case MPV_EVENT_NONE:
-                applyPendingChanges(pending)
+                applyPendingChanges(&pending, uptime: &uptime)
                 return
             case MPV_EVENT_SHUTDOWN:
-                applyPendingChanges(pending)
+                applyPendingChanges(&pending, uptime: &uptime)
                 return
             case MPV_EVENT_PROPERTY_CHANGE:
-                if let property = PropID(rawValue: evt.reply_userdata),
+                if let property = MPVProperty.from(userdata: evt.reply_userdata),
                    property.isHandleProperty || itemLifecycle.activeIdentity != nil,
                    let prop = evt.data?.assumingMemoryBound(to: mpv_event_property.self).pointee {
-                    collectProperty(id: evt.reply_userdata, prop: prop, into: &pending)
+                    collectProperty(property, prop: prop, into: &pending, uptime: &uptime)
                 }
             case MPV_EVENT_GET_PROPERTY_REPLY:
-                if let request = propertyRequests.removeValue(forKey: evt.reply_userdata),
+                if let request = propertyRequests.remove(requestID: evt.reply_userdata),
                    playbackControl.acceptsLoad(request.generation),
                    request.property.isHandleProperty || itemLifecycle.acceptsProperty(for: request.item),
                    let prop = evt.data?.assumingMemoryBound(to: mpv_event_property.self).pointee {
-                    collectProperty(id: request.property.rawValue, prop: prop, into: &pending)
+                    collectProperty(request.property, prop: prop, into: &pending, uptime: &uptime)
                 }
             case MPV_EVENT_COMMAND_REPLY:
                 if let completion = itemLifecycle.complete(
                     requestID: evt.reply_userdata,
                     playlistEntryID: Self.playlistEntryID(from: evt)
                 ) {
-                    pending = PendingChanges()
+                    pending.reset()
                     if let loaded = completion.loaded { handleFileLoaded(identity: loaded) }
                     if let ended = completion.ended { handleCurrentItemEnded(ended) }
                     if evt.error < 0, completion.request.generation == loadGeneration,
@@ -1366,7 +1371,7 @@ final class MPVPlayer {
                 }
                 startTargetLoadIfPauseConfirmed()
             case MPV_EVENT_START_FILE:
-                pending = PendingChanges()
+                pending.reset()
                 if let start = evt.data?.assumingMemoryBound(to: mpv_event_start_file.self).pointee {
                     itemLifecycle.started(playlistEntryID: start.playlist_entry_id)
                     if let identity = itemLifecycle.activeIdentity {
@@ -1377,12 +1382,12 @@ final class MPVPlayer {
                 }
             case MPV_EVENT_FILE_LOADED:
                 if let loaded = itemLifecycle.loaded() {
-                    applyPendingChanges(pending)
+                    applyPendingChanges(&pending, uptime: &uptime)
                     handleFileLoaded(identity: loaded)
                 }
-                pending = PendingChanges()
+                pending.reset()
             case MPV_EVENT_END_FILE:
-                pending = PendingChanges()
+                pending.reset()
                 if let end = evt.data?.assumingMemoryBound(to: mpv_event_end_file.self).pointee {
                     handleEndFileEvent(end)
                 }
@@ -1720,352 +1725,151 @@ final class MPVPlayer {
         guard let seconds = telemetryExactCacheSeconds else { return }
         maintainLiveCacheFloor(cacheSeconds: seconds)
     }
-    private enum PropID: UInt64 {
-        case pause = 1
-        case width
-        case height
-        case fps
-        case estimatedFps
-        case videoCodec
-        case audioCodec
-        case audioChannels
-        case audioSampleRate
-        case hwdec
-        case pausedForCache
-        case cacheSeconds
-        case volume
-        case mute
-        case timePos
-        case videoPTS
-        case duration
-        case seekable
-        case videoBitrate
-        case audioBitrate
-        case frameDrops
-        case decoderFrameDrops
-        case delayedFrames
-        case mistimedFrames
-        case audioOutput
-        case avSync
-        case demuxerStartTime
-        case cachePauseInitial
-        case cachePauseWait
-        case lavfAnalyzeDuration
-        case lavfProbeSize
-        case lavfProbeInfo
-
-        var isHandleProperty: Bool {
-            switch self {
-            case .pause, .volume, .mute: true
-            default: false
-            }
-        }
+    @inline(__always) private func receiptTime(_ uptime: inout Double) -> Double {
+        if uptime.isNaN { uptime = ProcessInfo.processInfo.systemUptime }
+        return uptime
     }
 
-    private struct PendingChanges {
-        var isPlaying: Bool?
-        var paused: Bool?
-        var pausedForCache: Bool?
-        var width: Int?
-        var height: Int?
-        var containerFps: Double?
-        var estimatedFps: Double?
-        var videoCodec: String?
-        var audioCodec: String?
-        var audioChannels: Int?
-        var audioSampleRate: Int?
-        var hwdec: String?
-        var cacheSeconds: Double??
-        var isBuffering: Bool?
-        var volume: Double?
-        var isMuted: Bool?
-        var timePos: Double?
-        var duration: Double?
-        var isSeekable: Bool?
-        var videoBitrateBps: Int64?
-        var audioBitrateBps: Int64?
-        var frameDrops: Int64?
-        var decoderFrameDrops: Int64?
-        var delayedFrames: Int64?
-        var mistimedFrames: Int64?
-        var audioOutput: String??
-        var avSync: Double??
-        var demuxerStartTime: Double??
-        var cachePauseInitial: Bool??
-        var cachePauseWaitSeconds: Double??
-        var lavfAnalyzeDurationSeconds: Double??
-        var lavfProbeSize: Int64??
-        var lavfProbeInfo: String??
-
-        var hasChanges: Bool {
-            isPlaying != nil ||
-            paused != nil ||
-            pausedForCache != nil ||
-            width != nil ||
-            height != nil ||
-            containerFps != nil ||
-            estimatedFps != nil ||
-            videoCodec != nil ||
-            audioCodec != nil ||
-            audioChannels != nil ||
-            audioSampleRate != nil ||
-            hwdec != nil ||
-            cacheSeconds != nil ||
-            isBuffering != nil ||
-            volume != nil ||
-            isMuted != nil ||
-            timePos != nil ||
-            duration != nil ||
-            isSeekable != nil ||
-            videoBitrateBps != nil ||
-            audioBitrateBps != nil ||
-            frameDrops != nil ||
-            decoderFrameDrops != nil ||
-            delayedFrames != nil ||
-            mistimedFrames != nil ||
-            audioOutput != nil ||
-            avSync != nil ||
-            demuxerStartTime != nil ||
-            cachePauseInitial != nil ||
-            cachePauseWaitSeconds != nil ||
-            lavfAnalyzeDurationSeconds != nil || lavfProbeSize != nil || lavfProbeInfo != nil
-        }
-    }
-
-    private func collectProperty(id: UInt64, prop: mpv_event_property, into pending: inout PendingChanges) {
-        guard let kind = PropID(rawValue: id) else { return }
-        switch kind {
-        case .pause:
-            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
-                let paused = data.assumingMemoryBound(to: Int32.self).pointee != 0
-                pending.paused = paused
-                pending.isPlaying = !paused
-            }
-        case .width:
-            pending.width = readInt(prop)
-        case .height:
-            pending.height = readInt(prop)
-        case .fps:
-            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
-                pending.containerFps = data.assumingMemoryBound(to: Double.self).pointee
-            } else {
-                pending.containerFps = 0
-            }
-        case .estimatedFps:
-            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
-                pending.estimatedFps = data.assumingMemoryBound(to: Double.self).pointee
-            } else {
-                pending.estimatedFps = 0
-            }
-        case .videoCodec:
-            pending.videoCodec = readString(prop)
-        case .audioCodec:
-            pending.audioCodec = readString(prop)
-        case .audioChannels:
-            pending.audioChannels = readInt(prop)
-        case .audioSampleRate:
-            pending.audioSampleRate = max(0, readInt(prop))
-        case .hwdec:
-            pending.hwdec = readString(prop)
-        case .pausedForCache:
-            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
-                let paused = data.assumingMemoryBound(to: Int32.self).pointee != 0
-                pending.pausedForCache = paused
-                pending.isBuffering = paused
-            }
-        case .cacheSeconds:
-            pending.cacheSeconds = .some(readFiniteDouble(prop))
-        case .volume:
-            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
-                pending.volume = data.assumingMemoryBound(to: Double.self).pointee
-            }
-        case .mute:
-            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
-                pending.isMuted = data.assumingMemoryBound(to: Int32.self).pointee != 0
-            }
+    /// Decodes one payload into the flat batch. The two playback clocks are
+    /// sampled at receipt; everything else is coalesced until the drain ends.
+    @inline(__always)
+    private func collectProperty(_ property: MPVProperty, prop: mpv_event_property,
+                                 into pending: inout MPVPropertyBatch, uptime: inout Double) {
+        let format = UInt32(truncatingIfNeeded: prop.format.rawValue)
+        let data = UnsafeRawPointer(prop.data)
+        switch property {
         case .timePos:
-            let value = readFiniteDouble(prop)
-            rawTimeSample.observe(value, generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)
-            pending.timePos = value
+            rawTimeSample.observe(MPVPropertyBatch.finiteDouble(format: format, data: data),
+                                  generation: loadGeneration, at: receiptTime(&uptime))
         case .videoPTS:
-            videoPTSSample.observe(readFiniteDouble(prop), generation: loadGeneration,
-                                   at: ProcessInfo.processInfo.systemUptime)
-        case .duration:
-            if prop.format == MPV_FORMAT_DOUBLE, let data = prop.data {
-                pending.duration = data.assumingMemoryBound(to: Double.self).pointee
-            }
-        case .seekable:
-            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
-                pending.isSeekable = data.assumingMemoryBound(to: Int32.self).pointee != 0
-            }
-        case .videoBitrate:
-            pending.videoBitrateBps = readInt64(prop)
-        case .audioBitrate:
-            pending.audioBitrateBps = readInt64(prop)
-        case .frameDrops:
-            pending.frameDrops = readInt64(prop)
-        case .decoderFrameDrops:
-            pending.decoderFrameDrops = readInt64(prop)
-        case .delayedFrames:
-            pending.delayedFrames = readInt64(prop)
-        case .mistimedFrames:
-            pending.mistimedFrames = readInt64(prop)
-        case .audioOutput:
-            let value = readString(prop)
-            pending.audioOutput = .some(value.isEmpty ? nil : value)
-        case .avSync:
-            pending.avSync = .some(readFiniteDouble(prop))
-        case .demuxerStartTime:
-            pending.demuxerStartTime = .some(readFiniteDouble(prop))
-        case .cachePauseInitial:
-            if prop.format == MPV_FORMAT_FLAG, let data = prop.data {
-                pending.cachePauseInitial = .some(data.assumingMemoryBound(to: Int32.self).pointee != 0)
-            } else { pending.cachePauseInitial = .some(nil) }
-        case .cachePauseWait:
-            pending.cachePauseWaitSeconds = .some(readFiniteDouble(prop).flatMap { $0 >= 0 ? $0 : nil })
-        case .lavfAnalyzeDuration:
-            pending.lavfAnalyzeDurationSeconds = .some(readFiniteDouble(prop).flatMap { $0 >= 0 ? $0 : nil })
-        case .lavfProbeSize:
-            let value = readInt64(prop)
-            pending.lavfProbeSize = .some(prop.format == MPV_FORMAT_INT64 && prop.data != nil && value > 0 ? value : nil)
-        case .lavfProbeInfo:
-            let value = readString(prop)
-            pending.lavfProbeInfo = .some(["auto", "yes", "no", "nostreams"].contains(value) ? value : nil)
+            videoPTSSample.observe(MPVPropertyBatch.finiteDouble(format: format, data: data),
+                                   generation: loadGeneration, at: receiptTime(&uptime))
+        default:
+            break
         }
+        pending.collect(property, format: format, data: data)
     }
 
+    /// Publishes one drain's coalesced changes. Each observed property is
+    /// written only when its value actually changed (by its epsilon), so
+    /// SwiftUI observers invalidate only for changed fields. Hot comparisons
+    /// read the @Observable backing storage to avoid registrar access calls.
+    private func applyPendingChanges(_ batch: inout MPVPropertyBatch, uptime: inout Double) {
+        guard !batch.isEmpty else { return }
 
-    private func applyPendingChanges(_ pending: PendingChanges) {
-        guard pending.hasChanges else { return }
-
-        if let isPlaying = pending.isPlaying {
-            setState(\.isPlaying, isPlaying)
+        if batch.has(.pause) {
+            let paused = batch.flag(.pause)
+            if _isPlaying == paused { isPlaying = !paused }
         }
-        if let paused = pending.paused { telemetryPause = paused }
-        if let pausedForCache = pending.pausedForCache { telemetryPausedForCache = pausedForCache }
-        if let audioOutput = pending.audioOutput { telemetryAudioOutput = audioOutput }
-        if let avSync = pending.avSync { telemetryAVSyncSeconds = avSync }
-        if let demuxerStartTime = pending.demuxerStartTime { telemetryDemuxerStartTime = demuxerStartTime }
-        if let initial = pending.cachePauseInitial { telemetryCachePauseInitial = initial }
-        if let seconds = pending.cachePauseWaitSeconds { telemetryCachePauseWaitSeconds = seconds }
-        if let seconds = pending.lavfAnalyzeDurationSeconds { telemetryLavfAnalyzeDurationSeconds = seconds }
-        if let bytes = pending.lavfProbeSize { telemetryLavfProbeSize = bytes }
-        if let mode = pending.lavfProbeInfo { telemetryLavfProbeInfo = mode }
-
-        var nextMediaInfo = mediaInfo
-        if let width = pending.width {
-            nextMediaInfo.width = width
-        }
-        if let height = pending.height {
-            nextMediaInfo.height = height
-        }
-        if let videoCodec = pending.videoCodec {
-            nextMediaInfo.videoCodec = videoCodec
-        }
-        if let audioCodec = pending.audioCodec {
-            nextMediaInfo.audioCodec = audioCodec
-        }
-        if let audioChannels = pending.audioChannels {
-            nextMediaInfo.audioChannels = audioChannels
-        }
-        if let audioSampleRate = pending.audioSampleRate { nextMediaInfo.audioSampleRate = audioSampleRate }
-        if let hwdec = pending.hwdec {
-            nextMediaInfo.hwdec = hwdec
-        }
-        let nextDuration = pending.duration ?? duration
-        let nextTimePos = pending.timePos ?? timePos
-        let nextIsSeekable = pending.isSeekable ?? isSeekable
-        let hasReplayWindow = nextIsSeekable && nextDuration > 0 && nextDuration.isFinite && nextTimePos.isFinite
-        if hasReplayWindow {
-            let targetDelay = min(Double(bufferSeconds), nextDuration)
-            let nextLatency = max(0, nextDuration - nextTimePos - targetDelay)
-            let currentLatency = nextMediaInfo.liveLatencySeconds ?? 0
-            if abs(currentLatency - nextLatency) >= Tuning.liveLatencyEpsilon {
-                nextMediaInfo.liveLatencySeconds = nextLatency
+        if batch.hasAny(MPVPropertyBatch.telemetryMask) {
+            // Polled diagnostics, not observed: plain stores.
+            if batch.has(.pause) { telemetryPause = batch.flag(.pause) }
+            if batch.has(.pausedForCache) { telemetryPausedForCache = batch.flag(.pausedForCache) }
+            if batch.has(.audioOutput) {
+                telemetryAudioOutput = batch.isUnavailable(.audioOutput) ? nil : batch.audioOutput
             }
-        } else if nextMediaInfo.liveLatencySeconds != nil {
-            nextMediaInfo.liveLatencySeconds = nil
+            if batch.has(.avSync) { telemetryAVSyncSeconds = batch.optionalDouble(.avSync) }
+            if batch.has(.demuxerStartTime) { telemetryDemuxerStartTime = batch.optionalDouble(.demuxerStartTime) }
+            if batch.has(.cachePauseInitial) {
+                telemetryCachePauseInitial = batch.isUnavailable(.cachePauseInitial) ? nil : batch.flag(.cachePauseInitial)
+            }
+            if batch.has(.cachePauseWait) { telemetryCachePauseWaitSeconds = batch.optionalDouble(.cachePauseWait) }
+            if batch.has(.lavfAnalyzeDuration) {
+                telemetryLavfAnalyzeDurationSeconds = batch.optionalDouble(.lavfAnalyzeDuration)
+            }
+            if batch.has(.lavfProbeSize) {
+                telemetryLavfProbeSize = batch.isUnavailable(.lavfProbeSize) ? nil : batch.int64(.lavfProbeSize)
+            }
+            if batch.has(.lavfProbeInfo) {
+                telemetryLavfProbeInfo = batch.isUnavailable(.lavfProbeInfo) ? nil : batch.lavfProbeInfo
+            }
         }
 
-        let nextContainerFps = pending.containerFps ?? containerFps
-        let nextEstimatedFps = pending.estimatedFps ?? estimatedFps
-        if abs(containerFps - nextContainerFps) >= Tuning.stateEpsilon {
-            containerFps = nextContainerFps
-        }
-        if abs(estimatedFps - nextEstimatedFps) >= Tuning.stateEpsilon {
-            estimatedFps = nextEstimatedFps
-        }
+        let currentDuration = _duration
+        let currentTimePos = _timePos
+        let currentIsSeekable = _isSeekable
+        let nextDuration = batch.has(.duration) ? batch.double(.duration) : currentDuration
+        let nextTimePos = batch.has(.timePos) ? batch.double(.timePos) : currentTimePos
+        let nextIsSeekable = batch.has(.seekable) ? batch.flag(.seekable) : currentIsSeekable
 
+        // Media info: decide from stored fields; copy the struct only when a
+        // field it holds may change.
+        let currentLatency = _mediaInfo.liveLatencySeconds
+        var nextLatency = currentLatency
+        if nextIsSeekable && nextDuration > 0 && nextDuration.isFinite && nextTimePos.isFinite {
+            let targetDelay = min(Double(_bufferSeconds), nextDuration)
+            let latency = max(0, nextDuration - nextTimePos - targetDelay)
+            if abs((currentLatency ?? 0) - latency) >= Tuning.liveLatencyEpsilon { nextLatency = latency }
+        } else {
+            nextLatency = nil
+        }
+        let nextContainerFps = batch.has(.fps) ? batch.double(.fps) : containerFps
+        let nextEstimatedFps = batch.has(.estimatedFps) ? batch.double(.estimatedFps) : estimatedFps
+        if abs(containerFps - nextContainerFps) >= Tuning.stateEpsilon { containerFps = nextContainerFps }
+        if abs(estimatedFps - nextEstimatedFps) >= Tuning.stateEpsilon { estimatedFps = nextEstimatedFps }
         let displayFps = max(nextContainerFps, nextEstimatedFps)
-        if abs(nextMediaInfo.fps - displayFps) >= Tuning.stateEpsilon {
-            nextMediaInfo.fps = displayFps
-        }
-        let didMediaInfoChange = mediaInfo != nextMediaInfo
-        if didMediaInfoChange {
-            mediaInfo = nextMediaInfo
-            onMediaInfoChanged?(nextMediaInfo)
-        }
-
-        if let observation = pending.cacheSeconds {
-            preciseCacheSample.observe(observation, generation: loadGeneration, at: ProcessInfo.processInfo.systemUptime)
-            if let seconds = telemetryExactCacheSeconds {
-                setApproxState(\.cacheSeconds, seconds, epsilon: Tuning.cacheEpsilon)
+        let fpsChanged = abs(_mediaInfo.fps - displayFps) >= Tuning.stateEpsilon
+        if nextLatency != currentLatency || fpsChanged || batch.hasAny(MPVPropertyBatch.mediaInfoMask) {
+            var info = _mediaInfo
+            if batch.has(.width) { info.width = Int(batch.int64(.width)) }
+            if batch.has(.height) { info.height = Int(batch.int64(.height)) }
+            if batch.has(.videoCodec) { info.videoCodec = batch.videoCodec }
+            if batch.has(.audioCodec) { info.audioCodec = batch.audioCodec }
+            if batch.has(.audioChannels) { info.audioChannels = Int(batch.int64(.audioChannels)) }
+            if batch.has(.audioSampleRate) { info.audioSampleRate = Int(batch.int64(.audioSampleRate)) }
+            if batch.has(.hwdec) { info.hwdec = batch.hwdec }
+            info.liveLatencySeconds = nextLatency
+            if fpsChanged { info.fps = displayFps }
+            if info != _mediaInfo {
+                mediaInfo = info
+                onMediaInfoChanged?(info)
             }
         }
-        if pending.isBuffering != nil {
+
+        if batch.has(.cacheSeconds) {
+            let at = receiptTime(&uptime)
+            preciseCacheSample.observe(batch.optionalDouble(.cacheSeconds), generation: loadGeneration, at: at)
+            if let seconds = preciseCacheSample.currentSeconds(generation: loadGeneration, at: at),
+               abs(_cacheSeconds - seconds) >= Tuning.cacheEpsilon {
+                cacheSeconds = seconds
+            }
+        }
+        if batch.has(.pausedForCache) {
             updateBufferingState(effectiveBufferingState, source: "mpv")
         }
-        if let volume = pending.volume {
-            setApproxState(\.volume, volume, epsilon: Tuning.stateEpsilon)
+        if batch.has(.volume) {
+            let value = batch.double(.volume)
+            if abs(_volume - value) >= Tuning.stateEpsilon { volume = value }
         }
-        if let isMuted = pending.isMuted {
-            setState(\.isMuted, isMuted)
+        if batch.has(.mute) {
+            let value = batch.flag(.mute)
+            if _isMuted != value { isMuted = value }
         }
-        if let timePos = pending.timePos {
-            setApproxState(\.timePos, timePos, epsilon: Tuning.timePosEpsilon)
-            if isLoading, timePos > 0, !startupHoldActive {
-                setState(\.isLoading, false)
+        if batch.has(.timePos) {
+            if abs(currentTimePos - nextTimePos) >= Tuning.timePosEpsilon { timePos = nextTimePos }
+            if _isLoading, nextTimePos > 0, !startupHoldActive { isLoading = false }
+        }
+        if batch.has(.duration), abs(currentDuration - nextDuration) >= Tuning.stateEpsilon { duration = nextDuration }
+        if batch.has(.seekable), currentIsSeekable != nextIsSeekable { isSeekable = nextIsSeekable }
+
+        if batch.hasAny(MPVPropertyBatch.statsMask) {
+            var stats = _playbackStats
+            if batch.has(.fps) { stats.containerFps = batch.double(.fps) }
+            if batch.has(.estimatedFps) { stats.estimatedFps = batch.double(.estimatedFps) }
+            if batch.has(.videoBitrate) { stats.videoBitrateBps = batch.int64(.videoBitrate) }
+            if batch.has(.audioBitrate) { stats.audioBitrateBps = batch.int64(.audioBitrate) }
+            if batch.has(.frameDrops) { stats.frameDrops = batch.int64(.frameDrops) }
+            if batch.has(.decoderFrameDrops) { stats.decoderFrameDrops = batch.int64(.decoderFrameDrops) }
+            if batch.has(.delayedFrames) { stats.delayedFrames = batch.int64(.delayedFrames) }
+            if batch.has(.mistimedFrames) { stats.mistimedFrames = batch.int64(.mistimedFrames) }
+            if stats != _playbackStats { playbackStats = stats }
+        }
+
+        if batch.has(.cacheSeconds) {
+            evaluateStartupTarget()
+            if let seconds = telemetryExactCacheSeconds {
+                maintainLiveCacheFloor(cacheSeconds: seconds)
             }
-        }
-        if let duration = pending.duration {
-            setApproxState(\.duration, duration, epsilon: Tuning.stateEpsilon)
-        }
-        if let isSeekable = pending.isSeekable {
-            setState(\.isSeekable, isSeekable)
-        }
-
-        var nextStats = playbackStats
-        if let containerFps = pending.containerFps {
-            nextStats.containerFps = containerFps
-        }
-        if let estimatedFps = pending.estimatedFps {
-            nextStats.estimatedFps = estimatedFps
-        }
-        if let videoBitrateBps = pending.videoBitrateBps {
-            nextStats.videoBitrateBps = videoBitrateBps
-        }
-        if let audioBitrateBps = pending.audioBitrateBps {
-            nextStats.audioBitrateBps = audioBitrateBps
-        }
-        if let frameDrops = pending.frameDrops {
-            nextStats.frameDrops = frameDrops
-        }
-        if let decoderFrameDrops = pending.decoderFrameDrops {
-            nextStats.decoderFrameDrops = decoderFrameDrops
-        }
-        if let delayedFrames = pending.delayedFrames {
-            nextStats.delayedFrames = delayedFrames
-        }
-        if let mistimedFrames = pending.mistimedFrames {
-            nextStats.mistimedFrames = mistimedFrames
-        }
-        if nextStats != playbackStats {
-            playbackStats = nextStats
-        }
-
-        if pending.cacheSeconds != nil { evaluateStartupTarget() }
-        if pending.cacheSeconds != nil, let seconds = telemetryExactCacheSeconds {
-            maintainLiveCacheFloor(cacheSeconds: seconds)
         }
         updateDisplayPowerAssertion()
     }
@@ -2194,28 +1998,6 @@ final class MPVPlayer {
     private func setApproxState(_ keyPath: ReferenceWritableKeyPath<MPVPlayer, Double>, _ value: Double, epsilon: Double) {
         guard abs(self[keyPath: keyPath] - value) >= epsilon else { return }
         self[keyPath: keyPath] = value
-    }
-
-    private func readInt(_ prop: mpv_event_property) -> Int {
-        guard prop.format == MPV_FORMAT_INT64, let data = prop.data else { return 0 }
-        return Int(data.assumingMemoryBound(to: Int64.self).pointee)
-    }
-
-    private func readInt64(_ prop: mpv_event_property) -> Int64 {
-        guard prop.format == MPV_FORMAT_INT64, let data = prop.data else { return 0 }
-        return data.assumingMemoryBound(to: Int64.self).pointee
-    }
-
-    private func readFiniteDouble(_ prop: mpv_event_property) -> Double? {
-        guard prop.format == MPV_FORMAT_DOUBLE, let data = prop.data else { return nil }
-        let value = data.assumingMemoryBound(to: Double.self).pointee
-        return value.isFinite ? value : nil
-    }
-
-    private func readString(_ prop: mpv_event_property) -> String {
-        guard prop.format == MPV_FORMAT_STRING, let data = prop.data else { return "" }
-        let pp = data.assumingMemoryBound(to: UnsafePointer<CChar>?.self).pointee
-        return pp.map { String(cString: $0) } ?? ""
     }
 
     // MARK: - C helpers
@@ -2353,15 +2135,13 @@ final class MPVPlayer {
     /// Requests a property read; the value arrives as
     /// MPV_EVENT_GET_PROPERTY_REPLY in drainEvents and flows through the same
     /// collectProperty path as observed property changes.
-    private func requestProperty(_ id: PropID, _ name: String, _ format: mpv_format) {
+    private func requestProperty(_ id: MPVProperty, _ name: String, _ format: mpv_format) {
         guard let handle else { return }
-        propertyRequestSerial &+= 1
-        let requestID = (1 << 62) | propertyRequestSerial
-        propertyRequests[requestID] = (loadGeneration, itemLifecycle.activeIdentity, id)
+        let requestID = propertyRequests.insert(generation: loadGeneration, item: itemLifecycle.activeIdentity, property: id)
         let result = name.withCString { n in
             mpv_get_property_async(handle, requestID, n, format)
         }
-        if result < 0 { propertyRequests[requestID] = nil }
+        if result < 0 { propertyRequests.cancel(requestID: requestID) }
     }
 
     /// Capture refreshes remain asynchronous, including during a cache pause.
@@ -2370,9 +2150,11 @@ final class MPVPlayer {
 #if DEBUG
         guard PlaybackValidation.isEnabled || SavedPlaybackScenario.isCapturing,
               itemLifecycle.loadedIdentity?.generation == loadGeneration else { return }
-        for (id, name) in [(PropID.timePos, "time-pos"), (.videoPTS, "video-pts")] {
-            guard !propertyRequests.values.contains(where: { $0.generation == loadGeneration && $0.property == id }) else { continue }
-            requestProperty(id, name, MPV_FORMAT_DOUBLE)
+        if !propertyRequests.containsPending(generation: loadGeneration, property: .timePos) {
+            requestProperty(.timePos, "time-pos", MPV_FORMAT_DOUBLE)
+        }
+        if !propertyRequests.containsPending(generation: loadGeneration, property: .videoPTS) {
+            requestProperty(.videoPTS, "video-pts", MPV_FORMAT_DOUBLE)
         }
 #endif
     }
