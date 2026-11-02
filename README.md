@@ -46,7 +46,7 @@ Select one channel in the app. The collector opens the normal app through Launch
 Focused reproducible comparisons supplement the in-app suite:
 
 ```bash
-python3 scripts/bench-epg-grid.py --output .logs/epg-grid.json
+scripts/bench-epg-grid-layout.sh
 python3 scripts/bench_sync.py --output .logs/sync-http.json
 scripts/test-sports.sh
 ```
