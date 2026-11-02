@@ -451,6 +451,37 @@ private final class ProbeIO: @unchecked Sendable {
             check(s.probe(for: live)?.bitRate == 7_000_000, "another endpoint revision changed this bitrate")
         }
 
+        // A known multi-connection account keeps a slot free for playback;
+        // an outdated status (ledger assumes one connection) pauses probing.
+        do {
+            let source = UUID()
+            let account = SourceAccountKey(opaqueValue: "probe-headroom-\(source)")
+            func owned(_ id: String) -> Channel {
+                Channel(id: id, name: "Fixture", logoURL: nil, group: "Tests",
+                    streamURL: URL(string: "http://127.0.0.1/hr/\(id)")!, epgChannelID: nil,
+                    sourceOwnership: ChannelSourceOwnership(channelIdentity: SourceChannelIdentity(sourceID: source, nativeID: id),
+                        accountKey: account))
+            }
+            let io = ProbeIO(), s = service(io)
+            var staleRequests = 0
+            s.onCapacityStatusStale = { _ in staleRequests += 1 }
+            s.setActiveCacheKey("headroom", sourceID: source)
+            AccountCapacityLedger.shared.updateStatus(accountKey: account, maxConnections: 4, activeConnections: nil,
+                                                      observedAt: Date().addingTimeInterval(-600))
+            s.requestProbe(for: owned("h0"))
+            await settle()
+            check(io.count == 0 && staleRequests > 0, "stale account status still started a probe")
+            AccountCapacityLedger.shared.updateStatus(accountKey: account, maxConnections: 4, activeConnections: nil, observedAt: Date())
+            for i in 1...3 { s.requestProbe(for: owned("h\(i)")) }
+            s.retryQueuedProbes()
+            await wait("fresh account probes", until: { io.count >= 2 })
+            await settle()
+            check(io.peak == 2, "more than two probes ran on one account")
+            check(AccountCapacityLedger.shared.snapshot(accountKey: account).available >= 1, "probes took the last free connection")
+            for i in 0...3 { io.release(owned("h\(i)").streamURL.absoluteString) }
+            await wait("headroom probes drained", until: { io.count == 4 })
+        }
+
         print("PASS \(checks) real StreamProbeService lifecycle checks: source generations, clear/disable, playback exclusion, cache merging and ordered newest snapshots")
     }
 }

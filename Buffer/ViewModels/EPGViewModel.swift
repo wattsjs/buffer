@@ -242,6 +242,7 @@ class EPGViewModel {
         if self.smartSports.probeLookup == nil {
             self.smartSports.probeLookup = { channel in StreamProbeService.shared.probe(for: channel) }
             self.smartSports.probeVersion = { StreamProbeService.shared.version }
+            StreamProbeService.shared.onCapacityStatusStale = { [weak self] _ in self?.refreshAccountCapacityForProbing() }
         }
         // Synthetic performance runs must not read accounts or start real sync.
         guard !PerformanceBenchmark.shouldRun, !PlaybackValidation.isEnabled else { return }

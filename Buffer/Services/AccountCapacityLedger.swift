@@ -164,7 +164,7 @@ nonisolated final class AccountCapacityLedger: @unchecked Sendable {
                 return .success(existing)
             }
             let state = snapshot(account: account, now: now)
-            guard state.available > 0 else {
+            guard (kind == .probe ? state.available : userAvailable(account: account)) > 0 else {
                 return .failure(.capacityReached(limit: state.limit,
                     localReservations: state.localReservations, externalConnections: state.knownExternalConnections))
             }
@@ -187,6 +187,18 @@ nonisolated final class AccountCapacityLedger: @unchecked Sendable {
             accounts[lease.accountKey] = account
             return true
         }
+    }
+
+    /// Players and recordings are explicit user requests. Providers keep
+    /// counting a stream for a while after it closes, and an account's plan
+    /// limit does not shrink when the status ages, so these are checked only
+    /// against Buffer's own player/recording connections and the last
+    /// declared limit. Probes are short-lived and yield; a genuine provider
+    /// refusal still reaches the player's own recovery path.
+    private func userAvailable(account: Account) -> Int {
+        let limit = account.status?.maximum ?? 1
+        let local = account.leases.values.filter { $0.kind != .probe }.count
+        return max(0, limit - min(limit, local))
     }
 
     private func snapshot(account: Account, now: Date) -> Snapshot {

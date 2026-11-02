@@ -443,6 +443,10 @@ final class StreamProbeService {
 
     /// Convenience for batch warming (e.g. all visible favorites). Same dedupe
     /// rules as the single-channel call.
+    /// Asked to refresh an account's connection status when probes are
+    /// waiting on it; the owner throttles and calls `retryQueuedProbes`.
+    @ObservationIgnored var onCapacityStatusStale: (@MainActor (SourceAccountKey) -> Void)?
+
     /// Re-evaluates queued probes, e.g. after account capacity was refreshed.
     func retryQueuedProbes() { drainQueue() }
 
@@ -514,8 +518,20 @@ final class StreamProbeService {
                 // connection (pressing play must always find one) and never
                 // run more than two at once on one account.
                 let account = AccountCapacityLedger.shared.snapshot(accountKey: ownership.accountKey)
-                guard account.limit <= 1 || account.available >= 2,
-                      (account.reservationsByKind[.probe] ?? 0) < Self.maximumProbesPerAccount else {
+                let probesHere = account.reservationsByKind[.probe] ?? 0
+                let mayProbe: Bool
+                switch account.statusFreshness {
+                case .fresh:
+                    mayProbe = account.available >= 2 && probesHere < Self.maximumProbesPerAccount
+                case .stale:
+                    // An outdated status makes the ledger assume one
+                    // connection; a probe would then hold the only slot.
+                    mayProbe = false
+                    onCapacityStatusStale?(ownership.accountKey)
+                case .unknown:
+                    mayProbe = probesHere == 0
+                }
+                guard mayProbe else {
                     waiting.append(next)
                     continue
                 }

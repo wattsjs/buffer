@@ -91,9 +91,15 @@ enum AccountCapacityTests {
         expect(ledger.snapshot(accountKey: accountA, now: now).statusFreshness == .unknown,
                "Unknown external usage is explicit")
         let owner = UUID()
-        let player = lease(ledger.reserve(accountKey: accountA, kind: .player, ownerID: owner, now: now))
+        let earlyProbe = lease(ledger.reserve(accountKey: accountA, kind: .probe, ownerID: UUID(), now: now))
         expect(rejected(ledger.reserve(accountKey: alias, kind: .probe, ownerID: UUID(), now: now)),
                "Aliases cannot open a probe beyond the shared default cap")
+        let player = lease(ledger.reserve(accountKey: accountA, kind: .player, ownerID: owner, now: now))
+        expect(rejected(ledger.reserve(accountKey: alias, kind: .probe, ownerID: UUID(), now: now)),
+               "A running player blocks further probes")
+        ledger.confirmTeardown(lease: earlyProbe)
+        expect(rejected(ledger.reserve(accountKey: alias, kind: .player, ownerID: UUID(), now: now)),
+               "A second player cannot exceed the default cap")
         expect(lease(ledger.reserve(accountKey: alias, kind: .player, ownerID: owner, now: now)) == player,
                "Duplicate reservation by the same owner is idempotent")
         let independent = lease(ledger.reserve(accountKey: accountB, kind: .recording, ownerID: UUID(), now: now))
@@ -114,7 +120,7 @@ enum AccountCapacityTests {
         let p = lease(ledger.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now))
         let r = lease(ledger.reserve(accountKey: accountA, kind: .recording, ownerID: UUID(), now: now))
         let q = lease(ledger.reserve(accountKey: accountA, kind: .probe, ownerID: UUID(), now: now))
-        expect(rejected(ledger.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now)),
+        expect(rejected(ledger.reserve(accountKey: accountA, kind: .probe, ownerID: UUID(), now: now)),
                "Players, recordings and probes compete within one account limit")
         let full = ledger.snapshot(accountKey: accountA, now: now)
         expect(full.reservationsByKind[.player] == 1 && full.reservationsByKind[.recording] == 1
@@ -125,6 +131,10 @@ enum AccountCapacityTests {
                             observedAt: now.addingTimeInterval(1))
         expect(ledger.snapshot(accountKey: accountA, now: now.addingTimeInterval(1)).available == 0,
                "Aggregate totals are not assumed to be owned by Buffer")
+        let lingering = lease(ledger.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now.addingTimeInterval(1)))
+        expect(rejected(ledger.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now.addingTimeInterval(1))),
+               "Players and recordings still share the declared limit")
+        ledger.confirmTeardown(lease: lingering)
         ledger.updateStatus(accountKey: accountA, maxConnections: 3, activeConnections: 2,
                             observedAt: now.addingTimeInterval(2), knownOwnedConnections: 2)
         expect(ledger.snapshot(accountKey: accountA, now: now.addingTimeInterval(2)).knownExternalConnections == 0,
@@ -142,8 +152,12 @@ enum AccountCapacityTests {
         let stale = ledger.snapshot(accountKey: accountA, now: now.addingTimeInterval(124))
         expect(stale.statusFreshness == .stale && stale.limit == 1 && stale.knownExternalConnections == 1,
                "Stale status falls back conservatively without expiring external usage")
-        expect(rejected(ledger.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now.addingTimeInterval(124))),
-               "Stale external connections cannot be silently treated as ended")
+        expect(rejected(ledger.reserve(accountKey: accountA, kind: .probe, ownerID: UUID(), now: now.addingTimeInterval(124))),
+               "Stale external connections still block background probes")
+        let afterSwitch = lease(ledger.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now.addingTimeInterval(124)))
+        expect(ledger.snapshot(accountKey: accountA, now: now.addingTimeInterval(124)).reservationsByKind[.player] == 1,
+               "A user's play request is not refused by a stale provider active count")
+        ledger.confirmTeardown(lease: afterSwitch)
         ledger.updateStatus(accountKey: accountA, maxConnections: 0, activeConnections: -1,
                             observedAt: now.addingTimeInterval(125))
         expect(ledger.snapshot(accountKey: accountA, now: now.addingTimeInterval(125)).limit == 1,
