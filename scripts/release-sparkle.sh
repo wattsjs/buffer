@@ -199,14 +199,14 @@ xcodebuild archive \
   -archivePath "$ARCHIVE_PATH" \
   DEVELOPMENT_TEAM="$TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
-  "${KEYCHAIN_BUILD_FLAGS[@]}"
+  ${KEYCHAIN_BUILD_FLAGS[@]+"${KEYCHAIN_BUILD_FLAGS[@]}"}
 
 echo "==> Exporting Developer ID app"
 xcodebuild -exportArchive \
   -archivePath "$ARCHIVE_PATH" \
   -exportPath "$EXPORT_DIR" \
   -exportOptionsPlist "$EXPORT_OPTIONS" \
-  "${KEYCHAIN_BUILD_FLAGS[@]}"
+  ${KEYCHAIN_BUILD_FLAGS[@]+"${KEYCHAIN_BUILD_FLAGS[@]}"}
 
 APP_PATH="$EXPORT_DIR/$PRODUCT_NAME.app"
 ZIP_PATH="$LOCAL_RELEASE_DIR/$RELEASE_BASENAME.zip"
