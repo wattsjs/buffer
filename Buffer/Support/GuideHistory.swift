@@ -13,8 +13,26 @@ nonisolated enum GuideHistory {
         return start.isFinite && end.isFinite && end > start
             && end - start <= Double(maximumHistoryDays + maximumFutureDays) * 86400
             && program.end > earliest && program.start < latest
-            && !program.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && hasVisibleText(program.title)
     }
+
+    /// Same as `!trimmingCharacters(in: .whitespacesAndNewlines).isEmpty`
+    /// without allocating a trimmed copy: usually decided by the first scalar.
+    @inline(__always)
+    static func hasVisibleText(_ text: String) -> Bool {
+        var utf8 = text.utf8.makeIterator()
+        // ASCII fast path; anything else defers to the Unicode set.
+        while let byte = utf8.next() {
+            switch byte {
+            case 0x20, 0x09...0x0D: continue
+            case 0x80...: return text.unicodeScalars.contains { !whitespace.contains($0) }
+            default: return true
+            }
+        }
+        return false
+    }
+
+    private static let whitespace = CharacterSet.whitespacesAndNewlines
 
     static func retentionStarts(channels: [Channel], now: Date) -> [String: Date] {
         var starts: [String: Date] = [:]
@@ -30,6 +48,15 @@ nonisolated enum GuideHistory {
     static func merge(existing: [EPGProgram], incoming: [EPGProgram], earliest: Date, now: Date) -> [EPGProgram] {
         let latest = now.addingTimeInterval(Double(maximumFutureDays) * 86400)
         let usable = incoming.filter { isUsable($0, earliest: earliest, latest: latest) }
+        if usable.isEmpty {
+            // Pruning only: keep the same array storage when nothing expires,
+            // so the published guide and its timeline columns can be reused.
+            if existing.count <= maximumProgramsPerChannel,
+               existing.allSatisfy({ isUsable($0, earliest: earliest, latest: latest) }),
+               !zip(existing, existing.dropFirst()).contains(where: { $0.start > $1.start }) {
+                return existing
+            }
+        }
         let incomingIDs = Set(usable.map(\.id))
         let incomingStarts = Set(usable.map(\.start))
         var result = existing.filter {
@@ -58,6 +85,18 @@ nonisolated enum GuideHistory {
             result = result.enumerated().compactMap { retained.contains($0.offset) ? $0.element : nil }
         }
         return result
+    }
+
+    /// `prune` expressed as a policy the columnar cache applies during decode.
+    static func retentionPolicy(starts: [String: Date], now: Date) -> EPGProgram.RetentionPolicy {
+        let latest = now.addingTimeInterval(Double(maximumFutureDays) * 86400)
+        return EPGProgram.RetentionPolicy(
+            starts: starts, latest: latest,
+            maximumDuration: Double(maximumHistoryDays + maximumFutureDays) * 86400,
+            maximumCount: maximumProgramsPerChannel,
+            isUsable: { isUsable($0, earliest: $1, latest: latest) },
+            hasVisibleTitle: { hasVisibleText($0) },
+            normalize: { merge(existing: $0, incoming: [], earliest: $1, now: now) })
     }
 
     static func prune(_ programs: [String: [EPGProgram]], starts: [String: Date], now: Date) -> [String: [EPGProgram]] {

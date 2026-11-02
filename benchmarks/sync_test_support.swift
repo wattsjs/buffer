@@ -156,6 +156,17 @@ nonisolated enum DataCache {
         return result
     }
     static func loadPrograms(key: String) -> CachedPrograms? { storage.lock.withLock { storage.programs[key] } }
+    /// Mirrors the production decode-time retention (`GuideHistory.prune`).
+    static func loadPrograms(key: String, retaining policy: EPGProgram.RetentionPolicy?) -> CachedPrograms? {
+        guard let cached = loadPrograms(key: key) else { return nil }
+        guard let policy else { return cached }
+        var retained: [String: [EPGProgram]] = [:]
+        for (id, earliest) in policy.starts {
+            let list = policy.normalize(cached.programs[id] ?? [], earliest)
+            if !list.isEmpty { retained[id] = list }
+        }
+        return CachedPrograms(savedAt: cached.savedAt, programs: retained)
+    }
     static func loadVODItems(key: String) -> CachedVODItems? {
         let (result, delay) = storage.lock.withLock {
             storage.itemReads[key, default: 0] += 1
