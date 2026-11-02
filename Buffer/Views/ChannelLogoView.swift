@@ -2,33 +2,59 @@ import SwiftUI
 import NukeUI
 import Nuke
 
+/// Channel logo backed by `LogoAtlas`. A row resolves its URL to an integer
+/// handle once at init; rendering is an array read of the published slot
+/// image. Misses decode off the main thread at slot size and re-render this
+/// view when the slot becomes resident.
 struct ChannelLogoView: View {
     let url: URL?
     var fallbackSystemImage: String = "tv"
     var contentInset: CGFloat = 5
     var onComputedColor: ((NSColor) -> Void)? = nil
 
+    private let handle: LogoHandle?
+    @State private var generation: UInt32 = 0
+
+    init(
+        url: URL?,
+        fallbackSystemImage: String = "tv",
+        contentInset: CGFloat = 5,
+        onComputedColor: ((NSColor) -> Void)? = nil
+    ) {
+        self.url = url
+        self.fallbackSystemImage = fallbackSystemImage
+        self.contentInset = contentInset
+        self.onComputedColor = onComputedColor
+        self.handle = url.map { LogoAtlas.shared.handle(for: $0) }
+    }
+
+    /// For rows that already hold a logo handle (no URL interning).
+    init(
+        handle: LogoHandle,
+        fallbackSystemImage: String = "tv",
+        contentInset: CGFloat = 5,
+        onComputedColor: ((NSColor) -> Void)? = nil
+    ) {
+        self.url = nil
+        self.fallbackSystemImage = fallbackSystemImage
+        self.contentInset = contentInset
+        self.onComputedColor = onComputedColor
+        self.handle = handle
+    }
+
     var body: some View {
+        // `generation` bumps when a load finishes so the body re-reads the atlas.
+        let _ = generation
         Group {
-            if let url, !ImageLoader.isFailed(url) {
-                // Reused guide rows get a fresh LazyImage, which renders its
-                // placeholder for a frame even on a memory-cache hit. Draw a
-                // cached logo immediately so scrolling never flashes icons.
-                if let cached = ImageLoader.pipeline.cache[url] {
-                    logo(Image(nsImage: cached.image))
-                        .onAppear { analyzeColorIfNeeded(url: url, image: cached.image) }
+            if let handle {
+                let atlas = LogoAtlas.shared
+                if let image = atlas.image(handle) {
+                    logo(image)
+                } else if atlas.isFailed(handle) {
+                    placeholder
                 } else {
-                    LazyImage(url: url) { state in
-                        if let image = state.image {
-                            logo(image)
-                        } else {
-                            placeholder
-                        }
-                    }
-                    .onCompletion { result in
-                        handleCompletion(url: url, result: result)
-                    }
-                    .pipeline(ImageLoader.pipeline)
+                    placeholder
+                        .task(id: handle) { await load(handle, atlas: atlas) }
                 }
             } else {
                 placeholder
@@ -37,8 +63,21 @@ struct ChannelLogoView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func logo(_ image: Image) -> some View {
-        image
+    private func load(_ handle: LogoHandle, atlas: LogoAtlas) async {
+        // Parent tiles seed their background from the colour column at init.
+        // Only deliver a colour that this load produced, so an already-known
+        // colour never kicks the parent's @State into a re-render loop.
+        let hadColor = atlas.packedColor(handle) != 0
+        let loaded = await atlas.load(handle)
+        if loaded, !hadColor, let onComputedColor,
+           let color = LogoColorAnalyzer.color(packed: atlas.packedColor(handle)) {
+            onComputedColor(color)
+        }
+        generation &+= 1
+    }
+
+    private func logo(_ image: CGImage) -> some View {
+        Image(decorative: image, scale: 1)
             .resizable()
             .interpolation(.high)
             .aspectRatio(contentMode: .fit)
@@ -51,38 +90,6 @@ struct ChannelLogoView: View {
             Image(systemName: fallbackSystemImage)
                 .font(BufferFont.iconLarge)
                 .foregroundStyle(.secondary)
-        }
-    }
-
-    private func handleCompletion(url: URL, result: Result<ImageResponse, Error>) {
-        switch result {
-        case .failure(let error):
-            ImageLoader.markFailed(url, unlessCancelled: error)
-        case .success(let response):
-            // Parent cells seed their background from `LogoColorAnalyzer.cachedColor`
-            // at init. If that cache already holds a value, delivering it again
-            // here would kick the parent's @State and re-render the cell, which
-            // in turn re-instantiates this view and refires onCompletion — a
-            // tight feedback loop that pegged the CPU when combined with
-            // uncached failing logo URLs.
-            // Only perform (expensive) color analysis when the caller actually
-            // subscribes to the result. This eliminates wasted decode + CG work
-            // for the many logo sites that only need the image (player chrome,
-            // small list rows, etc.).
-            analyzeColorIfNeeded(url: url, image: response.image)
-        }
-    }
-
-    private func analyzeColorIfNeeded(url: URL, image: NSImage) {
-        guard onComputedColor != nil else { return }
-        if LogoColorAnalyzer.cachedColor(for: url) != nil {
-            return
-        }
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return
-        }
-        LogoColorAnalyzer.color(for: url, image: cgImage) { color in
-            onComputedColor?(color)
         }
     }
 }

@@ -2,121 +2,73 @@ import Foundation
 import CoreGraphics
 import AppKit
 
+/// Dominant logo colour. Computed once per logo, off the main thread, when
+/// `LogoAtlas` packs the logo into its slot, and stored as packed sRGB RGBA8
+/// in the atlas colour column. There is no URL-keyed colour cache: a lookup
+/// is the atlas handle plus an array read.
 enum LogoColorAnalyzer {
-    private static let cacheLock = NSLock()
-    // Bounded runtime cache (Agent 07)
-    private static let cache: NSCache<NSURL, NSColor> = {
-        let c = NSCache<NSURL, NSColor>()
-        c.countLimit = 4096
-        c.name = "com.buffer.logoColors.runtime"
-        return c
-    }()
-
-    // Small side map used only for persistence (kept in sync, bounded by the same limit logic)
-    private static var persistMap: [URL: NSColor] = [:]
-    private static let workQueue = DispatchQueue(
-        label: "com.buffer.logo-color",
-        qos: .utility,
-        attributes: .concurrent
-    )
-    private static let persistKey = "com.buffer.logoColors.v1"
-    private static let persistLock = NSLock()
-    private static var persistedLoaded = false
-    private static var pendingFlush: DispatchWorkItem?
-
+    @MainActor
     static func cachedColor(for url: URL) -> NSColor? {
-        ensurePersistedLoaded()
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
-        if let color = cache.object(forKey: url as NSURL) {
-            return color
-        }
-        return persistMap[url]
+        cachedColor(for: url, in: LogoAtlas.shared)
     }
 
+    @MainActor
+    static func cachedColor(for url: URL, in atlas: LogoAtlas) -> NSColor? {
+        color(packed: atlas.packedColor(atlas.handle(for: url)))
+    }
+
+    @MainActor
+    static func cachedColor(handle: LogoHandle, in atlas: LogoAtlas) -> NSColor? {
+        color(packed: atlas.packedColor(handle))
+    }
+
+    /// Computes the colour for an image that did not come through the atlas
+    /// and records it in the atlas colour column.
+    @MainActor
     static func color(
         for url: URL,
         image: CGImage,
-        completion: @escaping (NSColor) -> Void
+        completion: @escaping @MainActor (NSColor) -> Void
     ) {
-        if let cached = cachedColor(for: url) {
+        let atlas = LogoAtlas.shared
+        let handle = atlas.handle(for: url)
+        if let cached = color(packed: atlas.packedColor(handle)) {
             completion(cached)
             return
         }
-        workQueue.async {
-            let color = extract(from: image)
-            cacheLock.lock()
-            cache.setObject(color, forKey: url as NSURL)
-            persistMap[url] = color
-            // Trim persistMap to keep memory reasonable
-            if persistMap.count > 4500 {
-                // Simple trim: drop oldest (not perfect LRU but good enough)
-                let keysToRemove = Array(persistMap.keys.prefix(persistMap.count - 4000))
-                for k in keysToRemove { persistMap.removeValue(forKey: k) }
+        DispatchQueue.global(qos: .utility).async {
+            let packed = packedColor(from: image)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    atlas.setPackedColor(packed, for: handle)
+                    completion(color(packed: packed)!)
+                }
             }
-            cacheLock.unlock()
-            schedulePersist()
-            DispatchQueue.main.async { completion(color) }
         }
     }
 
-    // MARK: - Persistence
-
-    private static func ensurePersistedLoaded() {
-        persistLock.lock()
-        defer { persistLock.unlock() }
-        if persistedLoaded { return }
-        persistedLoaded = true
-        guard let dict = UserDefaults.standard.dictionary(forKey: persistKey) as? [String: String] else { return }
-        cacheLock.lock()
-        for (key, hex) in dict {
-            guard let url = URL(string: key), let color = Self.color(fromHex: hex) else { continue }
-            if cache.object(forKey: url as NSURL) == nil {
-                cache.setObject(color, forKey: url as NSURL)
-            }
-        }
-        cacheLock.unlock()
+    /// sRGB RGBA8 (`r << 24 | g << 16 | b << 8 | a`). Never 0: alpha is 255.
+    nonisolated static func packedColor(from cgImage: CGImage) -> UInt32 {
+        pack(extract(from: cgImage))
     }
 
-    private static func schedulePersist() {
-        persistLock.lock()
-        defer { persistLock.unlock() }
-        pendingFlush?.cancel()
-        let work = DispatchWorkItem {
-            cacheLock.lock()
-            let snapshot = persistMap.reduce(into: [String: String]()) { acc, pair in
-                acc[pair.key.absoluteString] = hex(from: pair.value)
-            }
-            cacheLock.unlock()
-            if !snapshot.isEmpty {
-                UserDefaults.standard.set(snapshot, forKey: persistKey)
-            }
-        }
-        pendingFlush = work
-        workQueue.asyncAfter(deadline: .now() + 1.0, execute: work)
+    nonisolated static func color(packed: UInt32) -> NSColor? {
+        guard packed != 0 else { return nil }
+        return NSColor(srgbRed: CGFloat(packed >> 24) / 255, green: CGFloat((packed >> 16) & 0xff) / 255,
+                       blue: CGFloat((packed >> 8) & 0xff) / 255, alpha: CGFloat(packed & 0xff) / 255)
     }
 
-    private static func hex(from color: NSColor) -> String {
+    nonisolated static func pack(_ color: NSColor) -> UInt32 {
         let c = color.usingColorSpace(.sRGB) ?? color
-        let r = Int((c.redComponent * 255).rounded())
-        let g = Int((c.greenComponent * 255).rounded())
-        let b = Int((c.blueComponent * 255).rounded())
-        return String(format: "%02x%02x%02x", r, g, b)
-    }
-
-    private static func color(fromHex hex: String) -> NSColor? {
-        guard hex.count == 6, let value = UInt32(hex, radix: 16) else { return nil }
-        let r = CGFloat((value >> 16) & 0xff) / 255.0
-        let g = CGFloat((value >> 8) & 0xff) / 255.0
-        let b = CGFloat(value & 0xff) / 255.0
-        return NSColor(srgbRed: r, green: g, blue: b, alpha: 1.0)
+        func byte(_ v: CGFloat) -> UInt32 { UInt32(max(0, min(255, (v * 255).rounded()))) }
+        return byte(c.redComponent) << 24 | byte(c.greenComponent) << 16 | byte(c.blueComponent) << 8 | 0xff
     }
 
     // MARK: - Extraction
 
-    private static let fallback = NSColor(srgbRed: 0.14, green: 0.14, blue: 0.15, alpha: 1.0)
+    nonisolated private static let fallback = NSColor(srgbRed: 0.14, green: 0.14, blue: 0.15, alpha: 1.0)
 
-    private static func extract(from cgImage: CGImage) -> NSColor {
+    nonisolated static func extract(from cgImage: CGImage) -> NSColor {
         let size = 40
         let bytesPerRow = size * 4
         guard let context = CGContext(
