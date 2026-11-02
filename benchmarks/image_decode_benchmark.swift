@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 import Nuke
 import Darwin
 
-@main struct ImageDecodeBenchmark {
+@MainActor @main struct ImageDecodeBenchmark {
     static func cgImage(_ image: NSImage) -> CGImage {
         image.cgImage(forProposedRect: nil, context: nil, hints: nil)!
     }

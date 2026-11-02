@@ -2,7 +2,7 @@ import Foundation
 import Nuke
 
 enum ImageLoader {
-    static let pipeline: ImagePipeline = {
+    nonisolated static let pipeline: ImagePipeline = {
         var config = ImagePipeline.Configuration.withDataCache(
             name: "com.buffer.image-cache",
             sizeLimit: 256 * 1024 * 1024
@@ -27,6 +27,7 @@ enum ImageLoader {
         return ImagePipeline(configuration: config)
     }()
 
+    @MainActor
     static func configure() {
         ImagePipeline.shared = pipeline
         ImageDecoderRegistry.shared.register(ImageDecoders.Default.init)
@@ -55,27 +56,30 @@ enum ImageLoader {
 
     // MARK: - Failure memo
     //
-    // Nuke has no built-in failure caching, so every re-instantiated LazyImage
-    // for a dead URL fires another request. In a virtualized grid that can
-    // cascade into a hot loop. We track recent failures here and let callers
-    // skip the fetch entirely until the TTL elapses.
+    // Nuke has no built-in failure caching, so every re-instantiated view for
+    // a dead URL would fire another request. Failures are a bitset over image
+    // handles (with an expiry column) owned by `LogoAtlas`; callers skip the
+    // fetch until the TTL elapses.
 
-    private static let failures = RecentImageFailures()
-
+    @MainActor
     static func markFailed(_ url: URL) {
-        failures.insert(url)
+        let atlas = LogoAtlas.shared
+        atlas.markFailed(atlas.handle(for: url))
     }
 
+    @MainActor
     static func markFailed(_ url: URL, unlessCancelled error: Error) {
         guard !isCancellation(error) else { return }
         markFailed(url)
     }
 
+    @MainActor
     static func isFailed(_ url: URL) -> Bool {
-        failures.contains(url)
+        let atlas = LogoAtlas.shared
+        return atlas.isFailed(atlas.handle(for: url))
     }
 
-    private static func isCancellation(_ error: Error) -> Bool {
+    nonisolated static func isCancellation(_ error: Error) -> Bool {
         if error is CancellationError {
             return true
         }

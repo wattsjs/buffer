@@ -17,6 +17,7 @@ import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCES = ['Buffer/Support/RecentImageFailures.swift', 'Buffer/Services/ArtworkImageDecoder.swift', 'Buffer/Services/ImageLoader.swift',
+           'Buffer/Services/LogoColorAnalyzer.swift', 'Buffer/Services/LogoAtlas.swift',
            'benchmarks/image_decode_benchmark.swift']
 
 
