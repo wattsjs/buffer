@@ -714,6 +714,17 @@ final class EPGContainerView: NSView {
             name: NSView.boundsDidChangeNotification,
             object: programScrollView.contentView
         )
+        // The clip view narrows without a bounds notification when legacy
+        // (non-overlay) scrollers appear after the first layout. Viewport-
+        // sized programme surfaces must follow, or they stay wider than the
+        // visible area.
+        programScrollView.contentView.postsFrameChangedNotifications = true
+        nc.addObserver(
+            self,
+            selector: #selector(programClipFrameDidChange(_:)),
+            name: NSView.frameDidChangeNotification,
+            object: programScrollView.contentView
+        )
         nc.addObserver(
             self,
             selector: #selector(channelBoundsDidChange(_:)),
@@ -934,6 +945,12 @@ final class EPGContainerView: NSView {
         updateChannelLabelOverlay()
         updateProgramDrawingViewports()
         updateVisibleRowData?()   // vertical scroll in channel column also updates visible program rows
+    }
+
+    @objc private func programClipFrameDidChange(_ note: Notification) {
+        updateNowLineFrame()
+        updateChannelLabelOverlay()
+        updateProgramDrawingViewports()
     }
 
     @objc private func headerBoundsDidChange(_ note: Notification) {
@@ -1372,12 +1389,12 @@ final class HostingRow<Content: View>: NSTableCellView, EPGViewportHosting, EPGR
     func updateDrawingViewport() {
         guard let hostingView else { return }
         let hostFrame = usesHorizontalViewport ? viewportSlice(of: self) : bounds
-        if hostingView.frame.size != hostFrame.size {
+        if hostingView.frame != hostFrame {
             hostingView.frame = hostFrame
+            // Also flushes a pending SwiftUI layout (for example after the
+            // clip view narrows when a legacy scroller appears), so the
+            // hosted canvas never keeps a stale, wider-than-viewport size.
             hostingView.layoutSubtreeIfNeeded()
-        } else if hostingView.frame.origin != hostFrame.origin {
-            // A pure pan moves the host; SwiftUI has nothing to lay out.
-            hostingView.setFrameOrigin(hostFrame.origin)
         }
         guard usesHorizontalViewport else { return }
         if drawingCanvas == nil || drawingCanvas?.isDescendant(of: hostingView) != true {
