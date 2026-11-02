@@ -23,7 +23,7 @@ CASE_KEYS = {'sourceName', 'sourceID', 'channelName', 'channelID', 'expectedWidt
              'playbackMode', 'catchupOffsetMinutes', 'vodName', 'vodID', 'vodResumeSeconds'}
 EVENT_KEYS = {'event', 'schema', 'cases', 'caseSeconds', 'pid', 'buildMetadata', 'case', 'seconds', 'reason',
     'completedCases', 'restored', 'teardownConfirmed', 'cancelled', 'backendIdle', 'captured',
-    'elapsedMs', 'tickGapMs', 'generation', 'windowVisible', 'applicationActive', 'time', 'cache', 'rendered',
+    'elapsedMs', 'tickGapMs', 'mainLagMaxMs', 'mainLagOver20', 'mainLagSamples', 'generation', 'windowVisible', 'applicationActive', 'time', 'cache', 'rendered',
     'windowOnActiveSpace', 'windowMiniaturized', 'windowLevel', 'applicationHidden', 'windowKey', 'windowMain',
     'renderedFrameCount', 'secondsSinceLastRender', 'playbackRequested', 'playing', 'pause', 'pausedForCache',
     'loading', 'buffering', 'bufferingMs', 'frameDrops', 'decoderDrops', 'mistimed', 'delayed', 'cacheFloorPauses',
@@ -274,6 +274,7 @@ def main():
     parser.add_argument('--ao', choices=['auto', 'avfoundation', 'coreaudio'], default='auto')
     parser.add_argument('--archive-timestamps', action='store_true', help='Opt-in archive timestamp recovery experiment')
     parser.add_argument('--render-no-block', action='store_true', help='Opt-in render timing experiment')
+    parser.add_argument('--main-thread-load', action='store_true', help='DEBUG stress: periodic 25 ms main-thread work during capture')
     parser.add_argument('--startup-reserve', action='store_true', help='Opt-in live startup reserve experiment')
     parser.add_argument('--startup-target', action='store_true', help='DEBUG trial: hold live playback until measured buffer target')
     parser.add_argument('--native-cache-only', action='store_true', help='DEBUG trial: native cache handling without the app floor')
@@ -330,6 +331,7 @@ def main():
     if args.ao != 'auto': command.extend(['--observe-session-ao', args.ao])
     if args.archive_timestamps: command.append('--validate-archive-timestamps')
     if args.render_no_block: command.append('--validate-render-no-block')
+    if args.main_thread_load: command.append('--validate-main-thread-load')
     if args.startup_reserve: command.append('--validate-startup-reserve')
     if args.startup_target: command.append('--validate-startup-target')
     if args.native_cache_only: command.append('--validate-native-cache-only')

@@ -248,6 +248,20 @@ private final class SavedScenarioAppBackend: SavedPlaybackScenarioBackend {
             throw SavedScenarioFailure.playerWindowTimedOut
         }
         var previous = start
+        let lagProbe = MainQueueLagProbe()
+        lagProbe.start()
+        // Stress trial: the kind of short main-thread bursts EPG, sync and
+        // Smart Channels work produce, so render pacing can be compared under
+        // identical load.
+        let mainLoad: Task<Void, Never>? = CommandLine.arguments.contains("--validate-main-thread-load")
+            ? Task { @MainActor in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    let busyUntil = ContinuousClock.now.advanced(by: .milliseconds(25))
+                    while ContinuousClock.now < busyUntil {}
+                }
+            } : nil
+        defer { lagProbe.stop(); mainLoad?.cancel() }
         let deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
         while ContinuousClock.now < deadline {
             // A one-second sample can miss the short burst of playback before
@@ -272,7 +286,9 @@ private final class SavedScenarioAppBackend: SavedPlaybackScenarioBackend {
                       value.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-,./ ()")).contains($0) }) else { return NSNull() }
                 return value
             }
+            let lag = lagProbe.drain()
             emit(["event": "sample", "case": caseIndex, "elapsedMs": AppLog.elapsedMilliseconds(since: start, now: now),
+                  "mainLagMaxMs": lag.maxMilliseconds, "mainLagOver20": lag.over20Milliseconds, "mainLagSamples": lag.samples,
                   "tickGapMs": AppLog.elapsedMilliseconds(since: previous, now: now),
                   "generation": player.telemetryLoadGeneration,
                   "windowVisible": session.hostWindow?.occlusionState.contains(.visible) ?? false,

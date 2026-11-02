@@ -377,13 +377,17 @@ final class MPVPlayer {
 
     private var handle: OpaquePointer?
     private(set) var renderContext: OpaquePointer?
+    /// Drawing reads the render context through this box on the render queue.
+    nonisolated let renderTarget = MPVRenderTarget()
     private var wakeupPipe: [Int32] = [-1, -1]
     private var eventSource: DispatchSourceRead?
     private var statePollTimer: DispatchSourceTimer?
     private var bufferSeconds: Int = BufferSetting.read()
     @ObservationIgnored private var activeCachePauseFloorSeconds: Double = Tuning.cachePauseFloorSeconds(for: BufferSetting.read())
     @ObservationIgnored private var activeCachePauseResumeSeconds: Double = Tuning.cachePauseResumeSeconds(for: BufferSetting.read())
-    @ObservationIgnored private var playbackControl = PlaybackControlState()
+    @ObservationIgnored private var playbackControl = PlaybackControlState() {
+        didSet { renderTarget.update(backgroundSuspended: playbackControl.backgroundSuspended) }
+    }
     private var autoPausedForCacheFloor: Bool {
         get { playbackControl.cacheSuspended }
         set { playbackControl.cacheSuspended = newValue }
@@ -402,7 +406,9 @@ final class MPVPlayer {
     @ObservationIgnored private var bufferingEventCount = 0
     @ObservationIgnored private var bufferingTotalMilliseconds = 0
     private var loadGeneration: Int { playbackControl.generation }
-    @ObservationIgnored private var itemLifecycle = MPVItemLifecycle()
+    @ObservationIgnored private var itemLifecycle = MPVItemLifecycle() {
+        didSet { renderTarget.update(itemIdentity: itemLifecycle.loadedIdentity) }
+    }
     @ObservationIgnored private var propertyRequestSerial: UInt64 = 0
     @ObservationIgnored private var propertyRequests: [UInt64: (generation: Int, item: MPVItemLifecycle.Identity?, property: PropID)] = [:]
     @ObservationIgnored private var firstRenderedLoadGeneration = 0
@@ -985,6 +991,7 @@ final class MPVPlayer {
             return false
         }
         renderContext = ctx
+        if let ctx { renderTarget.install(ctx, blockForTargetTime: MPVRenderTiming.blockForTargetTime) }
         return true
     }
 
@@ -994,11 +1001,9 @@ final class MPVPlayer {
     }
 
     func resetRenderContext() {
-        if let ctx = renderContext {
-            mpv_render_context_set_update_callback(ctx, nil, nil)
-            mpv_render_context_free(ctx)
-            renderContext = nil
-        }
+        guard renderContext != nil else { return }
+        renderContext = nil
+        renderTarget.free()
     }
 
     // MARK: - Setup
@@ -1237,11 +1242,7 @@ final class MPVPlayer {
         if wakeupPipe[0] >= 0 { close(wakeupPipe[0]); wakeupPipe[0] = -1 }
         if wakeupPipe[1] >= 0 { close(wakeupPipe[1]); wakeupPipe[1] = -1 }
 
-        if let ctx = renderContext {
-            mpv_render_context_set_update_callback(ctx, nil, nil)
-            mpv_render_context_free(ctx)
-            renderContext = nil
-        }
+        resetRenderContext()
         // `mpv_terminate_destroy` synchronously waits for mpv's internal
         // worker threads to unwind — which can take tens of seconds when
         // the demuxer is mid-reconnect or waiting on a socket read. Hand
