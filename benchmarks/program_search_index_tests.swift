@@ -124,6 +124,58 @@ enum ProgramSearchIndexTests {
         catalogue.testFinishProgramSearchEnrichment()
         await catalogue.testWaitForProgramSearchIndex()
         expect(catalogue.programSearchIndexPublicationCount == 1, "No redundant tail index when the latest snapshot already won")
+        // Flat index structures: interning, posting lists, substring
+        // dictionary and ranking over packed columns.
+        do {
+            let base = Date(timeIntervalSinceReferenceDate: 700_000_000)
+            func program(_ id: String, _ title: String, _ minutes: Double, _ length: Double = 30) -> EPGProgram {
+                EPGProgram(id: id, channelID: "g", title: title, description: "",
+                           start: base.addingTimeInterval(minutes * 60), end: base.addingTimeInterval((minutes + length) * 60))
+            }
+            let guides: [(epgID: String, channelID: String, programs: [EPGProgram])] = [
+                ("g1", "c1", [program("a", "World News", -60), program("b", "News at Ten", 10),
+                              program("c", "World  News", 0), program("d", "CAFÉ Society", 2000)]),
+                ("g2", "c2", [program("e", "world news", 5), program("a", "World News", 20),
+                              program("f", "Café society", -3000), program("g", "Abcdefghijklmn", 15)]),
+                ("empty", "c3", []),
+                ("g3", "missing", [program("h", "World News", 0)]),
+            ]
+            let index = ProgramSearchIndex.build(guides: guides)!
+            let storage = index.storage!
+            expect(index.count == 9 && index.slotCount == 3, "Empty guides take no slot; ordinals cover every programme")
+            expect(storage.titleCount == 7, "Raw titles interned once each")
+            let interned = Set((0..<storage.tokenCount).map { k in
+                String(decoding: storage.tokenBytes[Int(storage.tokenOffsets[k])..<Int(storage.tokenOffsets[k + 1])], as: UTF8.self)
+            })
+            expect(interned == ["world", "news", "at", "ten", "café", "society", "abcdefghijklmn"],
+                   "Tokens are normalized and interned once: \(interned)")
+            for k in 0..<storage.tokenCount {
+                let postings = storage.tokenTitles[Int(storage.tokenTitleOffsets[k])..<Int(storage.tokenTitleOffsets[k + 1])]
+                expect(zip(postings, postings.dropFirst()).allSatisfy { $0 < $1 }, "Posting lists are strictly ascending")
+            }
+            expect(zip(storage.suffixKeys, storage.suffixKeys.dropFirst()).allSatisfy { $0 <= $1 }, "Substring keys sorted")
+            for t in 0..<storage.titleCount {
+                let run = Int(storage.titleRunOffsets[t])..<Int(storage.titleRunOffsets[t + 1])
+                expect(run.dropFirst().allSatisfy { storage.start[$0 - 1] <= storage.start[$0] }, "Title runs ordered by start")
+            }
+            expect(index[4].id == "e" && index[4].epgID == "g2" && index[4].programIndex == 0 && index[4].channelID == "c2"
+                   && index[4].titleLower == "world news", "Collection view reconstructs legacy entries")
+            func ids(_ query: String, slots: [Int32] = [0, 1, -1], at minutes: Double = 0) -> [String] {
+                let phrase = ProgramSearchIndex.normalize(query)
+                let tokens = phrase.split(whereSeparator: { $0 == " " || $0 == "\t" }).map { Array($0.utf8) }
+                return index.search(phrase: Array(phrase.utf8), tokens: tokens, now: base.addingTimeInterval(minutes * 60),
+                                    slotChannel: slots).map { index.program(ordinal: Int($0.ordinal)).program.id }
+            }
+            // Upcoming prefix matches (~160) beat a live non-phrase match (90); "a" is
+            // de-duplicated keeping its best-ranked copy; slot 2's channel is absent.
+            expect(ids("world news") == ["e", "a", "c"], "Ranking + id de-dup: \(ids("world news"))")
+            expect(ids("news") == ["b", "c", "e", "a"], "Single token: prefix 120 beats contains 70: \(ids("news"))")
+            expect(ids("ews wor") == ["c", "e", "a"], "Multi-token substrings AND across tokens")
+            expect(ids("CAFÉ") == ["d", "f"] && ids("cafe\u{301}") == ["d", "f"], "Unicode lower/NFC normalization")
+            expect(ids("efghijklm") == ["g"] && ids("bcdefghijklmnz").isEmpty, "Substrings longer than the 8-byte key verify tail bytes")
+            expect(ids("w", slots: [-1, -1, -1]).isEmpty && ids("zz").isEmpty, "Missing channels and absent tokens yield nothing")
+            expect(ids("news", slots: [0, 1, 0]).count == 5, "Every channel slot participates when present")
+        }
         print("Program search snapshot/enrichment checks: \(checks) passed")
     }
 }

@@ -186,7 +186,9 @@ class EPGViewModel {
         return playlists.first(where: { $0.id == id })
     }
 
-    var searchEntries: [ProgramSearchEntry] = []
+    /// Flat programme search index (interned titles/tokens, title-major SoA
+    /// columns). Iterating it yields legacy `ProgramSearchEntry` values.
+    var searchEntries = ProgramSearchIndex()
     /// Entries retain offsets into this exact guide snapshot. Progressive
     /// history publications can reorder the live arrays while search stays
     /// usable; they must not change the arrays behind an already built index.
@@ -2313,22 +2315,22 @@ class EPGViewModel {
         let channelSnapshot = displayedChannels
         let guideSnapshot = displayedPrograms
 
-        let channelsByEPGID: [String: Channel] = Dictionary(
-            channelSnapshot.compactMap { channel -> (String, Channel)? in
-                guard let id = channel.epgChannelID else { return nil }
-                return (id, channel)
-            },
-            uniquingKeysWith: { first, _ in first }
-        )
+        // One searchable guide per EPG id, owned by the first playlist channel
+        // that references it (channel order is the index's guide order).
+        var seenEPGIDs = Set<String>()
+        seenEPGIDs.reserveCapacity(channelSnapshot.count)
+        var guideInputs: [(epgID: String, channelID: String, programs: [EPGProgram])] = []
+        guideInputs.reserveCapacity(channelSnapshot.count)
         // Retain only guide arrays referenced by this playlist's entries;
         // unrelated XMLTV channels must not stay alive in the search snapshot.
         var programsSnapshot: [String: [EPGProgram]] = [:]
-        programsSnapshot.reserveCapacity(channelsByEPGID.count)
-        for epgID in channelsByEPGID.keys {
-            if let rows = guideSnapshot[epgID] { programsSnapshot[epgID] = rows }
-        }
-        let searchableCount = channelsByEPGID.keys.reduce(0) {
-            $0 + (programsSnapshot[$1]?.count ?? 0)
+        var searchableCount = 0
+        for channel in channelSnapshot {
+            guard let epgID = channel.epgChannelID, seenEPGIDs.insert(epgID).inserted else { continue }
+            guard let rows = guideSnapshot[epgID] else { continue }
+            programsSnapshot[epgID] = rows
+            searchableCount += rows.count
+            guideInputs.append((epgID, channel.id, rows))
         }
         searchIndexNeedsRebuild = false
         guard searchableCount > 0 else {
@@ -2344,32 +2346,9 @@ class EPGViewModel {
         searchIndexBuildIsFirstColdSnapshot = searchEntries.isEmpty
         programSearchIndexBuildCount &+= 1
 
-        indexBuildTask = Task.detached(priority: .utility) { [weak self, channelsByEPGID, programsSnapshot] in
+        indexBuildTask = Task.detached(priority: .utility) { [weak self, guideInputs, programsSnapshot] in
             let started = ContinuousClock.now
-            var entries: [ProgramSearchEntry] = []
-            // XMLTV feeds often include many channels outside this playlist.
-            // Reserve only the entries that can be searched through a channel.
-            entries.reserveCapacity(searchableCount)
-
-            for (epgID, progs) in programsSnapshot {
-                if Task.isCancelled { return }
-                guard let channel = channelsByEPGID[epgID] else { continue }
-                for (programIndex, program) in progs.enumerated() {
-                    if programIndex.isMultiple(of: 256), Task.isCancelled { return }
-                    entries.append(
-                        ProgramSearchEntry(
-                            id: program.id,
-                            epgID: epgID,
-                            programIndex: programIndex,
-                            channelID: channel.id,
-                            titleLower: program.title.lowercased(),
-                            start: program.start,
-                            end: program.end
-                        )
-                    )
-                }
-            }
-
+            guard let entries = ProgramSearchIndex.build(guides: guideInputs) else { return }
             if Task.isCancelled { return }
             let finalEntries = entries
             let buildMs = AppLog.elapsedMilliseconds(since: started)

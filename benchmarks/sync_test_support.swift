@@ -85,15 +85,6 @@ nonisolated enum ServerPasswordStore {
     }
     static func deletePasswordAsync(for id: UUID) async -> Bool { deletePassword(for: id) }
 }
-nonisolated struct ProgramSearchEntry: Sendable {
-    let id: String
-    let epgID: String
-    let programIndex: Int
-    let channelID: String
-    let titleLower: String
-    let start: Date
-    let end: Date
-}
 nonisolated enum DataCache {
     struct CachedChannels: Sendable { let savedAt: Date; let channels: [Channel] }
     struct CachedPrograms: Sendable { let savedAt: Date; let programs: [String: [EPGProgram]] }
