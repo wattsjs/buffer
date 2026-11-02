@@ -13,9 +13,10 @@ struct ChannelSidebarView: View {
     @AppStorage("sidebarHiddenExpanded") private var hiddenExpanded = false
 
     private var activeRecordingCount: Int {
-        recordingManager.recordings.filter {
+        // Counted in place; no filtered copy of the recordings list.
+        recordingManager.recordings.count {
             $0.status == .recording || $0.status == .scheduled
-        }.count
+        }
     }
 
     private var playlistName: String {

@@ -107,6 +107,7 @@ protocol EPGTimeSensitiveDrawing: AnyObject {
 }
 
 /// Document-coordinate drawing hosted on a horizontally bounded native surface.
+@MainActor
 protocol EPGViewportDrawing: AnyObject {
     func setTimelineOriginX(_ x: CGFloat)
 }

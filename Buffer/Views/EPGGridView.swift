@@ -9,8 +9,8 @@ struct EPGGridView: View {
     var catchupLookback: CatchupLookbackSetting = .default
     let guideVersion: Int
     let programsProvider: (Channel) -> [EPGProgram]
-    /// Optional ranged provider backed by pre-buckets in VM. When present, rowData + ProgramRow receive
-    /// only programs intersecting the current timeline window (makes buildRowData/buildBlocks allocation-free for the window).
+    /// Optional ranged provider backed by pre-buckets in VM. When present, the label and programme
+    /// row layouts receive only programs intersecting the current timeline window.
     var rangedProgramsProvider: ((Channel, Date, Date) -> [EPGProgram])? = nil
     var onCatchupGuideNeeded: (([Channel]) -> Void)? = nil
     let isFavorite: (Channel) -> Bool
@@ -19,6 +19,7 @@ struct EPGGridView: View {
     var onPlayFromStart: ((Channel, EPGProgram) -> Void)? = nil
 
     @Environment(\.activePlaylistID) private var activePlaylistID: UUID?
+    @Environment(\.epgActionModel) private var actionModel
 
     @State private var timelineAnchor = Date()
     @State private var timelineResetID = 0
@@ -29,10 +30,11 @@ struct EPGGridView: View {
     // on incidental re-renders from syncs or user actions.
     @State private var now = Date()
     @State private var nowTicker: Task<Void, Never>? = nil
-    @State private var timelineInputCache = EPGTimelineInputCache()
-    @State private var timeStripCache = EPGTimeStripCache()
+    /// The inputs behind the current document origin. Updated exactly when
+    /// the channel set or lookback changes, so the body never rescans channels.
     @State private var displayedTimelineInputs: EPGTimelineInputs?
     @State private var visibleChannelContext = EPGVisibleChannelContext()
+    @State private var popoverPresenter = EPGProgramPopoverPresenter()
 
     private let channelColumnWidth: CGFloat = 120
     private let rowHeight: CGFloat = 64
@@ -118,8 +120,23 @@ struct EPGGridView: View {
         timelineInputs.archiveStart(anchor: currentNow)
     }
 
+    /// The displayed inputs, or (before the first appearance) a direct
+    /// single-pass computation from the channels.
     private var timelineInputs: EPGTimelineInputs {
-        timelineInputCache.inputs(channels: channels, version: channelSetVersion, lookback: catchupLookback)
+        displayedTimelineInputs ?? currentTimelineInputs
+    }
+
+    private var currentTimelineInputs: EPGTimelineInputs {
+        EPGTimelineInputs(channels: channels, lookback: catchupLookback)
+    }
+
+    /// Reminder programme IDs for the active source. Read here, once per
+    /// grid update, so reminder changes refresh the visible native rows.
+    private var reminderProgramIDs: Set<String> {
+        guard let playlistID = activePlaylistID else { return [] }
+        let reminders = NotificationManager.shared.reminders
+        guard !reminders.isEmpty else { return [] }
+        return Set(reminders.lazy.filter { $0.playlistID == playlistID }.map(\.programID))
     }
 
     private func requestCatchupGuideIfNeeded(for channels: [Channel]) {
@@ -132,12 +149,6 @@ struct EPGGridView: View {
         let offset = now.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute)
         guard offset > 0, offset < Double(timelineWidth) else { return nil }
         return CGFloat(offset)
-    }
-
-    private static func timelineTime(_ date: Date) -> String {
-        date.formatted(date: .omitted, time: .shortened)
-            .replacingOccurrences(of: " ", with: "")
-            .lowercased()
     }
 
     var body: some View {
@@ -160,6 +171,10 @@ struct EPGGridView: View {
             let width = timelineWidth(hours: timelineHours)
             let nowX = makeNowX(now: now, timelineStart: timelineStart, timelineWidth: width)
 
+            let reminderIDs = reminderProgramIDs
+            let rowHeight = self.rowHeight
+            let pixelsPerMinute = self.pixelsPerMinute
+
             EPGScrollGrid(
                 items: channels,
                 rowHeight: rowHeight,
@@ -178,18 +193,18 @@ struct EPGGridView: View {
                 itemSetVersion: channelSetVersion,
                 dataVersion: AnyHashable(guideVersion),
                 referenceDate: now,
-                timeStripSlots: timeStripCache.slots(start: timelineStart, hours: timelineHours, pixelsPerMinute: pixelsPerMinute, relativeTo: now),
-                timeStripSlotWidth: 30 * pixelsPerMinute,
-                rowDataProvider: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd = timelineEnd, pixelsPerMinute, timelineHours] channel in
-                    let progs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
-                    return Self.buildRowData(
-                        channel: channel,
-                        programs: progs,
+                timeStrip: EPGTimeStripSpec(start: timelineStart, hours: timelineHours,
+                                            pixelsPerMinute: pixelsPerMinute, relativeTo: now),
+                rowDataProvider: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd] channel, slot in
+                    let programs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
+                    slot.channelName = channel.name
+                    slot.layout.build(
+                        programs: programs,
                         timelineStart: timelineStart,
-                        pixelsPerMinute: pixelsPerMinute,
-                        timelineHours: timelineHours,
-                        rowHeight: rowHeight,
-                        showGuideGaps: channel.supportsRewind
+                        pixelsPerMinute: Double(pixelsPerMinute),
+                        timelineWidth: Double(width),
+                        rowHeight: Double(rowHeight),
+                        showGaps: channel.supportsRewind
                     )
                 },
                 visibleItemsDidChange: { visible in
@@ -197,6 +212,50 @@ struct EPGGridView: View {
                     onCatchupGuideNeeded?(visible)
                 },
                 revealItemID: revealChannelID.map { AnyHashable($0) },
+                nativeProgramRow: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd,
+                                     catchupLookback, activePlaylistID, actionModel, popoverPresenter,
+                                     onChannelSelected, onPlayFromStart] channel, canvas in
+                    let programs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
+                    let onPlay = { onChannelSelected(channel) }
+                    let playFromStart = onPlayFromStart.map { callback in { (program: EPGProgram) in callback(channel, program) } }
+                    canvas.ownerID = channel.id
+                    canvas.setPrograms(
+                        programs,
+                        timelineStart: timelineStart,
+                        pixelsPerMinute: pixelsPerMinute,
+                        timelineWidth: width,
+                        rowHeight: rowHeight,
+                        showGaps: channel.supportsRewind,
+                        reminderIDs: reminderIDs
+                    )
+                    canvas.setReplayLookbackHours(channel.supportsRewind
+                        ? min(min(channel.catchup?.days ?? 0, 14) * 24, catchupLookback.limitHours ?? 336)
+                        : nil)
+                    canvas.setHandlers(
+                        onProgramTap: { [weak canvas] program, rect in
+                            guard let canvas else { return }
+                            popoverPresenter.present(
+                                program: program, channel: channel, anchor: rect, in: canvas,
+                                playlistID: activePlaylistID, actionModel: actionModel,
+                                onPlay: onPlay, onPlayFromStart: playFromStart
+                            )
+                        },
+                        onEmptyTap: onPlay,
+                        onProgramRightClick: { program, event, view in
+                            guard let activePlaylistID else { return }
+                            ReminderMenuBuilder.present(
+                                playlistID: activePlaylistID,
+                                program: program,
+                                channel: channel,
+                                event: event,
+                                in: view,
+                                onPlay: onPlay,
+                                onPlayFromStart: channel.canReplay(program) ? playFromStart.map { callback in { callback(program) } } : nil,
+                                actionModel: actionModel
+                            )
+                        }
+                    )
+                },
                 channelContent: { channel in
                     ChannelCell(
                         channel: channel,
@@ -209,38 +268,15 @@ struct EPGGridView: View {
                     .id(channel.id)
                     .fadeIfStreamDead(channel: channel)
                 },
-                programContent: { [programsProvider, rangedProgramsProvider, timelineStart, timelineEnd = timelineEnd] channel in
-                    let progs = rangedProgramsProvider?(channel, timelineStart, timelineEnd) ?? programsProvider(channel)
-                    return ProgramRow(
-                        channel: channel,
-                        programs: progs,
-                        fallbackTitle: channel.name,
-                        timelineStart: timelineStart,
-                        timelineWidth: width,
-                        pixelsPerMinute: pixelsPerMinute,
-                        rowHeight: rowHeight,
-                        showGuideGaps: channel.supportsRewind,
-                        replayLookbackHours: channel.supportsRewind
-                            ? min(min(channel.catchup?.days ?? 0, 14) * 24, catchupLookback.limitHours ?? 336)
-                            : nil,
-                        onPlay: { onChannelSelected(channel) },
-                        playlistID: activePlaylistID,
-                        onPlayFromStart: onPlayFromStart.map { callback in { callback(channel, $0) } }
-                    )
-                    .frame(maxWidth: .infinity, minHeight: rowHeight, maxHeight: rowHeight)
-                    .overlay(alignment: .bottom) {
-                        Divider().opacity(0.5)
-                    }
-                    // A failed live-stream probe says nothing about the
-                    // readability/availability of this schedule or its replay.
-                    // Keep status dimming on the channel/logo tile only; an
-                    // 80k-point row must not become an offscreen effect group.
-                },
+                // Programme rows are native (`nativeProgramRow`). A failed
+                // live-stream probe says nothing about the schedule or its
+                // replay, so status dimming stays on the channel tile only.
+                programContent: { _ in EmptyView() },
                 cornerContent: { cornerLabel }
             )
             .bufferPageBackground()
             .onChange(of: channelSetVersion) { _, _ in
-                let inputs = timelineInputs
+                let inputs = currentTimelineInputs
                 if displayedTimelineInputs != inputs {
                     displayedTimelineInputs = inputs
                     resetTimelineWindow(for: channels, now: Date())
@@ -248,74 +284,18 @@ struct EPGGridView: View {
                 requestCatchupGuideIfNeeded(for: channels)
             }
             .onChange(of: catchupLookback) { _, _ in
-                displayedTimelineInputs = timelineInputs
+                displayedTimelineInputs = currentTimelineInputs
                 resetTimelineWindow(for: channels, now: Date())
                 requestCatchupGuideIfNeeded(for: channels)
             }
             .onAppear {
-                displayedTimelineInputs = timelineInputs
+                displayedTimelineInputs = currentTimelineInputs
                 startNowTicker()
                 requestCatchupGuideIfNeeded(for: channels)
             }
             .onDisappear { stopNowTicker() }
         }
     }
-
-    private static func buildRowData(
-        channel: Channel,
-        programs: [EPGProgram],
-        timelineStart: Date,
-        pixelsPerMinute: CGFloat,
-        timelineHours: Int,
-        rowHeight: CGFloat,
-        showGuideGaps: Bool
-    ) -> ChannelLabelRowData {
-        let timelineWidth = CGFloat(timelineHours * 60) * pixelsPerMinute
-        let end = timelineStart.addingTimeInterval(Double(timelineWidth / pixelsPerMinute) * 60)
-
-        let sorted = programs
-            .filter { $0.end > timelineStart && $0.start < end }
-            .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
-
-        var blocks: [ChannelLabelBlockData] = []
-        var cursor = timelineStart
-
-        func appendGap(until gapEnd: Date) {
-            guard gapEnd > cursor else { return }
-            let startX = max(0, cursor.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let endX = min(Double(timelineWidth), gapEnd.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let width = endX - startX
-            guard width > 2 else { return }
-            blocks.append(ChannelLabelBlockData(
-                rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                timeRange: nil
-            ))
-        }
-
-        for p in sorted {
-            if showGuideGaps {
-                appendGap(until: p.start)
-            }
-            let effectiveStart = max(p.start, cursor)
-            guard p.end > effectiveStart else { continue }
-            let startX = max(0, effectiveStart.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let endX = min(Double(timelineWidth), p.end.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let width = endX - startX
-            guard width > 2 else { continue }
-            blocks.append(ChannelLabelBlockData(
-                rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                timeRange: "\(Self.timelineTime(p.start)) - \(Self.timelineTime(p.end))"
-            ))
-            cursor = p.end
-        }
-
-        if showGuideGaps && !sorted.isEmpty {
-            appendGap(until: end)
-        }
-
-        return ChannelLabelRowData(channelName: channel.name, blocks: blocks)
-    }
-
 
     private var cornerLabel: some View {
         HStack(spacing: 6) {
@@ -434,230 +414,51 @@ private struct ChannelCell: View {
     }
 }
 
-// MARK: - Program row
+// MARK: - Programme popover
 
-private struct ProgramRow: View {
-    @Environment(\.epgActionModel) private var actionModel
-    let channel: Channel
-    let programs: [EPGProgram]
-    let fallbackTitle: String
-    let timelineStart: Date
-    let timelineWidth: CGFloat
-    let pixelsPerMinute: CGFloat
-    let rowHeight: CGFloat
-    let showGuideGaps: Bool
-    let replayLookbackHours: Int?
-    let onPlay: () -> Void
+/// Presents the programme detail for a native programme row. One presenter
+/// serves the whole grid; at most one detail popover is open at a time.
+@MainActor
+final class EPGProgramPopoverPresenter: NSObject, NSPopoverDelegate {
+    private var popover: NSPopover?
 
-    @State private var selectedProgram: EPGProgram?
-    @State private var selectedRect: CGRect = .zero
-
-    let playlistID: UUID?
-    var onPlayFromStart: ((EPGProgram) -> Void)? = nil
-
-    private var reminderProgramIDs: Set<String> {
-        guard let playlistID else { return [] }
-        let ids = Set(programs.map(\.id))
-        return Set(
-            NotificationManager.shared.reminders
-                .lazy
-                .filter { $0.playlistID == playlistID && ids.contains($0.programID) }
-                .map(\.programID)
-        )
-    }
-
-    var body: some View {
-        ProgramCanvasLayer(
-            ownerID: channel.id,
-            programs: programs,
-            fallbackTitle: fallbackTitle,
-            timelineStart: timelineStart,
-            timelineWidth: timelineWidth,
-            pixelsPerMinute: pixelsPerMinute,
-            rowHeight: rowHeight,
-            showGuideGaps: showGuideGaps,
-            replayLookbackHours: replayLookbackHours,
-            reminderProgramIDs: reminderProgramIDs,
-            onProgramTap: { program, rect in
-                selectedRect = rect
-                selectedProgram = program
+    func present(
+        program: EPGProgram,
+        channel: Channel,
+        anchor: CGRect,
+        in view: NSView,
+        playlistID: UUID?,
+        actionModel: EPGViewModel?,
+        onPlay: @escaping () -> Void,
+        onPlayFromStart: ((EPGProgram) -> Void)?
+    ) {
+        popover?.close()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        let close: () -> Void = { [weak popover] in popover?.close() }
+        let content = ProgramDetailPopover(
+            program: program,
+            channel: channel,
+            onPlay: {
+                close()
+                onPlay()
             },
-            onEmptyTap: onPlay,
-            onProgramRightClick: { program, event, view in
-                if let playlistID {
-                    ReminderMenuBuilder.present(
-                        playlistID: playlistID,
-                        program: program,
-                        channel: channel,
-                        event: event,
-                        in: view,
-                        onPlay: onPlay,
-                        onPlayFromStart: channel.canReplay(program) ? onPlayFromStart.map { callback in { callback(program) } } : nil,
-                        actionModel: actionModel
-                    )
-                }
-            }
+            onPlayFromStart: onPlayFromStart.map { callback in { close(); callback(program) } }
         )
-        .equatable()
-        .popover(
-            isPresented: Binding(
-                get: { selectedProgram != nil },
-                set: { if !$0 { selectedProgram = nil } }
-            ),
-            attachmentAnchor: .rect(.rect(selectedRect)),
-            arrowEdge: .top
-        ) {
-            if let program = selectedProgram {
-                ProgramDetailPopover(
-                    program: program,
-                    channel: channel,
-                    onPlay: {
-                        selectedProgram = nil
-                        onPlay()
-                    },
-                    onPlayFromStart: onPlayFromStart.map { callback in { selectedProgram = nil; callback(program) } }
-                )
-            }
-        }
-    }
-}
-
-// MARK: - AppKit programme canvas (viewport-sized backing for full archive widths)
-
-private struct ProgramCanvasLayer: View, Equatable {
-    let ownerID: String
-    let programs: [EPGProgram]
-    let fallbackTitle: String
-    let timelineStart: Date
-    let timelineWidth: CGFloat
-    let pixelsPerMinute: CGFloat
-    let rowHeight: CGFloat
-    let showGuideGaps: Bool
-    let replayLookbackHours: Int?
-    let reminderProgramIDs: Set<String>
-    let onProgramTap: (EPGProgram, CGRect) -> Void
-    let onEmptyTap: () -> Void
-    let onProgramRightClick: (EPGProgram, NSEvent, NSView) -> Void
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        guard lhs.ownerID == rhs.ownerID,
-              lhs.timelineStart == rhs.timelineStart,
-              lhs.timelineWidth == rhs.timelineWidth,
-              lhs.pixelsPerMinute == rhs.pixelsPerMinute,
-              lhs.rowHeight == rhs.rowHeight,
-              lhs.showGuideGaps == rhs.showGuideGaps,
-              lhs.replayLookbackHours == rhs.replayLookbackHours,
-              lhs.fallbackTitle == rhs.fallbackTitle,
-              lhs.reminderProgramIDs == rhs.reminderProgramIDs,
-              lhs.programs.count == rhs.programs.count else { return false }
-        for (a, b) in zip(lhs.programs, rhs.programs) {
-            if a.id != b.id || a.start != b.start || a.end != b.end || a.title != b.title { return false }
-        }
-        return true
+        .environment(\.activePlaylistID, playlistID)
+        .environment(\.epgActionModel, actionModel)
+        let controller = NSHostingController(rootView: content)
+        controller.sizingOptions = .preferredContentSize
+        popover.contentViewController = controller
+        popover.delegate = self
+        self.popover = popover
+        // `arrowEdge: .top`: the card hangs below the programme.
+        popover.show(relativeTo: anchor, of: view, preferredEdge: view.isFlipped ? .maxY : .minY)
     }
 
-    fileprivate typealias Block = EPGProgramBlock
-
-    private func buildBlocks() -> [Block] {
-        let end = timelineStart.addingTimeInterval(Double(timelineWidth / pixelsPerMinute) * 60)
-
-        let sorted = programs
-            .filter { $0.end > timelineStart && $0.start < end }
-            .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
-
-        var blocks: [Block] = []
-        var cursor: Date = timelineStart
-
-        func appendGap(until gapEnd: Date) {
-            guard gapEnd > cursor else { return }
-            let startX = max(0, cursor.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let endX = min(Double(timelineWidth), gapEnd.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let width = endX - startX
-            guard width > 2 else { return }
-            blocks.append(
-                Block(
-                    program: nil,
-                    rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                    hasReminder: false
-                )
-            )
-        }
-
-        for p in sorted {
-            if showGuideGaps {
-                appendGap(until: p.start)
-            }
-            let effectiveStart = max(p.start, cursor)
-            guard p.end > effectiveStart else { continue }
-
-            let startX = max(0, effectiveStart.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let endX = min(Double(timelineWidth), p.end.timeIntervalSince(timelineStart) / 60.0 * Double(pixelsPerMinute))
-            let width = endX - startX
-            guard width > 2 else { continue }
-
-            blocks.append(
-                Block(
-                    program: p,
-                    rect: CGRect(x: startX, y: 3, width: width, height: Double(rowHeight) - 6),
-                    hasReminder: reminderProgramIDs.contains(p.id)
-                )
-            )
-            cursor = p.end
-        }
-
-        if showGuideGaps && !sorted.isEmpty {
-            appendGap(until: end)
-        }
-
-        return blocks
-    }
-
-    var body: some View {
-        ProgramBlocksRepresentable(
-            ownerID: ownerID,
-            blocks: buildBlocks(),
-            replayLookbackHours: replayLookbackHours,
-            onProgramTap: onProgramTap,
-            onEmptyTap: onEmptyTap,
-            onProgramRightClick: onProgramRightClick
-        )
-    }
-}
-
-private struct ProgramBlocksRepresentable: NSViewRepresentable {
-    let ownerID: String
-    let blocks: [ProgramCanvasLayer.Block]
-    let replayLookbackHours: Int?
-    let onProgramTap: (EPGProgram, CGRect) -> Void
-    let onEmptyTap: () -> Void
-    let onProgramRightClick: (EPGProgram, NSEvent, NSView) -> Void
-
-    func makeNSView(context: Context) -> ProgramBlocksView {
-        let view = ProgramBlocksView()
-        EPGGridStyle.applyAppearance(to: view, scheme: context.environment.colorScheme,
-                                    contrast: context.environment.colorSchemeContrast)
-        view.setHandlers(
-            onProgramTap: onProgramTap,
-            onEmptyTap: onEmptyTap,
-            onProgramRightClick: onProgramRightClick
-        )
-        view.ownerID = ownerID
-        view.setBlocks(blocks)
-        view.setReplayLookbackHours(replayLookbackHours)
-        return view
-    }
-
-    func updateNSView(_ view: ProgramBlocksView, context: Context) {
-        EPGGridStyle.applyAppearance(to: view, scheme: context.environment.colorScheme,
-                                    contrast: context.environment.colorSchemeContrast)
-        view.setHandlers(
-            onProgramTap: onProgramTap,
-            onEmptyTap: onEmptyTap,
-            onProgramRightClick: onProgramRightClick
-        )
-        view.ownerID = ownerID
-        view.setBlocks(blocks)
-        view.setReplayLookbackHours(replayLookbackHours)
+    func popoverDidClose(_ notification: Notification) {
+        if (notification.object as? NSPopover) === popover { popover = nil }
     }
 }
 
