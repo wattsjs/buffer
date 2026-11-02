@@ -123,7 +123,9 @@ setup_signing() {
     DEVELOPER_ID_APPLICATION=$(detect_signing_identity "$SIGNING_KEYCHAIN_PATH")
     if [[ -n "$DEVELOPER_ID_APPLICATION" ]]; then
       activate_signing_keychain "$SIGNING_KEYCHAIN_PATH"
-      KEYCHAIN_BUILD_FLAGS=(OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN_PATH")
+      # The keychain is now on the search list alongside login, so archive
+      # (Apple Development) and export (Developer ID) both find their
+      # identities. Pinning codesign to this keychain hid the former.
       return 0
     fi
   fi

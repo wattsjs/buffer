@@ -36,6 +36,36 @@ final class SmartSportsCoordinator {
     /// guide-only refresh reuses the previous discovery.
     @ObservationIgnored private var autoDiscoveryCache: (signature: Int, result: SmartAutoDiscoveryResult)?
 
+    static let automaticBase = SmartSportsDefinition(schemaVersion: 1, playlistID: playlistID,
+        name: "Smart Channels", provenance: "Automatic cross-account grouping", feeds: [], heldEndpoints: [])
+
+    /// Preferences saved against retired curated feed IDs move to whichever
+    /// current feed contains the same physical stream; others are dropped.
+    /// Returns whether anything changed.
+    nonisolated static func migrateRetiredFeedOverrides(_ overrides: inout SmartSportsOverrides,
+                                                       definition: SmartSportsDefinition) -> Bool {
+        let validFeeds = Set(definition.feeds.map(\.id) + overrides.customFeeds.map(\.id))
+        var feedByKey: [String: String] = [:]
+        for feed in definition.feeds {
+            for variant in feed.variants { feedByKey[variant.key.rawValue] = feed.id }
+        }
+        var changed = false
+        func remap(_ table: inout [String: String]) {
+            for (feedID, keyRaw) in table where !validFeeds.contains(feedID) {
+                table[feedID] = nil
+                if let current = feedByKey[keyRaw], table[current] == nil { table[current] = keyRaw }
+                changed = true
+            }
+        }
+        remap(&overrides.preferredVariants)
+        remap(&overrides.preferredGuides)
+        for (key, link) in overrides.links where !validFeeds.contains(link.feedID) {
+            overrides.links[key] = nil
+            changed = true
+        }
+        return changed
+    }
+
     /// Source caches may have changed while Smart was inactive.
     func invalidateAutoDiscovery() { autoDiscoveryCache = nil }
 
@@ -114,9 +144,10 @@ final class SmartSportsCoordinator {
         errorMessage = nil
         var configurations = configurations
         do {
-            if curatedDefinition == nil {
-                curatedDefinition = try await Task.detached(priority: .utility) { try SmartSportsCatalog.loadBundled() }.value
-            }
+            // Smart Channels is built entirely from automatic grouping; the
+            // former hand-curated catalog is retired. Injected definitions
+            // (tests, diagnostics) still act as a fixed base.
+            if curatedDefinition == nil { curatedDefinition = Self.automaticBase }
             guard epoch == refreshEpoch, !Task.isCancelled, let curated = curatedDefinition else { return }
             if let autoDiscovery, UserDefaults.standard.object(forKey: Self.autoAggregationKey) as? Bool ?? true {
                 let curatedKeys = Set(curated.feeds.flatMap { $0.variants.map(\.key) } + curated.heldEndpoints.map(\.key))
@@ -149,6 +180,9 @@ final class SmartSportsCoordinator {
                 guard epoch == refreshEpoch, !Task.isCancelled else { return }
                 state = loaded
                 stateLoaded = true
+            }
+            if Self.migrateRetiredFeedOverrides(&state.overrides, definition: definition) {
+                try? await store.save(overrides: state.overrides)
             }
             let configuredIDs = Set(configurations.map(\.id))
             let priorSources = loadedSources
@@ -220,7 +254,7 @@ final class SmartSportsCoordinator {
             isLoading = false
         } catch {
             guard epoch == refreshEpoch, !Task.isCancelled else { return }
-            errorMessage = "Smart Sports could not load its local catalog or saved reviews."
+            errorMessage = "Smart Channels could not load your saved reviews."
             isLoading = false
         }
     }
@@ -495,7 +529,7 @@ final class SmartSportsCoordinator {
         rebuild()
         let overrides = state.overrides
         do { try await store.save(overrides: overrides) }
-        catch { errorMessage = "Your Smart Sports review could not be saved." }
+        catch { errorMessage = "Your Smart Channels review could not be saved." }
     }
 
     /// Rebuilds the catalog when playback/probe measurements changed since the

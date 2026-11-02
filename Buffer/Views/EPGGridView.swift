@@ -832,7 +832,7 @@ struct ProgramDetailPopover: View {
         guard let playlistID = activePlaylistID else { return }
         guard let action = actionModel?.sourceProgramAction(channel: channel, program: program) ??
                 (channel.sourceOwnership?.logicalChannelID == nil ? (channel, program) : nil) else {
-            actionModel?.showSmartActionUnavailable("The guide source has changed. Refresh Smart Sports and select the programme again.")
+            actionModel?.showSmartActionUnavailable("The guide source has changed. Refresh Smart Channels and select the programme again.")
             return
         }
         _ = recordingManager.schedule(
@@ -875,7 +875,7 @@ struct ProgramDetailPopover: View {
         guard let playlistID = activePlaylistID else { return }
         guard let action = actionModel?.sourceProgramAction(channel: channel, program: program) ??
                 (channel.sourceOwnership?.logicalChannelID == nil ? (channel, program) : nil) else {
-            actionModel?.showSmartActionUnavailable("The guide source has changed. Refresh Smart Sports and select the programme again.")
+            actionModel?.showSmartActionUnavailable("The guide source has changed. Refresh Smart Channels and select the programme again.")
             return
         }
         Task { @MainActor in

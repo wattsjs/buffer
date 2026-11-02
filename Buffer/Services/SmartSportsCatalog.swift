@@ -27,14 +27,6 @@ nonisolated struct SmartSportsCatalog: Sendable {
 
     enum LoadError: Error { case missingResource, unsupportedSchema, duplicateFeedID }
 
-    static func loadBundled(bundle: Bundle = .main) throws -> SmartSportsDefinition {
-        guard let url = bundle.url(forResource: "SmartSportsCatalog", withExtension: "json")
-            ?? bundle.url(forResource: "SmartSportsCatalog", withExtension: "json", subdirectory: "Resources") else {
-            throw LoadError.missingResource
-        }
-        return try loadDefinition(data: Data(contentsOf: url))
-    }
-
     static func loadDefinition(data: Data) throws -> SmartSportsDefinition {
         let definition = try JSONDecoder().decode(SmartSportsDefinition.self, from: data)
         guard definition.schemaVersion == 1 else { throw LoadError.unsupportedSchema }

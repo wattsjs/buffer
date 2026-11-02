@@ -4,6 +4,10 @@ import Foundation
 /// feeds, so one row plays whichever account currently has the best stream.
 /// Pure metadata grouping: candidates still pass the catalog's identity,
 /// capacity and recovery rules before anything plays.
+nonisolated protocol GuideKeyed {
+    var guideID: String? { get }
+}
+
 nonisolated enum AutoChannelGrouper {
     static let feedPrefix = "smart:auto:"
 
@@ -37,7 +41,10 @@ nonisolated enum AutoChannelGrouper {
                         minimumSources: Int = 2,
                         filter: SmartChannelFilter = .init())
         -> (feeds: [SmartSportsFeedDefinition], inventory: [SmartRegionSummary]) {
-        struct Member { let snapshot: SmartSportsSourceSnapshot; let channel: Channel; let parsed: Parsed }
+        struct Member: GuideKeyed {
+            let snapshot: SmartSportsSourceSnapshot; let channel: Channel; let parsed: Parsed
+            var guideID: String? { channel.epgChannelID }
+        }
         var groups: [Identity: [Member]] = [:]
         var inventory: [String: [String: Int]] = [:]
         for snapshot in snapshots {
@@ -59,13 +66,17 @@ nonisolated enum AutoChannelGrouper {
             groups[identity] = nil
         }
 
+        mergeGroupsSharingGuideIDs(&groups)
+
         var feeds: [SmartSportsFeedDefinition] = []
         for (identity, members) in groups {
             let category = category(for: members.map(\.channel.group))
             if filter.isEnabled {
                 guard filter.allows(region: regionLabel(identity.country), category: category) else { continue }
             } else {
-                guard Set(members.map(\.snapshot.sourceID)).count >= minimumSources else { continue }
+                // Sports channels are kept even when one account carries
+                // them; everything else needs several sources to group.
+                guard category == "Sports" || Set(members.map(\.snapshot.sourceID)).count >= minimumSources else { continue }
             }
             let keys = members.map { SmartSportsEndpointKey(sourceID: $0.snapshot.sourceID, nativeID: nativeID(of: $0.channel)) }
             guard Set(keys).count == keys.count, curated.isDisjoint(with: keys) else { continue }
@@ -119,6 +130,22 @@ nonisolated enum AutoChannelGrouper {
         "hebrew": "hebrew", "armenian": "armenian", "pashto": "pashto", "afghan": "pashto",
     ]
 
+    /// "Australia | Sports", "United Kingdom - Entertainment", "USA Sports".
+    private static func countryName(in text: String) -> String? {
+        let lower = " " + text.lowercased().map { $0.isLetter ? $0 : " " }.reduce(into: "") { $0.append($1) } + " "
+        for (name, code) in countryNames where lower.contains(" \(name) ") { return code }
+        return nil
+    }
+
+    private static let countryNames: [(String, String)] = [
+        ("united kingdom", "uk"), ("great britain", "uk"), ("england", "uk"), ("scotland", "uk"), ("britain", "uk"),
+        ("united states", "us"), ("usa", "us"), ("america", "us"), ("australia", "au"), ("aussie", "au"),
+        ("new zealand", "nz"), ("canada", "ca"), ("ireland", "ie"), ("india", "in"), ("germany", "de"),
+        ("france", "fr"), ("spain", "es"), ("italy", "it"), ("portugal", "pt"), ("netherlands", "nl"),
+        ("brazil", "br"), ("mexico", "mx"), ("argentina", "ar"), ("south africa", "za"), ("turkey", "tr"),
+        ("poland", "pl"), ("sweden", "se"), ("norway", "no"), ("denmark", "dk"), ("finland", "fi"),
+    ]
+
     private static func language(in text: String) -> String? {
         for word in text.lowercased().split(whereSeparator: { !$0.isLetter }) {
             if let language = languages[String(word)] { return language }
@@ -127,6 +154,44 @@ nonisolated enum AutoChannelGrouper {
     }
 
     static func isAutomatic(feedID: String) -> Bool { feedID.hasPrefix(feedPrefix) }
+
+    /// Providers often name one broadcast differently ("Fox Sports 501" and
+    /// "Fox Sports 501 Cricket") but give it the same guide ID. Groups in a
+    /// compatible region that share a specific guide ID become one group,
+    /// keeping the largest group's identity. Synthetic or widely shared IDs
+    /// (placeholders reused across many channels) never merge.
+    private static func mergeGroupsSharingGuideIDs<Member>(_ groups: inout [Identity: [Member]]) where Member: GuideKeyed {
+        var identitiesByGuide: [String: Set<Identity>] = [:]
+        for (identity, members) in groups {
+            for member in members {
+                guard let raw = member.guideID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                      raw.count >= 3, !raw.hasPrefix("xtream-stream-") else { continue }
+                identitiesByGuide[raw, default: []].insert(identity)
+            }
+        }
+        var parent: [Identity: Identity] = [:]
+        func root(_ identity: Identity) -> Identity {
+            var current = identity
+            while let next = parent[current], next != current { current = next }
+            return current
+        }
+        for identities in identitiesByGuide.values where identities.count > 1 && identities.count <= 4 {
+            let countries = Set(identities.map(\.country).filter { !$0.isEmpty })
+            guard countries.count <= 1 else { continue }
+            let ordered = identities.sorted { (groups[$0]?.count ?? 0, $1.name) > (groups[$1]?.count ?? 0, $0.name) }
+            let keep = root(ordered[0])
+            for other in ordered.dropFirst() {
+                let r = root(other)
+                if r != keep { parent[r] = keep }
+            }
+        }
+        guard !parent.isEmpty else { return }
+        var merged: [Identity: [Member]] = [:]
+        for (identity, members) in groups {
+            merged[root(identity), default: []].append(contentsOf: members)
+        }
+        groups = merged
+    }
 
     // MARK: - Name parsing
 
@@ -142,6 +207,9 @@ nonisolated enum AutoChannelGrouper {
             text.removeSubrange(range)
         }
         if country.isEmpty, let (code, _) = leadingCountry(in: channel.group.lowercased()) {
+            country = code
+        }
+        if country.isEmpty, let code = countryName(in: channel.group) {
             country = code
         }
         if country.isEmpty, let guide = channel.epgChannelID?.lowercased(),

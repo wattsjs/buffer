@@ -78,7 +78,7 @@ enum ReminderMenuBuilder {
                 manager.cancelReminder(playlistID: playlistID, for: program)
             })
         } else if action == nil {
-            let unavailable = NSMenuItem(title: "Guide source unavailable — refresh Smart Sports", action: nil, keyEquivalent: "")
+            let unavailable = NSMenuItem(title: "Guide source unavailable — refresh Smart Channels", action: nil, keyEquivalent: "")
             unavailable.isEnabled = false
             menu.addItem(unavailable)
         } else if program.end <= Date() {

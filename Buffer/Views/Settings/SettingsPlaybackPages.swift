@@ -11,7 +11,7 @@ struct PlaybackSettingsPage: View {
                     ForEach(ExternalPlayerKind.allCases) { option in Text(option == .none ? "Buffer" : option.displayName).tag(option) }
                 }
             } header: { Text("Default player") } footer: {
-                Text(player == .none ? "Videos play in Buffer." : "Original source playlists open in \(player.displayName). Smart Sports uses Buffer for managed connection limits and source recovery.")
+                Text(player == .none ? "Videos play in Buffer." : "Original source playlists open in \(player.displayName). Smart Channels uses Buffer for managed connection limits and source recovery.")
             }
 
             Section {

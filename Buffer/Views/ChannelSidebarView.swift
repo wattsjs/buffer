@@ -33,10 +33,10 @@ struct ChannelSidebarView: View {
                 Button {
                     viewModel.activateSmartSports()
                 } label: {
-                    Label("Smart Channels", systemImage: viewModel.isSmartSportsActive ? "checkmark" : "sportscourt")
+                    Label("Smart Channels", systemImage: viewModel.isSmartSportsActive ? "checkmark" : "square.stack.3d.up")
                 }
                 if viewModel.isSmartSportsActive {
-                    Button("Review Smart Sports…") { openWindow(id: "smart-sports-reviews") }
+                    Button("Review Smart Channels…") { openWindow(id: "smart-sports-reviews") }
                 }
                 Divider()
                 ForEach(viewModel.playlists) { playlist in

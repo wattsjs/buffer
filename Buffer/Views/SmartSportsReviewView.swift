@@ -24,7 +24,7 @@ struct SmartSportsReviewView: View {
         VStack(spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Smart Sports membership reviews").font(.title2.weight(.semibold))
+                    Text("Smart Channels membership reviews").font(.title2.weight(.semibold))
                     Text("Held streams stay outside automatic grouping until reviewed.")
                         .font(.subheadline).foregroundStyle(.secondary)
                 }
@@ -170,7 +170,7 @@ private struct SmartSportsMembershipReviewDetail: View {
                         Button("Accept current identity") { save { await coordinator.acceptIdentity(item.key) } }
                             .disabled(current == nil || isSaving)
                     }
-                    Button("Exclude from Smart Sports") { save { await coordinator.reject(item.key) } }
+                    Button("Exclude from Smart Channels") { save { await coordinator.reject(item.key) } }
                         .disabled(item.state == .rejected || isSaving)
                 }
                 Button("Restore proposal") { save { await coordinator.restoreProposal(item.key) } }.disabled(isSaving)

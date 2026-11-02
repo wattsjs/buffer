@@ -318,6 +318,27 @@ struct SmartSportsCoordinatorTests {
         await availability.reject(keyB)
         check(availability.aggregateAvailability(for: "smart:sports:fixture", now: now).state == .unavailable,
               "No accepted current metadata member is unavailable, not online or busy")
+        // Saved choices on retired curated feeds move to the automatic feed
+        // that now holds the same stream; unrelated stale entries are dropped.
+        do {
+            let src = UUID()
+            let kept = Channel(id: "keep", name: "AU: ESPN", logoURL: nil, group: "AU | Sports",
+                               streamURL: URL(string: "http://127.0.0.1/keep")!, epgChannelID: "espn.au")
+            let auto = SmartSportsDefinition(schemaVersion: 1, playlistID: "smart:sports:v1", name: "Smart Channels",
+                provenance: "test", feeds: [SmartSportsFeedDefinition(id: "smart:auto:au:espn", name: "ESPN", country: "AU",
+                    language: "", edition: "Sports", guideStatus: "", caveats: [], variants: [variant(sourceID: src, channel: kept)])],
+                heldEndpoints: [])
+            let keptKey = SmartSportsEndpointKey(sourceID: src, nativeID: "keep").rawValue
+            var overrides = SmartSportsOverrides()
+            overrides.preferredVariants = ["smart:sports:au.espn-1": keptKey, "smart:sports:gone": "\(UUID().uuidString)|x"]
+            overrides.preferredGuides = ["smart:sports:au.espn-1": keptKey]
+            overrides.links["\(src.uuidString)|old"] = .init(feedID: "smart:sports:gone", identity: .init(channel: kept))
+            check(SmartSportsCoordinator.migrateRetiredFeedOverrides(&overrides, definition: auto), "Migration reported no change")
+            check(overrides.preferredVariants == ["smart:auto:au:espn": keptKey]
+                  && overrides.preferredGuides == ["smart:auto:au:espn": keptKey], "Preferences did not move to the automatic feed")
+            check(overrides.links.isEmpty, "Links to retired feeds were kept")
+            check(!SmartSportsCoordinator.migrateRetiredFeedOverrides(&overrides, definition: auto), "Migration is not idempotent")
+        }
         print("PASS \(checks) Smart Sports coordinator/loader namespace, source action, account, archive and epoch checks")
     }
 

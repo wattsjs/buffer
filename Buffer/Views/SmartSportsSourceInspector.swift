@@ -13,7 +13,7 @@ struct SmartSportsSourceInspector: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(feed?.name ?? "Smart Sports sources").font(.title2.weight(.semibold))
+                    Text(feed?.name ?? "Smart Channels sources").font(.title2.weight(.semibold))
                     Text("\(variants.filter(\.isPlayable).count) available of \(variants.count) variants")
                         .font(.subheadline).foregroundStyle(.secondary)
                 }

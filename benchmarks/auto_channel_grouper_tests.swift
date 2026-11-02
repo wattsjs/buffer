@@ -43,7 +43,9 @@ import Foundation
         ]
         let feeds = AutoChannelGrouper.feeds(from: snapshots)
         let byName = Dictionary(uniqueKeysWithValues: feeds.map { ($0.name, $0) })
-        precondition(feeds.count == 2, "Expected Sky + BBC only, got \(feeds.map(\.name))")
+        // "UK: Only Here" is a sports channel on one account: kept. PPV is not.
+        precondition(feeds.count == 3 && byName["Only Here"]?.variants.count == 1,
+                     "Expected Sky, BBC and single-source sport, got \(feeds.map(\.name))")
         precondition(byName["Sky Sports Main Event"]?.variants.count == 3)
         precondition(byName["Sky Sports Main Event"]?.edition == "Sports" && byName["BBC One"]?.edition == "Entertainment" || byName["BBC One"]?.edition == "Channels")
         precondition(feeds.allSatisfy { AutoChannelGrouper.isAutomatic(feedID: $0.id) && $0.country == "UK" })
@@ -52,6 +54,25 @@ import Foundation
         // Curated endpoints keep their curated feed.
         let curated: Set<SmartSportsEndpointKey> = [.init(sourceID: a, nativeID: "a1")]
         precondition(!AutoChannelGrouper.feeds(from: snapshots, excluding: curated).contains { $0.name == "Sky Sports Main Event" })
+        // Country names in group titles set the region.
+        precondition(parsed("ESPN", group: "Australia | Sports")?.identity.country == "au")
+        precondition(parsed("Sky One", group: "United Kingdom - Entertainment")?.identity.country == "uk")
+        precondition(parsed("TSN 1", group: "Canada Sports")?.identity.country == "ca")
+
+        // Differently named channels sharing a specific guide ID merge;
+        // synthetic per-stream IDs never do.
+        let merged = AutoChannelGrouper.feeds(from: [
+            SmartSportsSourceSnapshot(sourceID: a, sourceName: "A", channels: [
+                ch("m1", "AU: Fox Sports 501", group: "AU | Sports", guide: "FoxSports501.au"),
+                ch("m3", "AU: Channel X", group: "AU | Sports", guide: "xtream-stream-1")]),
+            SmartSportsSourceSnapshot(sourceID: b, sourceName: "B", channels: [
+                ch("m2", "Fox Sports 501 Cricket", group: "Australia | Sports", guide: "foxsports501.au"),
+                ch("m4", "AU: Channel Y", group: "AU | Sports", guide: "xtream-stream-1")]),
+        ])
+        precondition(merged.contains { $0.variants.count == 2 && Set($0.variants.map(\.nativeID)) == ["m1", "m2"] },
+                     "Shared guide ID did not merge: \(merged.map { ($0.name, $0.variants.count) })")
+        precondition(!merged.contains { Set($0.variants.map(\.nativeID)) == ["m3", "m4"] }, "Synthetic guide IDs merged")
+
         // Language-only labels become their own switchable region.
         precondition(AutoChannelGrouper.regionLabel(parsed("beIN Sports 1", group: "Arabic | Sports")!.identity.country) == "Arabic")
         precondition(AutoChannelGrouper.regionLabel(parsed("Some Channel", group: "Misc")!.identity.country) == SmartChannelFilter.unknownRegion)
@@ -76,6 +97,6 @@ import Foundation
         precondition(!SmartChannelFilter(isEnabled: true).allows(region: "US", category: "Sports"), "Unlisted region allowed")
         precondition(SmartChannelFilter().allows(region: "FR", category: "News"), "Disabled filter rejected")
 
-        print("PASS auto channel grouping: region/quality normalisation, distinct timeshift/region, event-slot exclusion, cross-source feeds, stable IDs, curated precedence, language regions, region/category filter, inventory")
+        print("PASS auto channel grouping: region/quality normalisation, distinct timeshift/region, event-slot exclusion, cross-source feeds, stable IDs, curated precedence, language regions, region/category filter, inventory, guide-ID merging, country names, single-source sports")
     }
 }

@@ -426,14 +426,12 @@ class EPGViewModel {
                   now.timeIntervalSince(capacityStatusCheckedAt[source.id] ?? .distantPast) > 90 else { continue }
             capacityStatusCheckedAt[source.id] = now
             Task.detached(priority: .utility) {
-                let accountKey = SourceAccountKey(config: config)
-                let ownedBefore = AccountCapacityLedger.shared.snapshot(accountKey: accountKey).localReservations
                 guard let info = try? await XtreamClient(config: config).fetchAccountInfo() else { return }
-                // The provider's active count includes our own probes/players.
-                let ownedAfter = AccountCapacityLedger.shared.snapshot(accountKey: accountKey).localReservations
-                AccountCapacityLedger.shared.updateStatus(accountKey: accountKey,
-                    maxConnections: info.maxConnections, activeConnections: info.activeConnections, observedAt: Date(),
-                    knownOwnedConnections: min(ownedBefore, ownedAfter))
+                // Only the account's limit is fed in. Providers keep counting a
+                // stream for a while after it closes, so their active count
+                // must not make a play request look over capacity.
+                AccountCapacityLedger.shared.updateStatus(accountKey: SourceAccountKey(config: config),
+                    maxConnections: info.maxConnections, activeConnections: nil, observedAt: Date())
                 AppLog.sync.info("Account capacity refreshed max=\(info.maxConnections ?? -1, privacy: .public) active=\(info.activeConnections ?? -1, privacy: .public)")
                 await MainActor.run { StreamProbeService.shared.retryQueuedProbes() }
             }
@@ -510,7 +508,7 @@ class EPGViewModel {
                 if availability.state == .busy || availability.state == .unavailable {
                     showSmartActionUnavailable(availability.message)
                 } else {
-                    showSmartActionUnavailable("The current source inputs have changed or are still loading. Refresh Smart Sports or open an original source.")
+                    showSmartActionUnavailable("The current source inputs have changed or are still loading. Refresh Smart Channels or open an original source.")
                 }
                 return nil
             }
@@ -575,7 +573,7 @@ class EPGViewModel {
     }
 
     func showSmartActionUnavailable(_ message: String) {
-        AppFeedbackCenter.shared.show(.init(title: "Smart Sports", message: message,
+        AppFeedbackCenter.shared.show(.init(title: "Smart Channels", message: message,
             symbol: "info.circle", tone: .warning, showsActivity: false))
     }
 

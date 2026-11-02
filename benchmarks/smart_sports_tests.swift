@@ -9,7 +9,7 @@ struct SmartSportsTests {
     }
 
     static func main() async throws {
-        let data = try Data(contentsOf: URL(fileURLWithPath: "Buffer/Resources/SmartSportsCatalog.json"))
+        let data = try Data(contentsOf: URL(fileURLWithPath: "benchmarks/fixtures/SmartSportsCatalog.json"))
         let definition = try SmartSportsCatalog.loadDefinition(data: data)
         check(definition.feeds.count == 56, "Frozen feed count")
         check(definition.feeds.reduce(0) { $0 + $1.variants.count } == 320, "Frozen variant count")

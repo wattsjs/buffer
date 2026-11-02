@@ -45,7 +45,7 @@ struct ContentView: View {
 
     private func open(_ request: PlaybackRequest) {
         if selectedPlayer != .none, request.channel.sourceOwnership?.logicalChannelID != nil {
-            viewModel.showSmartActionUnavailable("Smart Sports needs Buffer’s player to manage account connection limits and live source recovery. Choose Buffer in Settings → Playback, or select an original source playlist to use your external player.")
+            viewModel.showSmartActionUnavailable("Smart Channels needs Buffer’s player to manage account connection limits and live source recovery. Choose Buffer in Settings → Playback, or select an original source playlist to use your external player.")
             return
         }
         guard let request = viewModel.resolvePlaybackRequest(request) else { return }
@@ -508,7 +508,7 @@ struct ContentView: View {
                 .overlay(alignment: .bottom) {
                     VStack(spacing: 8) {
                         if viewModel.isRefreshing || viewModel.isLoadingSourceCredentials || viewModel.smartSports.isLoading {
-                            AppFeedbackBanner(message: .sync(stage: viewModel.smartSports.isLoading ? "Loading Smart Sports from saved sources…" :
+                            AppFeedbackBanner(message: .sync(stage: viewModel.smartSports.isLoading ? "Loading Smart Channels from saved sources…" :
                                 (viewModel.isLoadingSourceCredentials ? "Unlocking saved source…" : viewModel.loadingStage)))
                                 .allowsHitTesting(false)
                                 .transition(
@@ -532,7 +532,7 @@ struct ContentView: View {
                         }
                         if viewModel.isSmartSportsActive, !viewModel.smartSports.isLoading,
                            !viewModel.smartSports.sourceIssues.isEmpty {
-                            AppFeedbackBanner(message: .init(title: "Some Smart Sports sources are unavailable",
+                            AppFeedbackBanner(message: .init(title: "Some Smart Channels sources are unavailable",
                                 message: "Open an original source and refresh it, or check its saved credentials in Settings.",
                                 symbol: "exclamationmark.triangle", tone: .warning, showsActivity: false))
                         }

@@ -244,7 +244,7 @@ struct BufferApp: App {
                 Button {
                     viewModel.activateSmartSports()
                 } label: {
-                    Label("Smart Channels", systemImage: viewModel.isSmartSportsActive ? "checkmark" : "sportscourt")
+                    Label("Smart Channels", systemImage: viewModel.isSmartSportsActive ? "checkmark" : "square.stack.3d.up")
                 }
                 Divider()
                 ForEach(viewModel.playlists) { source in
@@ -258,7 +258,7 @@ struct BufferApp: App {
                 Divider()
                 Button("Filter Smart Channels…") { openWindow(id: "smart-channel-filter") }
                 Button("Manage Sources…") { openWindow(id: "settings") }
-                Button("Review Smart Sports…") { openWindow(id: "smart-sports-reviews") }
+                Button("Review Smart Channels…") { openWindow(id: "smart-sports-reviews") }
             }
 
             CommandGroup(after: .help) {
@@ -319,7 +319,7 @@ struct BufferApp: App {
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
-        Window("Smart Sports Reviews", id: "smart-sports-reviews") {
+        Window("Smart Channels Reviews", id: "smart-sports-reviews") {
             SmartSportsReviewView(coordinator: viewModel.smartSports)
         }
         .defaultSize(width: 820, height: 660)

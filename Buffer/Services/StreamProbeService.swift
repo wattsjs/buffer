@@ -70,6 +70,7 @@ final class StreamProbeService {
     /// connection limit; the global cap bounds local CPU and bandwidth.
     @ObservationIgnored private var activeProbes: [String: PendingProbe] = [:]
     static let maximumConcurrentProbes = 4
+    static let maximumProbesPerAccount = 2
     @ObservationIgnored private var retryTask: Task<Void, Never>?
 
     @ObservationIgnored private let isEnabled: @MainActor () -> Bool
@@ -509,6 +510,15 @@ final class StreamProbeService {
             if next.sourceID == nil { next.channelRevision = channelRevisions[next.id, default: 0] }
             let capacityLease: AccountCapacityLedger.Lease?
             if let ownership = next.ownership {
+                // Probes are optional: never take an account's last free
+                // connection (pressing play must always find one) and never
+                // run more than two at once on one account.
+                let account = AccountCapacityLedger.shared.snapshot(accountKey: ownership.accountKey)
+                guard account.limit <= 1 || account.available >= 2,
+                      (account.reservationsByKind[.probe] ?? 0) < Self.maximumProbesPerAccount else {
+                    waiting.append(next)
+                    continue
+                }
                 switch AccountCapacityLedger.shared.reserve(accountKey: ownership.accountKey, kind: .probe, ownerID: UUID()) {
                 case .success(let lease): capacityLease = lease
                 case .failure:
