@@ -146,7 +146,9 @@ nonisolated enum SmartSportsSnapshotLoader {
                             let cacheKey = DataCache.cacheKey(for: resolved)
                             guard let cached = DataCache.loadChannels(key: cacheKey) else { return nil }
                             let selected = selectedChannels(cached.channels, sourceID: resolved.id, allowedKeys: allowedKeys)
-                            let stamped = selected.map { stamp($0, config: resolved) }
+                            // One account digest per source, never one per row.
+                            let accountKey = SourceAccountKey(config: resolved)
+                            let stamped = selected.map { stamp($0, config: resolved, accountKey: accountKey) }
                             let guideIDs = Set(stamped.compactMap(\.epgChannelID))
                             guard !Task.isCancelled else { return nil }
                             let guideCache = DataCache.loadPrograms(key: cacheKey)
@@ -178,7 +180,9 @@ nonisolated enum SmartSportsSnapshotLoader {
 
     static func activeSource(config: ServerConfig, channels: [Channel], programs: [String: [EPGProgram]],
                              allowedKeys: Set<SmartSportsEndpointKey>) -> SmartSportsLoadedSource {
-        let selected = selectedChannels(channels, sourceID: config.id, allowedKeys: allowedKeys).map { stamp($0, config: config) }
+        let accountKey = SourceAccountKey(config: config)
+        let selected = selectedChannels(channels, sourceID: config.id, allowedKeys: allowedKeys)
+            .map { stamp($0, config: config, accountKey: accountKey) }
         return .init(config: config,
             snapshot: .init(sourceID: config.id, sourceName: config.name, channels: selected),
             programs: filteredPrograms(programs, guideIDs: Set(selected.compactMap(\.epgChannelID))), savedAt: nil)

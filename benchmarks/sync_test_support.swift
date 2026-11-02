@@ -18,6 +18,7 @@ nonisolated enum PlaybackValidation { static let isEnabled = false }
     var version: Int { 0 }
     func requestProbe(for channel: Channel, priority: TaskPriority = .utility) {}
     func retryQueuedProbes() {}
+    var onCapacityStatusStale: (@MainActor (SourceAccountKey) -> Void)?
 }
 @MainActor final class PlayerSlot {
     func configureLiveAlternatives(_ channels: [Channel], resolver: ((SourceChannelIdentity) -> Channel?)? = nil) {}

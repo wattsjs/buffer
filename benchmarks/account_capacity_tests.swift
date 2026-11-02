@@ -184,6 +184,35 @@ enum AccountCapacityTests {
         for value in successful { concurrent.confirmTeardown(lease: value) }
         expect(concurrent.snapshot(accountKey: accountA, now: now).localReservations == 0,
                "Concurrent owners release all confirmed teardowns")
+
+        // Large plans spill past the inline lease storage and stay exact.
+        let large = AccountCapacityLedger(statusLifetime: 120)
+        large.updateStatus(accountKey: accountA, maxConnections: 12, activeConnections: 0, observedAt: now)
+        var held: [AccountCapacityLedger.Lease] = []
+        for _ in 0..<12 {
+            if case .success(let value) = large.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now) {
+                held.append(value)
+            }
+        }
+        expect(held.count == 12 && large.snapshot(accountKey: accountA, now: now).localReservations == 12,
+               "Twelve player leases fit a twelve-connection plan")
+        if case .success = large.reserve(accountKey: accountA, kind: .player, ownerID: UUID(), now: now) {
+            expect(false, "A thirteenth player exceeded the plan")
+        }
+        let retry = large.reserve(accountKey: accountA, kind: .player, ownerID: held[10].ownerID, now: now)
+        expect((try? retry.get()) == held[10], "An overflowed owner's retry returns its existing lease")
+        expect(large.confirmTeardown(lease: held[2]) && large.confirmTeardown(lease: held[11]),
+               "Teardown removes inline and overflowed leases")
+        expect(!large.confirmTeardown(lease: held[2]), "Repeated teardown is harmless")
+        let remaining = large.snapshot(accountKey: accountA, now: now)
+        expect(remaining.localReservations == 10 && remaining.reservationsByKind[.player] == 10,
+               "Counts stay exact after removal from both regions")
+        for (index, value) in held.enumerated() where index != 2 && index != 11 {
+            expect(large.confirmTeardown(lease: value), "Every remaining lease is still found after compaction")
+        }
+        expect(large.snapshot(accountKey: accountA, now: now).localReservations == 0
+               && large.snapshot(accountKey: accountA, now: now).reservationsByKind.isEmpty,
+               "All leases released")
         print("Source ownership/account capacity checks: \(checks) passed")
     }
 }

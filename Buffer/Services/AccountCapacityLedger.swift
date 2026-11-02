@@ -100,18 +100,134 @@ nonisolated final class AccountCapacityLedger: @unchecked Sendable {
         let maximum: Int?
         let active: Int?
         let knownOwnedAtObservation: Int?
-        let observedAt: Date
+        /// Seconds since the reference date; plain arithmetic, no Date calls.
+        let observedAt: TimeInterval
+    }
+
+    /// One reservation without its account key (the account owns it):
+    /// plain values only, so it can live in inline storage.
+    private struct LeaseRecord: Equatable {
+        var id: UUID
+        var ownerID: UUID
+        var generation: UInt64
+        var kind: Kind
+    }
+
+    /// An account rarely holds more than a few connections (its plan limit
+    /// plus at most two probes). They live inline in the account record;
+    /// only an unusually large plan spills into a heap array. Each inline
+    /// slot's kind is also packed into `kindBits` (2 bits per slot) so
+    /// per-kind counts never read the records.
+    private struct InlineLeases {
+        static let capacity = 8
+        private typealias Storage = (LeaseRecord, LeaseRecord, LeaseRecord, LeaseRecord,
+                                     LeaseRecord, LeaseRecord, LeaseRecord, LeaseRecord)
+        private static let empty = LeaseRecord(id: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+                                               ownerID: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+                                               generation: 0, kind: .probe)
+        private var inline: Storage = (empty, empty, empty, empty, empty, empty, empty, empty)
+        private var inlineCount = 0
+        private var kindBits: UInt32 = 0
+        private var overflow: [LeaseRecord] = []
+
+        var count: Int { inlineCount + overflow.count }
+
+        @inline(__always) private static func code(_ kind: Kind) -> UInt32 {
+            switch kind { case .player: 1; case .recording: 2; case .probe: 3 }
+        }
+
+        private mutating func setInline(_ index: Int, _ record: LeaseRecord) {
+            withUnsafeMutableBytes(of: &inline) {
+                $0.storeBytes(of: record, toByteOffset: index * MemoryLayout<LeaseRecord>.stride, as: LeaseRecord.self)
+            }
+            let shift = UInt32(index * 2)
+            kindBits = kindBits & ~(3 << shift) | Self.code(record.kind) << shift
+        }
+
+        subscript(_ index: Int) -> LeaseRecord {
+            if index >= inlineCount { return overflow[index - inlineCount] }
+            return withUnsafeBytes(of: inline) {
+                $0.load(fromByteOffset: index * MemoryLayout<LeaseRecord>.stride, as: LeaseRecord.self)
+            }
+        }
+
+        mutating func append(_ record: LeaseRecord) {
+            guard inlineCount < Self.capacity, overflow.isEmpty else { overflow.append(record); return }
+            setInline(inlineCount, record)
+            inlineCount += 1
+        }
+
+        /// Order is not meaningful; the last record fills the hole.
+        mutating func remove(at index: Int) {
+            let last = count - 1
+            if index != last {
+                let moved = self[last]
+                if index >= inlineCount { overflow[index - inlineCount] = moved } else { setInline(index, moved) }
+            }
+            if overflow.isEmpty {
+                inlineCount -= 1
+                kindBits &= ~(3 << UInt32(inlineCount * 2))
+            } else {
+                overflow.removeLast()
+            }
+        }
+
+        /// One borrow of the inline records, then the overflow.
+        func firstIndex(where predicate: (LeaseRecord) -> Bool) -> Int? {
+            let found = withUnsafeBytes(of: inline) { raw -> Int? in
+                let records = raw.bindMemory(to: LeaseRecord.self)
+                for i in 0..<inlineCount where predicate(records[i]) { return i }
+                return nil
+            }
+            if let found { return found }
+            for (i, record) in overflow.enumerated() where predicate(record) { return inlineCount + i }
+            return nil
+        }
+
+        /// Player, recording and probe counts from the packed kind bits.
+        func counts() -> (player: Int, recording: Int, probe: Int) {
+            var result = (player: 0, recording: 0, probe: 0)
+            var bits = kindBits
+            while bits != 0 {
+                switch bits & 3 {
+                case 1: result.player += 1
+                case 2: result.recording += 1
+                case 3: result.probe += 1
+                default: break
+                }
+                bits >>= 2
+            }
+            for record in overflow {
+                switch record.kind {
+                case .player: result.player += 1
+                case .recording: result.recording += 1
+                case .probe: result.probe += 1
+                }
+            }
+            return result
+        }
     }
 
     private struct Account {
         var status: Status?
-        var leases: [UUID: Lease] = [:]
+        var leases = InlineLeases()
         var nextGeneration: UInt64 = 0
     }
 
     private let lock = NSLock()
-    private var accounts: [SourceAccountKey: Account] = [:]
+    /// Accounts live in one flat array, mutated in place; the dictionary
+    /// only maps an account key to its slot.
+    private var slotByAccount: [SourceAccountKey: Int] = [:]
+    private var accounts: [Account] = []
     private let statusLifetime: TimeInterval
+
+    /// Caller holds `lock`.
+    private func slot(for key: SourceAccountKey) -> Int {
+        if let slot = slotByAccount[key] { return slot }
+        slotByAccount[key] = accounts.count
+        accounts.append(Account())
+        return accounts.count - 1
+    }
 
     init(statusLifetime: TimeInterval = 120) {
         self.statusLifetime = statusLifetime.isFinite ? max(0, statusLifetime) : 120
@@ -130,22 +246,26 @@ nonisolated final class AccountCapacityLedger: @unchecked Sendable {
     ) {
         guard observedAt.timeIntervalSince1970.isFinite else { return }
         lock.withLock {
-            var account = accounts[accountKey] ?? Account()
-            guard account.status.map({ observedAt >= $0.observedAt }) ?? true else { return }
+            let slot = slot(for: accountKey)
+            let observed = observedAt.timeIntervalSinceReferenceDate
+            guard accounts[slot].status.map({ observed >= $0.observedAt }) ?? true else { return }
             let maximum = maxConnections.flatMap { $0 > 0 ? $0 : nil }
             let active = activeConnections.flatMap { $0 >= 0 ? $0 : nil }
+            let leaseCount = accounts[slot].leases.count
             let owned = knownOwnedConnections.flatMap { value -> Int? in
-                guard value >= 0, let active, value <= active, value <= account.leases.count else { return nil }
+                guard value >= 0, let active, value <= active, value <= leaseCount else { return nil }
                 return value
             }
-            account.status = Status(maximum: maximum, active: active,
-                                    knownOwnedAtObservation: owned, observedAt: observedAt)
-            accounts[accountKey] = account
+            accounts[slot].status = Status(maximum: maximum, active: active,
+                                           knownOwnedAtObservation: owned, observedAt: observed)
         }
     }
 
     func snapshot(accountKey: SourceAccountKey, now: Date = Date()) -> Snapshot {
-        lock.withLock { snapshot(account: accounts[accountKey] ?? Account(), now: now) }
+        lock.withLock {
+            guard let slot = slotByAccount[accountKey] else { return snapshot(status: nil, counts: (0, 0, 0), now: now) }
+            return snapshot(status: accounts[slot].status, counts: accounts[slot].leases.counts(), now: now)
+        }
     }
 
     func reserve(
@@ -165,21 +285,24 @@ nonisolated final class AccountCapacityLedger: @unchecked Sendable {
         now: Date = Date()
     ) -> Result<Lease, ReservationFailure> {
         lock.withLock {
-            var account = accounts[accountKey] ?? Account()
+            let slot = slot(for: accountKey)
             // Retrying an open cannot reserve the same connection twice.
-            if let existing = account.leases.values.first(where: { $0.ownerID == ownerID && $0.kind == kind }) {
-                return .success(existing)
+            if let index = accounts[slot].leases.firstIndex(where: { $0.ownerID == ownerID && $0.kind == kind }) {
+                let existing = accounts[slot].leases[index]
+                return .success(Lease(id: existing.id, accountKey: accountKey, kind: existing.kind,
+                                      ownerID: existing.ownerID, generation: existing.generation))
             }
-            let state = snapshot(account: account, now: now)
-            guard (kind == .probe ? state.available : userAvailable(account: account)) > 0 else {
+            let status = accounts[slot].status
+            let counts = accounts[slot].leases.counts()
+            let state = snapshot(status: status, counts: counts, now: now)
+            guard (kind == .probe ? state.available : userAvailable(status: status, counts: counts)) > 0 else {
                 return .failure(.capacityReached(limit: state.limit,
                     localReservations: state.localReservations, externalConnections: state.knownExternalConnections))
             }
-            account.nextGeneration &+= 1
+            accounts[slot].nextGeneration &+= 1
             let lease = Lease(id: UUID(), accountKey: accountKey, kind: kind,
-                              ownerID: ownerID, generation: account.nextGeneration)
-            account.leases[lease.id] = lease
-            accounts[accountKey] = account
+                              ownerID: ownerID, generation: accounts[slot].nextGeneration)
+            accounts[slot].leases.append(LeaseRecord(id: lease.id, ownerID: ownerID, generation: lease.generation, kind: kind))
             return .success(lease)
         }
     }
@@ -189,9 +312,11 @@ nonisolated final class AccountCapacityLedger: @unchecked Sendable {
     @discardableResult
     func confirmTeardown(lease: Lease) -> Bool {
         lock.withLock {
-            guard var account = accounts[lease.accountKey], account.leases[lease.id] == lease else { return false }
-            account.leases.removeValue(forKey: lease.id)
-            accounts[lease.accountKey] = account
+            guard let slot = slotByAccount[lease.accountKey] else { return false }
+            let record = LeaseRecord(id: lease.id, ownerID: lease.ownerID, generation: lease.generation, kind: lease.kind)
+            guard let index = accounts[slot].leases.firstIndex(where: { $0.id == lease.id }),
+                  accounts[slot].leases[index] == record else { return false }
+            accounts[slot].leases.remove(at: index)
             return true
         }
     }
@@ -202,28 +327,32 @@ nonisolated final class AccountCapacityLedger: @unchecked Sendable {
     /// against Buffer's own player/recording connections and the last
     /// declared limit. Probes are short-lived and yield; a genuine provider
     /// refusal still reaches the player's own recovery path.
-    private func userAvailable(account: Account) -> Int {
-        let limit = account.status?.maximum ?? 1
-        let local = account.leases.values.filter { $0.kind != .probe }.count
+    private func userAvailable(status: Status?, counts: (player: Int, recording: Int, probe: Int)) -> Int {
+        let limit = status?.maximum ?? 1
+        let local = counts.player + counts.recording
         return max(0, limit - min(limit, local))
     }
 
-    private func snapshot(account: Account, now: Date) -> Snapshot {
-        let age = account.status.map { now.timeIntervalSince($0.observedAt) }
+    private func snapshot(status: Status?, counts byKind: (player: Int, recording: Int, probe: Int), now: Date) -> Snapshot {
+        let age = status.map { now.timeIntervalSinceReferenceDate - $0.observedAt }
         let fresh = age.map { $0.isFinite && $0 >= 0 && $0 <= statusLifetime } ?? false
-        let freshness: StatusFreshness = account.status == nil ? .unknown : (fresh ? .fresh : .stale)
-        let limit = fresh ? (account.status?.maximum ?? 1) : 1
-        let external = account.status?.active.map { active in
-            max(0, active - (account.status?.knownOwnedAtObservation ?? 0))
+        let freshness: StatusFreshness = status == nil ? .unknown : (fresh ? .fresh : .stale)
+        let limit = fresh ? (status?.maximum ?? 1) : 1
+        let external = status?.active.map { active in
+            max(0, active - (status?.knownOwnedAtObservation ?? 0))
         }
+        let local = byKind.player + byKind.recording + byKind.probe
         var counts: [Kind: Int] = [:]
-        for lease in account.leases.values { counts[lease.kind, default: 0] += 1 }
+        if local > 0 {
+            if byKind.player > 0 { counts[.player] = byKind.player }
+            if byKind.recording > 0 { counts[.recording] = byKind.recording }
+            if byKind.probe > 0 { counts[.probe] = byKind.probe }
+        }
         // Avoid overflow for malformed advertised counts and retain stale
         // external usage until a newer status explicitly establishes it ended.
-        let local = account.leases.count
         let available = max(0, limit - min(limit, local) - min(limit, external ?? 0))
         return Snapshot(limit: limit, localReservations: local,
-                        reportedActiveConnections: account.status?.active,
+                        reportedActiveConnections: status?.active,
                         knownExternalConnections: external, statusFreshness: freshness,
                         available: available, reservationsByKind: counts)
     }
