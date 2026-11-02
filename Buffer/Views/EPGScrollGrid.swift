@@ -29,11 +29,6 @@ enum EPGStickyLabelMetrics {
     }
 }
 
-struct TimeStripSlot: Equatable {
-    let x: CGFloat
-    let title: String
-}
-
 /// Virtualized EPG grid built from three synchronized AppKit scroll views:
 /// a channel column (fixed width, scrolls vertically), a time header (fixed
 /// height, scrolls horizontally), and a program grid (scrolls both axes).
@@ -44,9 +39,12 @@ struct TimeStripSlot: Equatable {
 /// (and vice versa so trackpad scrolling over any pane drives the whole grid).
 /// Origin comparison prevents feedback loops.
 ///
-/// Each row is an `NSTableView` cell hosting SwiftUI content via
-/// `NSHostingView`. Programme hosts also track only the horizontal viewport:
-/// a multi-day archive must never allocate an 80k-point backing surface.
+/// Channel rows are `NSTableView` cells hosting SwiftUI content via
+/// `NSHostingView`. Programme rows are either native `ProgramBlocksView`
+/// cells (`nativeProgramRow`, the production path: one CoreGraphics draw of
+/// the row's packed layout, no SwiftUI per row) or hosted SwiftUI content.
+/// Both track only the horizontal viewport: a multi-day archive must never
+/// allocate an 80k-point backing surface.
 struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: View, CornerContent: View>: NSViewRepresentable {
     let items: [Item]
     let rowHeight: CGFloat
@@ -60,11 +58,13 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
     var itemSetVersion: AnyHashable? = nil
     let dataVersion: AnyHashable?
     var referenceDate: Date? = nil
-    let timeStripSlots: [TimeStripSlot]
-    let timeStripSlotWidth: CGFloat
-    var rowDataProvider: ((Item) -> ChannelLabelRowData)? = nil
+    let timeStrip: EPGTimeStripSpec
+    /// Fills the reused sticky-label slot of a visible row in place.
+    var rowDataProvider: ((Item, inout EPGLabelRow) -> Void)? = nil
     var visibleItemsDidChange: (([Item]) -> Void)? = nil
     var revealItemID: AnyHashable?
+    /// Configures a native programme row; when set, `programContent` is unused.
+    var nativeProgramRow: ((Item, ProgramBlocksView) -> Void)? = nil
     let channelContent: (Item) -> ChannelContent
     let programContent: (Item) -> ProgramContent
     let cornerContent: () -> CornerContent
@@ -79,7 +79,7 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
     func makeContainer(coordinator: Coordinator) -> EPGContainerView {
         let container = EPGContainerView()
         container.configure(coordinator: coordinator, dimensions: dimensions)
-        container.setTimeStrip(slots: timeStripSlots, slotWidth: timeStripSlotWidth)
+        container.setTimeStrip(timeStrip)
         container.setCornerContent(cornerContent())
         container.setNowLineX(nowLineX)
         coordinator.container = container
@@ -117,7 +117,7 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
         }
         container.setTimelineIdentity(timelineIdentity)
         container.applyDimensions(dimensions)
-        container.setTimeStrip(slots: timeStripSlots, slotWidth: timeStripSlotWidth)
+        container.setTimeStrip(timeStrip)
         container.setCornerContent(cornerContent())
         container.setNowLineX(nowLineX)
         container.setInitialHorizontalOffset(initialHorizontalOffset)
@@ -150,10 +150,10 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
         var itemIDs: [AnyHashable]
         var itemSetVersion: AnyHashable?
         /// Captured so AppKit scroll handlers can compute rowData for only the visible window without full scan.
-        var rowDataProvider: ((Item) -> ChannelLabelRowData)?
+        var rowDataProvider: ((Item, inout EPGLabelRow) -> Void)?
         private var rowDataInputs: RowDataInputs?
-        private var rowDataByIndex: [Int: ChannelLabelRowData] = [:]
-        private var rowDataRange: Range<Int>?
+        /// Set when row data must be rebuilt before the container exists.
+        private var rowDataInvalidated = false
         private var hasPublishedItems = false
         private var revealTargetID: AnyHashable?
         private var revealGeneration = 0
@@ -165,7 +165,8 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
         private struct VisibleItemsInputs: Equatable {
             let range: Range<Int>
             let itemSetVersion: AnyHashable?
-            let itemIDs: [AnyHashable]
+            /// Only needed (and only captured) for unversioned callers.
+            let itemIDs: [AnyHashable]?
         }
 
         private struct RowDataInputs: Equatable {
@@ -194,8 +195,7 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
             // Optional versions are a compatibility path for callers whose
             // providers can change without a source-driven revision token.
             if next.itemSetVersion == nil || next.dataVersion == nil || rowDataInputs != nextInputs {
-                rowDataByIndex.removeAll(keepingCapacity: true)
-                rowDataRange = nil
+                if let container { container.labelStore.invalidate() } else { rowDataInvalidated = true }
             }
             rowDataInputs = nextInputs
 
@@ -220,7 +220,7 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
             }
             guard let targetID, completedRevealID != targetID,
                   pendingRevealGeneration != revealGeneration,
-                  items.contains(where: { AnyHashable($0.id) == targetID }) else { return }
+                  itemIDs.contains(targetID) else { return }
             let generation = revealGeneration
             pendingRevealGeneration = generation
             // Resolve the ID after layout, because an intervening refresh may
@@ -229,7 +229,7 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
                 guard let self, self.revealGeneration == generation else { return }
                 defer { self.pendingRevealGeneration = nil }
                 guard self.revealTargetID == targetID, self.completedRevealID != targetID,
-                      let index = self.items.firstIndex(where: { AnyHashable($0.id) == targetID }),
+                      let index = self.itemIDs.firstIndex(of: targetID),
                       let container = self.container else { return }
                 container.layoutSubtreeIfNeeded()
                 guard container.scrollToRow(index) else { return }
@@ -258,6 +258,23 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
                     cell.identifier = identifier
                 }
                 cell.setContent(parent.channelContent(item))
+                return cell
+            } else if let configure = parent.nativeProgramRow {
+                let identifier = NSUserInterfaceItemIdentifier("nativeProgramCell")
+                let cell: EPGNativeProgramCell
+                if let reused = tableView.makeView(withIdentifier: identifier, owner: nil) as? EPGNativeProgramCell {
+                    cell = reused
+                } else {
+                    cell = EPGNativeProgramCell()
+                    cell.identifier = identifier
+                }
+                cell.expectedRowID = AnyHashable(item.id)
+                cell.marginFraction = 0.2 + 0.05 * CGFloat(row % 4)
+                // Rows created after the last tick still colour live/past cards
+                // against the grid's reference time.
+                if let date = container?.referenceDate { cell.canvas.setReferenceDate(date) }
+                configure(item, cell.canvas)
+                cell.updateDrawingViewport()
                 return cell
             } else {
                 let identifier = NSUserInterfaceItemIdentifier("programCell")
@@ -298,19 +315,26 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
         func updateVisibleRowData() {
             guard let container else { return }
             publishVisibleItemsIfNeeded(in: container.programTableView)
+            let store = container.labelStore
+            if rowDataInvalidated {
+                rowDataInvalidated = false
+                store.invalidate()
+            }
             guard let provider = rowDataProvider else {
-                rowDataByIndex.removeAll(keepingCapacity: true)
-                rowDataRange = nil
-                container.setRowDataForVisible([:])
+                if !store.isEmpty || store.range != nil {
+                    store.invalidate()
+                    container.labelRowsDidChange()
+                }
                 return
             }
 
             let tableView = container.programTableView
             let vis = tableView.rows(in: tableView.visibleRect)
             guard vis.length > 0, vis.location != NSNotFound else {
-                rowDataByIndex.removeAll(keepingCapacity: true)
-                rowDataRange = nil
-                container.setRowDataForVisible([:])
+                if !store.isEmpty || store.range != nil {
+                    store.invalidate()
+                    container.labelRowsDidChange()
+                }
                 return
             }
 
@@ -320,23 +344,18 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
             let first = min(items.count, max(0, vis.location - overscroll))
             let last = min(items.count, vis.location + Int(vis.length) + overscroll)
             let range = first..<max(first, last)
-            guard rowDataRange != range else { return }
+            guard store.range != range else { return }
 
             // Horizontal movement does not change document-space metadata.
-            // Vertical movement builds only newly exposed rows and discards
-            // those outside this bounded window.
+            // Vertical movement fills only newly exposed rows into reused
+            // slots and evicts those outside this bounded window.
             let buildStarted = ContinuousClock.now
-            rowDataByIndex = rowDataByIndex.filter { range.contains($0.key) }
-            rowDataByIndex.reserveCapacity(range.count)
-            var built = 0
-            for r in range where rowDataByIndex[r] == nil {
-                rowDataByIndex[r] = provider(items[r])
-                built += 1
+            let built = store.update(range: range) { row, slot in
+                provider(items[row], &slot)
             }
-            rowDataRange = range
             PerfMetrics.shared.record("epg.visibleRowData.buildMs", since: buildStarted)
             PerfMetrics.shared.increment("epg.visibleRowData.rowsBuilt", by: built)
-            container.setRowDataForVisible(rowDataByIndex)
+            container.labelRowsDidChange()
         }
 
         private func publishVisibleItemsIfNeeded(in tableView: NSTableView) {
@@ -356,7 +375,7 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
                itemSetVersion != nil, previous.range == range,
                previous.itemSetVersion == itemSetVersion { return }
             let inputs = VisibleItemsInputs(range: range, itemSetVersion: itemSetVersion,
-                                           itemIDs: Array(itemIDs[range]))
+                                           itemIDs: itemSetVersion == nil ? Array(itemIDs[range]) : nil)
             guard inputs != visibleItemsInputs else { return }
             visibleItemsInputs = inputs
             visibleItemsGeneration &+= 1
@@ -380,6 +399,11 @@ struct EPGScrollGrid<Item: Identifiable, ChannelContent: View, ProgramContent: V
                 if isChannel {
                     if let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? HostingRow<ChannelContent> {
                         cell.setContent(parent.channelContent(items[row]))
+                    }
+                } else if let configure = parent.nativeProgramRow {
+                    if let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? EPGNativeProgramCell {
+                        cell.expectedRowID = AnyHashable(items[row].id)
+                        configure(items[row], cell.canvas)
                     }
                 } else {
                     if let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? HostingRow<ProgramContent> {
@@ -419,10 +443,12 @@ final class EPGContainerView: NSView {
     private let cornerHost = NSHostingView(rootView: AnyView(EmptyView()))
     private let nowLineView = NSView()
     private let channelLabelOverlay = ChannelLabelOverlayView()
+    /// Reused sticky-label rows for the visible window (plus overscroll).
+    var labelStore: EPGLabelRowStore { channelLabelOverlay.store }
 
     private var dimensions = Dimensions(rowHeight: 0, channelColumnWidth: 0, programRowWidth: 0, headerHeight: 0)
     private var nowLineX: CGFloat?
-    private var referenceDate: Date?
+    private(set) var referenceDate: Date?
     private var initialHorizontalOffset: CGFloat?
     private var didApplyInitialHorizontalOffset = false
     private var timelineIdentity: AnyHashable?
@@ -527,26 +553,16 @@ final class EPGContainerView: NSView {
         needsLayout = true
     }
 
-    func setTimeStrip(slots: [TimeStripSlot], slotWidth: CGFloat) {
-        timeStripView.setSlots(slots, slotWidth: slotWidth)
+    func setTimeStrip(_ spec: EPGTimeStripSpec) {
+        timeStripView.setSpec(spec)
     }
 
     func setCornerContent<Content: View>(_ content: Content) {
         cornerHost.rootView = AnyView(content)
     }
 
-    func setRowData(_ data: [ChannelLabelRowData]) {
-        // Legacy full-array path (populates 0... for compatibility; prefer sparse for perf)
-        var dict: [Int: ChannelLabelRowData] = [:]
-        for (idx, d) in data.enumerated() { dict[idx] = d }
-        channelLabelOverlay.rowDataByIndex = dict
-        channelLabelOverlay.needsDisplay = true
-    }
-
-    /// Sets rowData only for the visible vertical range + overscroll (the key optimization).
-    /// This avoids O(N channels) work in rowDataProvider + buildRowData on every update/scroll tick.
-    func setRowDataForVisible(_ data: [Int: ChannelLabelRowData]) {
-        channelLabelOverlay.rowDataByIndex = data
+    /// The visible label rows were refilled or evicted.
+    func labelRowsDidChange() {
         channelLabelOverlay.needsDisplay = true
     }
 
@@ -966,239 +982,307 @@ final class EPGContainerView: NSView {
 
 // MARK: - Time strip
 
+/// Draws only the slots intersecting the dirty rectangle. Titles come from
+/// the interned clock table, so a 14-day header never formats 600+ labels.
 final class TimeStripView: NSView {
-    private var slots: [TimeStripSlot] = []
-    private var slotWidth: CGFloat = 120
+    private(set) var spec = EPGTimeStripSpec.empty
+    private var palette: EPGGridStyle.Palette?
+    private var paletteAppearance: NSAppearance.Name?
+    private static let font = NSFont.systemFont(ofSize: 11, weight: .medium)
 
     override var isFlipped: Bool { true }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        palette = nil
         needsDisplay = true
     }
 
-    func setSlots(_ slots: [TimeStripSlot], slotWidth: CGFloat) {
-        guard self.slots != slots || self.slotWidth != slotWidth else { return }
-        self.slots = slots
-        self.slotWidth = slotWidth
+    func setSpec(_ spec: EPGTimeStripSpec) {
+        guard self.spec != spec else { return }
+        self.spec = spec
         needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
         let drawStarted = ContinuousClock.now
         defer { PerfMetrics.shared.record("epg.timeStrip.drawMs", since: drawStarted) }
-        let palette = EPGGridStyle.palette(for: effectiveAppearance)
+        let name = effectiveAppearance.name
+        if palette == nil || paletteAppearance != name {
+            palette = EPGGridStyle.palette(for: effectiveAppearance)
+            paletteAppearance = name
+        }
+        guard let palette else { return }
         palette.header.setFill()
         dirtyRect.fill()
 
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .font: Self.font,
             .foregroundColor: palette.metadataText
         ]
-
-        for slot in slots {
-            let rect = NSRect(x: slot.x, y: 0, width: slotWidth, height: bounds.height)
+        EPGClockText.shared.beginPass()
+        for index in spec.slots(intersecting: dirtyRect.minX, dirtyRect.maxX) {
+            let rect = NSRect(x: spec.slotX(index), y: 0, width: spec.slotWidth, height: bounds.height)
             guard rect.intersects(dirtyRect) else { continue }
             let textRect = NSRect(x: rect.minX + 6, y: 8, width: max(0, rect.width - 6), height: 16)
-            (slot.title as NSString).draw(in: textRect, withAttributes: attributes)
+            (spec.title(index) as NSString).draw(in: textRect, withAttributes: attributes)
         }
 
-        palette.border.setStroke()
-        let divider = NSBezierPath()
-        divider.lineWidth = 1 / (window?.backingScaleFactor ?? 2)
-        let y = bounds.maxY - divider.lineWidth / 2
-        divider.move(to: NSPoint(x: dirtyRect.minX, y: y))
-        divider.line(to: NSPoint(x: dirtyRect.maxX, y: y))
-        divider.stroke()
+        palette.border.setFill()
+        let lineWidth = 1 / (window?.backingScaleFactor ?? 2)
+        NSRect(x: dirtyRect.minX, y: bounds.maxY - lineWidth, width: dirtyRect.width, height: lineWidth).fill()
+    }
+}
+
+// MARK: - Channel label rows
+
+/// One reusable sticky-label row: the channel name plus the row's packed
+/// programme layout. Slots are refilled in place as rows scroll into view.
+struct EPGLabelRow {
+    /// Absolute item row this slot currently describes.
+    fileprivate(set) var row = -1
+    var channelName = ""
+    var layout = EPGRowLayout()
+    /// Measured width of the trimmed channel name; negative until measured.
+    fileprivate(set) var channelNameWidth: CGFloat = -1
+    /// Shaped channel name and time-range labels (parallel to the layout
+    /// cells), created on first draw and kept while the row stays filled.
+    fileprivate var nameLine: EPGTextLine?
+    fileprivate var timeLines = ContiguousArray<EPGTextLine?>()
+    fileprivate var clockGeneration = -1
+
+    init() {}
+
+    /// Drops shaped text after a refill; storage is kept.
+    fileprivate mutating func resetText() {
+        channelNameWidth = -1
+        nameLine = nil
+        timeLines.removeAll(keepingCapacity: true)
+        clockGeneration = -1
+    }
+}
+
+/// Direct-mapped ring of label rows: row `r` lives in slot `r & mask`, with
+/// occupancy in a bitset. The visible window plus overscroll always fits, so
+/// lookups never hash and scrolling only refills newly exposed slots.
+final class EPGLabelRowStore {
+    private(set) var slots = ContiguousArray<EPGLabelRow>()
+    private(set) var occupied = EPGBitset()
+    private var mask = -1
+    /// Row window the store currently holds, or nil after invalidation.
+    private(set) var range: Range<Int>?
+
+    var capacity: Int { slots.count }
+    var isEmpty: Bool { occupied.isEmpty }
+
+    func invalidate() {
+        occupied.removeAll()
+        range = nil
+    }
+
+    @inline(__always)
+    private func slot(for row: Int) -> Int? {
+        guard row >= 0, mask >= 0 else { return nil }
+        let slot = row & mask
+        return occupied.contains(slot) && slots[slot].row == row ? slot : nil
+    }
+
+    func contains(row: Int) -> Bool { slot(for: row) != nil }
+
+    /// A copy of a row (tests and diagnostics; drawing uses `withRow`).
+    func row(_ row: Int) -> EPGLabelRow? { slot(for: row).map { slots[$0] } }
+
+    func withRow<Result>(_ row: Int, _ body: (inout EPGLabelRow) -> Result) -> Result? {
+        guard let slot = slot(for: row) else { return nil }
+        return body(&slots[slot])
+    }
+
+    /// Occupied rows in ascending order (tests and diagnostics).
+    var populatedRows: [Int] {
+        var rows: [Int] = []
+        occupied.forEach { rows.append(slots[$0].row) }
+        return rows.sorted()
+    }
+
+    /// Evicts rows outside `range` and fills the missing ones. Returns the
+    /// number of rows filled.
+    @discardableResult
+    func update(range newRange: Range<Int>, fill: (Int, inout EPGLabelRow) -> Void) -> Int {
+        if newRange.count > slots.count {
+            var capacity = 64
+            while capacity < newRange.count { capacity <<= 1 }
+            slots = ContiguousArray(repeating: EPGLabelRow(), count: capacity)
+            occupied = EPGBitset(bitCount: capacity)
+            mask = capacity - 1
+        } else {
+            // Evict rows that left the window, scanning occupied words only.
+            for word in 0..<occupied.words.count {
+                var bits = occupied.words[word]
+                while bits != 0 {
+                    let slot = word << 6 | bits.trailingZeroBitCount
+                    bits &= bits &- 1
+                    if !newRange.contains(slots[slot].row) { occupied.remove(slot) }
+                }
+            }
+        }
+        var filled = 0
+        for row in newRange {
+            let slot = row & mask
+            if occupied.contains(slot) && slots[slot].row == row { continue }
+            slots[slot].row = row
+            slots[slot].resetText()
+            fill(row, &slots[slot])
+            occupied.insert(slot)
+            filled += 1
+        }
+        range = newRange
+        return filled
     }
 }
 
 // MARK: - Channel label overlay
 
-struct ChannelLabelBlockData {
-    let rect: CGRect
-    /// Nil time denotes an intentional guide gap; the sticky metadata clips out there.
-    let timeRange: String?
-}
-
-struct ChannelLabelRowData {
-    let channelName: String
-    /// Program block metadata in document coordinates (x relative to row start).
-    let blocks: [ChannelLabelBlockData]
-}
-
 final class ChannelLabelOverlayView: NSView {
-    /// Sparse storage: only visible rows + small overscroll window have entries.
-    /// Keys are absolute row indices in the items array.
-    var rowDataByIndex: [Int: ChannelLabelRowData] = [:]
+    /// Visible rows + small overscroll window, keyed by absolute row index.
+    let store = EPGLabelRowStore()
     var rowHeight: CGFloat = 64
     var scrollOffsetX: CGFloat = 0
     var scrollOffsetY: CGFloat = 0
     var nowLineX: CGFloat?
+    private var palette: EPGGridStyle.Palette?
+    private var paletteAppearance: NSAppearance.Name?
 
     override var isFlipped: Bool { true }
     override func hitTest(_ aPoint: NSPoint) -> NSView? { nil }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        palette = nil
         needsDisplay = true
     }
 
+    private static let channelMeasureAttributes: [NSAttributedString.Key: Any] = {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineBreakMode = .byTruncatingTail
+        paragraph.minimumLineHeight = EPGStickyLabelMetrics.topRowHeight
+        paragraph.maximumLineHeight = EPGStickyLabelMetrics.topRowHeight
+        return [.font: EPGTextStyle.channelName.font, .paragraphStyle: paragraph]
+    }()
+
     override func draw(_ dirtyRect: NSRect) {
-        guard rowHeight > 0, !rowDataByIndex.isEmpty else { return }
+        guard rowHeight > 0, !store.isEmpty else { return }
         let drawStarted = ContinuousClock.now
         defer { PerfMetrics.shared.record("epg.labelOverlay.drawMs", since: drawStarted) }
-        let palette = EPGGridStyle.palette(for: effectiveAppearance)
+        let name = effectiveAppearance.name
+        if palette == nil || paletteAppearance != name {
+            palette = EPGGridStyle.palette(for: effectiveAppearance)
+            paletteAppearance = name
+        }
+        guard let palette, let context = NSGraphicsContext.current?.cgContext else { return }
 
-        NSBezierPath(rect: bounds).addClip()
-
-        let metadataParagraph = Self.truncatingParagraph(lineHeight: EPGStickyLabelMetrics.topRowHeight)
         let metadataMaxWidth = EPGStickyLabelMetrics.labelWidth(
             for: bounds.width,
             maxWidth: EPGStickyLabelMetrics.metadataMaxWidth
         )
         guard metadataMaxWidth > 24 else { return }
+        context.saveGState()
+        context.clip(to: bounds)
+        defer { context.restoreGState() }
+
+        let clock = EPGClockText.shared
+        clock.beginPass()
+        let timeStyle = EPGTextStyle.timeRange
+        let channelStyle = EPGTextStyle.channelName
 
         let firstVisibleRow = max(0, Int(floor(scrollOffsetY / rowHeight)))
         let visibleRowCount = Int(ceil(bounds.height / rowHeight)) + 2
         let lastVisibleRow = firstVisibleRow + visibleRowCount
+        let viewportWidth = bounds.width
+        let scrollX = scrollOffsetX
 
         for row in firstVisibleRow...lastVisibleRow {
-            guard let data = rowDataByIndex[row] else { continue }
             let rowY = CGFloat(row) * rowHeight - scrollOffsetY
             guard rowY < bounds.maxY, rowY + rowHeight > bounds.minY else { continue }
+            store.withRow(row) { data in
+                if data.channelNameWidth < 0 {
+                    // Measured once per filled row, never per frame.
+                    data.channelName = data.channelName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    data.channelNameWidth = data.channelName.isEmpty ? 0 : ceil((data.channelName as NSString).boundingRect(
+                        with: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+                        options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: Self.channelMeasureAttributes
+                    ).width) + 1
+                }
+                if data.clockGeneration != clock.generation || data.timeLines.count != data.layout.count {
+                    data.timeLines.removeAll(keepingCapacity: true)
+                    data.timeLines.append(contentsOf: repeatElement(nil, count: data.layout.count))
+                    data.clockGeneration = clock.generation
+                }
+                let hasChannelName = !data.channelName.isEmpty
+                let channelWidth = hasChannelName ? min(data.channelNameWidth, metadataMaxWidth) : 0
+                let timeLeadingX = EPGStickyLabelMetrics.x
+                    + channelWidth
+                    + (channelWidth > 0 ? EPGStickyLabelMetrics.metadataCollisionGap : 0)
 
-            let channelName = data.channelName.trimmingCharacters(in: .whitespacesAndNewlines)
-            let channelText = channelName.isEmpty
-                ? nil
-                : channelNameString(channelName, paragraph: metadataParagraph, color: palette.primaryText)
-            let channelWidth = channelText.map { min(measuredWidth(of: $0), metadataMaxWidth) } ?? 0
-            let timeLeadingX = EPGStickyLabelMetrics.x
-                + channelWidth
-                + (channelWidth > 0 ? EPGStickyLabelMetrics.metadataCollisionGap : 0)
+                // Times are constrained to begin after the pinned channel name.
+                // As an outgoing block narrows, its time truncates and disappears;
+                // it never slides left underneath the channel label.
+                var cell = data.layout.firstCell(endingAfter: Double(scrollX))
+                while cell < data.layout.count {
+                    defer { cell += 1 }
+                    let blockScreenMinX = CGFloat(data.layout.x[cell]) - scrollX
+                    guard blockScreenMinX < viewportWidth else { break }
+                    if data.layout.isGap(cell) { continue }
+                    let blockScreenMaxX = CGFloat(data.layout.maxX(cell)) - scrollX
+                    guard blockScreenMaxX > 0 else { continue }
 
-            // Times are constrained to begin after the pinned channel name.
-            // As an outgoing block narrows, its time truncates and disappears;
-            // it never slides left underneath the channel label.
-            for block in data.blocks {
-                guard let timeRange = block.timeRange, !timeRange.isEmpty else { continue }
+                    // Match the canvas title's ten-point interior inset, including
+                    // the one-point card gutter. New cards should never put their
+                    // timestamp against a border while the title is indented.
+                    let textX = max(blockScreenMinX + 1 + EPGStickyLabelMetrics.x, timeLeadingX)
+                    let textRight = min(viewportWidth - EPGStickyLabelMetrics.viewportTrailingPadding,
+                                        blockScreenMaxX - 1 - EPGStickyLabelMetrics.x)
+                    let availableWidth = textRight - textX
+                    guard availableWidth > 4 else { continue }
 
-                let blockScreenMinX = block.rect.minX - scrollOffsetX
-                let blockScreenMaxX = block.rect.maxX - scrollOffsetX
-                guard blockScreenMaxX > 0, blockScreenMinX < bounds.width else { continue }
+                    let text: EPGTextLine
+                    if let shaped = data.timeLines[cell] {
+                        text = shaped
+                    } else {
+                        text = timeStyle.line(clock.compactRange(start: data.layout.start[cell], end: data.layout.end[cell]))
+                        data.timeLines[cell] = text
+                    }
+                    let labelWidth = min(ceil(text.width) + 1, metadataMaxWidth, availableWidth)
+                    guard labelWidth > 4 else { continue }
 
-                // Match the canvas title's ten-point interior inset, including
-                // the one-point card gutter. New cards should never put their
-                // timestamp against a border while the title is indented.
-                let textX = max(blockScreenMinX + 1 + EPGStickyLabelMetrics.x, timeLeadingX)
-                let textRight = min(bounds.width - EPGStickyLabelMetrics.viewportTrailingPadding,
-                                    blockScreenMaxX - 1 - EPGStickyLabelMetrics.x)
-                let availableWidth = textRight - textX
-                guard availableWidth > 4 else { continue }
+                    context.saveGState()
+                    context.clip(to: CGRect(x: blockScreenMinX, y: rowY,
+                                            width: blockScreenMaxX - blockScreenMinX, height: rowHeight))
+                    timeStyle.draw(text, in: CGRect(x: textX, y: rowY + EPGStickyLabelMetrics.topRowY,
+                                                    width: labelWidth, height: EPGStickyLabelMetrics.topRowHeight),
+                                   color: palette.metadataText, context: context)
+                    context.restoreGState()
+                }
 
-                let timeText = timeRangeString(timeRange, paragraph: metadataParagraph, color: palette.metadataText)
-                let labelWidth = min(measuredWidth(of: timeText), metadataMaxWidth, availableWidth)
-                guard labelWidth > 4 else { continue }
-
-                let blockClipRect = NSRect(
-                    x: blockScreenMinX,
-                    y: rowY,
-                    width: blockScreenMaxX - blockScreenMinX,
-                    height: rowHeight
-                )
-
-                NSGraphicsContext.saveGraphicsState()
-                NSBezierPath(rect: blockClipRect).addClip()
-                timeText.draw(
-                    with: NSRect(
-                        x: textX,
-                        y: rowY + EPGStickyLabelMetrics.topRowY,
-                        width: labelWidth,
-                        height: EPGStickyLabelMetrics.topRowHeight
-                    ),
-                    options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine]
-                )
-                NSGraphicsContext.restoreGraphicsState()
-            }
-
-            if let channelText {
-                drawPinnedChannelName(
-                    channelText,
-                    rowY: rowY,
-                    height: EPGStickyLabelMetrics.topRowHeight,
-                    maxWidth: metadataMaxWidth
-                )
+                if hasChannelName {
+                    let labelX = EPGStickyLabelMetrics.x
+                    let availableWidth = min(metadataMaxWidth, viewportWidth - labelX - EPGStickyLabelMetrics.viewportTrailingPadding)
+                    let textWidth = min(data.channelNameWidth, availableWidth)
+                    if availableWidth > 8, textWidth > 4 {
+                        let text: EPGTextLine
+                        if let shaped = data.nameLine {
+                            text = shaped
+                        } else {
+                            text = channelStyle.line(data.channelName)
+                            data.nameLine = text
+                        }
+                        channelStyle.draw(text, in: CGRect(x: labelX, y: rowY + EPGStickyLabelMetrics.topRowY,
+                                                           width: textWidth, height: EPGStickyLabelMetrics.topRowHeight),
+                                          color: palette.primaryText, context: context)
+                    }
+                }
             }
         }
-    }
-
-    private static let channelFont = NSFont.systemFont(ofSize: 11, weight: .semibold)
-    private static let timeRangeFont = NSFont.systemFont(ofSize: 10, weight: .regular)
-
-    private static func truncatingParagraph(lineHeight: CGFloat) -> NSMutableParagraphStyle {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .left
-        paragraph.lineBreakMode = .byTruncatingTail
-        paragraph.minimumLineHeight = lineHeight
-        paragraph.maximumLineHeight = lineHeight
-        return paragraph
-    }
-
-    private func channelNameString(_ channelName: String, paragraph: NSParagraphStyle, color: NSColor) -> NSAttributedString {
-        NSAttributedString(
-            string: channelName,
-            attributes: [
-                .font: Self.channelFont,
-                .foregroundColor: color,
-                .paragraphStyle: paragraph,
-            ]
-        )
-    }
-
-    private func timeRangeString(_ timeRange: String, paragraph: NSParagraphStyle, color: NSColor) -> NSAttributedString {
-        NSAttributedString(
-            string: timeRange,
-            attributes: [
-                .font: Self.timeRangeFont,
-                .foregroundColor: color,
-                .paragraphStyle: paragraph,
-            ]
-        )
-    }
-
-    @discardableResult
-    private func drawPinnedChannelName(
-        _ text: NSAttributedString,
-        rowY: CGFloat,
-        height: CGFloat,
-        maxWidth: CGFloat
-    ) -> CGFloat? {
-        let labelX = EPGStickyLabelMetrics.x
-        let availableWidth = min(maxWidth, bounds.width - labelX - EPGStickyLabelMetrics.viewportTrailingPadding)
-        guard availableWidth > 8 else { return nil }
-
-        let textWidth = min(measuredWidth(of: text), availableWidth)
-        guard textWidth > 4 else { return nil }
-
-        let textY = rowY + EPGStickyLabelMetrics.topRowY
-        text.draw(
-            with: NSRect(
-                x: labelX,
-                y: textY,
-                width: textWidth,
-                height: height
-            ),
-            options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine]
-        )
-
-        return labelX + textWidth
-    }
-
-    private func measuredWidth(of text: NSAttributedString) -> CGFloat {
-        ceil(text.boundingRect(
-            with: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
-        ).width) + 1
     }
 }
 
@@ -1214,8 +1298,69 @@ private protocol EPGViewportHosting: AnyObject {
     func updateDrawingViewport()
 }
 
+/// The horizontal slice of a document-wide row that the clip view shows.
+@MainActor
+private func viewportSlice(of row: NSView) -> NSRect {
+    var frame = row.bounds
+    if let clip = row.enclosingScrollView?.contentView {
+        let viewport = row.convert(clip.bounds, from: clip)
+        let left = max(row.bounds.minX, viewport.minX)
+        let right = min(row.bounds.maxX, viewport.maxX)
+        frame.origin.x = left
+        frame.size.width = max(0, right - left)
+    }
+    return frame
+}
+
+/// Native programme row: one `ProgramBlocksView` per visible row, configured
+/// directly from programme data without a SwiftUI host.
+///
+/// The surface covers the viewport plus a margin on each side (never the
+/// whole archive row). Horizontal panning inside the margin only moves the
+/// clip view; the surface is re-centred, and repainted, when the viewport
+/// reaches its edge. Margins are staggered per row so rows do not all repaint
+/// in the same frame.
+final class EPGNativeProgramCell: NSTableCellView, EPGViewportHosting, EPGRowIdentityProviding {
+    let canvas = ProgramBlocksView(frame: .zero)
+    var expectedRowID: AnyHashable?
+    /// Margin on each side of the viewport, as a fraction of its width.
+    var marginFraction: CGFloat = 0.25
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        canvas.bottomDividerOpacity = 0.5
+        addSubview(canvas)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        updateDrawingViewport()
+    }
+
+    func updateDrawingViewport() {
+        let viewport = viewportSlice(of: self)
+        let margin = (viewport.width * marginFraction).rounded()
+        var frame = canvas.frame
+        let covers = frame.height == bounds.height
+            && frame.minX <= viewport.minX && frame.maxX >= viewport.maxX
+            && frame.minX >= bounds.minX && frame.maxX <= bounds.maxX
+            && frame.width <= viewport.width + 2 * margin + 1
+        if !covers {
+            let left = max(bounds.minX, viewport.minX - margin)
+            let right = min(bounds.maxX, viewport.maxX + margin)
+            frame = NSRect(x: left, y: bounds.minY, width: max(0, right - left), height: bounds.height)
+            canvas.frame = frame
+        }
+        canvas.setTimelineOriginX(frame.minX)
+        canvas.setVisibleSpan(minX: viewport.minX - frame.minX, maxX: viewport.maxX - frame.minX)
+    }
+}
+
 final class HostingRow<Content: View>: NSTableCellView, EPGViewportHosting, EPGRowIdentityProviding {
     private var hostingView: NSHostingView<Content>?
+    private weak var drawingCanvas: (NSView & EPGViewportDrawing)?
     var usesHorizontalViewport = false
     var expectedRowID: AnyHashable?
 
@@ -1226,30 +1371,28 @@ final class HostingRow<Content: View>: NSTableCellView, EPGViewportHosting, EPGR
 
     func updateDrawingViewport() {
         guard let hostingView else { return }
-        var hostFrame = bounds
-        if usesHorizontalViewport, let clip = enclosingScrollView?.contentView {
-            let viewport = convert(clip.bounds, from: clip)
-            let left = max(bounds.minX, viewport.minX)
-            let right = min(bounds.maxX, viewport.maxX)
-            hostFrame.origin.x = left
-            hostFrame.size.width = max(0, right - left)
-        }
-        if hostingView.frame != hostFrame {
+        let hostFrame = usesHorizontalViewport ? viewportSlice(of: self) : bounds
+        if hostingView.frame.size != hostFrame.size {
             hostingView.frame = hostFrame
             hostingView.layoutSubtreeIfNeeded()
+        } else if hostingView.frame.origin != hostFrame.origin {
+            // A pure pan moves the host; SwiftUI has nothing to lay out.
+            hostingView.setFrameOrigin(hostFrame.origin)
         }
         guard usesHorizontalViewport else { return }
-        func update(_ view: NSView) {
-            if let canvas = view as? EPGViewportDrawing {
-                // Convert the actual representable origin rather than assuming
-                // SwiftUI has placed it at the host's leading edge.
-                let origin = view.convert(.zero, to: self).x
-                canvas.setTimelineOriginX(origin)
-            } else {
-                for child in view.subviews { update(child) }
+        if drawingCanvas == nil || drawingCanvas?.isDescendant(of: hostingView) != true {
+            func find(_ view: NSView) -> (NSView & EPGViewportDrawing)? {
+                if let canvas = view as? (NSView & EPGViewportDrawing) { return canvas }
+                for child in view.subviews { if let found = find(child) { return found } }
+                return nil
             }
+            drawingCanvas = find(hostingView)
         }
-        update(hostingView)
+        // Convert the actual representable origin rather than assuming
+        // SwiftUI has placed it at the host's leading edge.
+        if let canvas = drawingCanvas {
+            canvas.setTimelineOriginX(canvas.convert(NSPoint.zero, to: self).x)
+        }
     }
 
     func setContent(_ content: Content) {

@@ -139,13 +139,15 @@ struct EPGAppearanceTests {
             renderPinnedTitle(appearance: appearance, suffix: suffix)
             let rendered = [renderPannedGrid(appearance: appearance, suffix: suffix, opacity: 1),
                             renderPannedGrid(appearance: appearance, suffix: suffix, opacity: 0.45),
-                            renderPannedGrid(appearance: appearance, suffix: suffix, opacity: 0.35)]
+                            renderPannedGrid(appearance: appearance, suffix: suffix, opacity: 0.35),
+                            renderPannedGrid(appearance: appearance, suffix: suffix, opacity: 1, native: true)]
             measurements.append(["appearance": suffix, "programmeSurface": colorString(palette.upcomingSurface),
                                  "minimumPrimaryContrast": minimumTitle, "minimumMetadataContrast": minimumMetadata,
                                  "renderedProgrammeContrast": rendered])
         }
         testViewportInteraction()
         testSourcePriorityContext()
+        testTextEquivalence()
         let report: [String: Any] = ["fixture": "production-epg-appearance-and-pan-v1", "appearances": measurements, "checks": checks]
         try! JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: output.appendingPathComponent("report.json"))
         print("PASS \(checks) production EPG appearance, contrast, panned canvas and viewport priority checks")
@@ -192,22 +194,32 @@ struct EPGAppearanceTests {
         window.contentView = nil
     }
 
-    static func renderPannedGrid(appearance: NSAppearance, suffix: String, opacity: Double) -> [String: Any] {
-        let suffix = suffix + (opacity == 1 ? "" : "-dimmed-\(opacity)")
+    static func renderPannedGrid(appearance: NSAppearance, suffix: String, opacity: Double, native: Bool = false) -> [String: Any] {
+        let suffix = suffix + (native ? "-native" : "") + (opacity == 1 ? "" : "-dimmed-\(opacity)")
         let width: CGFloat = 80_640
         let blocks = (0..<672).map { index in
             EPGProgramBlock(program: program("Slot \(index)", start: Double(index * 1800), end: Double((index + 1) * 1800)),
                             rect: CGRect(x: index * 120, y: 3, width: 120, height: 58), hasReminder: false)
         }
+        let programs = blocks.compactMap(\.program)
         let items = (0..<3).map { FixtureChannel(id: $0) }
         let opacityState = FixtureOpacity()
         let grid = EPGScrollGrid(items: items, rowHeight: 64, channelColumnWidth: 120, programRowWidth: width,
                                  headerHeight: 32, nowLineX: 400, initialHorizontalOffset: 60_060,
                                  horizontalScrollRequest: nil, timelineIdentity: 1,
                                  itemSetVersion: 1, dataVersion: 1, referenceDate: now,
-                                 timeStripSlots: (0..<672).map { TimeStripSlot(x: CGFloat($0 * 120), title: "Time \($0)") },
-                                 timeStripSlotWidth: 120,
-                                 rowDataProvider: { item in ChannelLabelRowData(channelName: "Channel \(item.id)", blocks: blocks.map { ChannelLabelBlockData(rect: $0.rect, timeRange: "9pm–10pm") }) },
+                                 timeStrip: EPGTimeStripSpec(start: now, hours: 336, pixelsPerMinute: 4, relativeTo: now),
+                                 rowDataProvider: { item, slot in
+                                     slot.channelName = "Channel \(item.id)"
+                                     slot.layout.build(programs: programs, timelineStart: now, pixelsPerMinute: 4,
+                                                       timelineWidth: Double(width), rowHeight: 64, showGaps: false)
+                                 },
+                                 nativeProgramRow: native ? { item, canvas in
+                                     canvas.ownerID = "\(item.id)"
+                                     canvas.setPrograms(programs, timelineStart: now, pixelsPerMinute: 4, timelineWidth: width,
+                                                        rowHeight: 64, showGaps: false, reminderIDs: [])
+                                     canvas.setReplayLookbackHours(72)
+                                 } : nil,
                                  channelContent: { item in Text("Channel \(item.id)") },
                                  programContent: { _ in FixtureProgramRow(blocks: blocks, now: now, width: width, opacity: opacityState.value) },
                                  cornerContent: { Text("TV Guide") })
@@ -242,8 +254,10 @@ struct EPGAppearanceTests {
         require(close(pixel(initial, x: 430, y: 86), expectedSurface),
                 "\(suffix) initial full-archive offset paints populated programme cards")
         let initialCanvases = canvases(in: container.programTableView)
+        // Native rows keep a bounded panning margin either side of the viewport.
+        let surfaceLimit = scroll.contentView.bounds.width * (native ? 1.7 : 1) + 1
         require(!initialCanvases.isEmpty, "\(suffix) native programme canvases attached")
-        require(initialCanvases.allSatisfy { $0.bounds.width <= scroll.contentView.bounds.width + 1 },
+        require(initialCanvases.allSatisfy { $0.bounds.width <= surfaceLimit },
                 "\(suffix) backing surfaces remain bounded to viewport at 80k archive width")
         for offset in [CGFloat(0), 1200, 20_040, 60_060] {
             scroll.contentView.scroll(to: NSPoint(x: offset, y: 0))
@@ -251,10 +265,14 @@ struct EPGAppearanceTests {
             container.layoutSubtreeIfNeeded()
             pump()
             let visibleCanvases = canvases(in: container.programTableView)
-            require(visibleCanvases.allSatisfy { $0.bounds.width <= scroll.contentView.bounds.width + 1 },
+            require(visibleCanvases.allSatisfy { $0.bounds.width <= surfaceLimit },
                     "\(suffix) horizontal pan does not grow backing surfaces")
-            require(visibleCanvases.allSatisfy { abs($0.timelineOriginX - offset) < 1 },
-                    "\(suffix) horizontal pan maps native drawing to its document coordinates")
+            require(visibleCanvases.allSatisfy { canvas in
+                native
+                    ? abs(canvas.timelineOriginX - canvas.frame.minX) < 1 && canvas.timelineOriginX <= offset + 1
+                        && canvas.timelineOriginX + canvas.bounds.width >= offset + scroll.contentView.bounds.width - 1
+                    : abs(canvas.timelineOriginX - offset) < 1
+            }, "\(suffix) horizontal pan maps native drawing to its document coordinates")
             let bitmap = snapshot(page, path: "\(suffix)-pan-\(Int(offset)).png")
             // Middle of a programme, below titles/metadata and away from the
             // now line. Sampling actual hosted production canvas, not tokens.
@@ -322,6 +340,65 @@ struct EPGAppearanceTests {
         let clipped = snapshot(view, path: "\(suffix)-pinned-title-card-edge.png")
         require(pixel(clipped, x: 70, y: 36).alphaComponent < 0.01,
                 "\(suffix) pinned title hard-clips at the programme edge before a genuine gap")
+    }
+
+    /// CoreText guide labels must render exactly like the NSString drawing
+    /// they replaced (fixed line height, truncating tail).
+    static func testTextEquivalence() {
+        func render(_ draw: (CGContext) -> Void) -> Data {
+            let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 800, pixelsHigh: 80, bitsPerSample: 8,
+                                       samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                       bytesPerRow: 3200, bitsPerPixel: 32)!
+            let base = NSGraphicsContext(bitmapImageRep: rep)!
+            base.cgContext.scaleBy(x: 2, y: 2)
+            base.cgContext.translateBy(x: 0, y: 40)
+            base.cgContext.scaleBy(x: 1, y: -1)
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: base.cgContext, flipped: true)
+            draw(base.cgContext)
+            NSGraphicsContext.current = nil
+            return Data(bytes: rep.bitmapData!, count: 3200 * 80)
+        }
+        func paragraph(_ height: CGFloat) -> NSParagraphStyle {
+            let style = NSMutableParagraphStyle()
+            style.alignment = .left
+            style.lineBreakMode = .byTruncatingTail
+            style.minimumLineHeight = height
+            style.maximumLineHeight = height
+            return style
+        }
+        let color = NSColor.labelColor
+        let cases: [(EPGTextStyle, String, Bool)] = [
+            (.programmeTitle, "Programme with a realistic title", false),
+            (.programmeTitle, "No Event Today", false),
+            (.timeRange, "9:00pm - 10:30pm", true),
+            (.channelName, "BBC One HD", true),
+        ]
+        for (style, text, usesOptions) in cases {
+            let rect = CGRect(x: 10.5, y: 7, width: 300, height: style.lineHeight)
+            let attributes: [NSAttributedString.Key: Any] = [.font: style.font, .foregroundColor: color,
+                                                             .paragraphStyle: paragraph(style.lineHeight)]
+            let reference = render { _ in
+                if usesOptions {
+                    (text as NSString).draw(with: rect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine],
+                                            attributes: attributes, context: nil)
+                } else {
+                    (text as NSString).draw(in: rect, withAttributes: attributes)
+                }
+            }
+            let shaped = style.line(text)
+            let current = render { context in style.draw(shaped, in: rect, color: color, context: context) }
+            require(reference == current, "CoreText label '\(text)' renders identically to NSString drawing")
+        }
+        // Truncated labels stay inside their rectangle and end with an ellipsis.
+        let narrow = render { context in
+            EPGTextStyle.programmeTitle.draw(EPGTextStyle.programmeTitle.line("A very long programme title that cannot fit"),
+                                             in: CGRect(x: 10, y: 7, width: 80, height: 18), color: .black, context: context)
+        }
+        var inkBeyond = false
+        narrow.withUnsafeBytes { bytes in
+            for y in 0..<80 { for x in 182..<800 where bytes[y * 3200 + x * 4 + 3] != 0 { inkBeyond = true } }
+        }
+        require(!inkBeyond, "truncated CoreText title is clipped to its rectangle")
     }
 
     static func testSourcePriorityContext() {
