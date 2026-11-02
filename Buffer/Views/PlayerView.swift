@@ -28,6 +28,17 @@ enum MediaInfoDisplay: String, CaseIterable {
     }
 }
 
+/// Evaluates `content` inside its own body, so @Observable reads made while
+/// building it (player clock, cache, stats) invalidate only this subtree,
+/// not the whole PlayerView. The parent rebuilds the scope (a closure never
+/// compares equal) whenever its own body runs, so @State-driven updates
+/// still flow through (PlayerView.body reads the @State they use).
+struct PlayerObservationScope<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View { content() }
+}
+
 @Observable
 final class PlayerChromeState {
     var isPinned: Bool = false
@@ -228,6 +239,10 @@ struct PlayerView: View {
     // MARK: - Body
 
     var body: some View {
+        // @State read only inside `PlayerObservationScope` closures. Reading
+        // it here keeps this body the owner of those dependencies, so a change
+        // rebuilds the scopes exactly as before.
+        let _ = (scrubPosition, liveLatched, showStatsForNerds, showVolumePopover, showChannelPicker)
         GeometryReader { viewport in
             ZStack {
                 Color.black.ignoresSafeArea()
@@ -267,7 +282,7 @@ struct PlayerView: View {
             }
             .overlay(alignment: .topLeading) {
                 if showChrome && !isMulti {
-                    infoStack
+                    PlayerObservationScope { infoStack }
                         .padding(16)
                         .allowsHitTesting(false)
                         .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .topLeading)))
@@ -283,14 +298,15 @@ struct PlayerView: View {
             }
             .overlay(alignment: .bottomLeading) {
                 if showChrome && !isMulti {
-                    controlsBar
+                    PlayerObservationScope { controlsBar }
                         .padding(16)
                         .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .bottomLeading)))
                 }
             }
             .overlay(alignment: .bottomTrailing) {
                 if showChrome && !isMulti {
-                    mediaInfoCard(maxStatsPanelHeight: statsPanelMaxHeight(for: viewport.size))
+                    let maxStatsPanelHeight = statsPanelMaxHeight(for: viewport.size)
+                    PlayerObservationScope { mediaInfoCard(maxStatsPanelHeight: maxStatsPanelHeight) }
                         .padding(16)
                         .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .bottomTrailing)))
                 }
@@ -326,11 +342,18 @@ struct PlayerView: View {
                     scheduleChromeHide()
                 }
             }
-            .onChange(of: player.timePos) { _, _ in
-                saveVODProgressIfNeeded()
-            }
-            .onChange(of: player.duration) { _, _ in
-                saveVODProgressIfNeeded(force: true)
+            .background {
+                // The playhead changes several times a second; observe it
+                // in a leaf so it does not re-run this body.
+                PlayerObservationScope {
+                    Color.clear
+                        .onChange(of: player.timePos) { _, _ in
+                            saveVODProgressIfNeeded()
+                        }
+                        .onChange(of: player.duration) { _, _ in
+                            saveVODProgressIfNeeded(force: true)
+                        }
+                }
             }
             .animation(BufferMotion.chrome, value: showChrome)
         }
@@ -350,14 +373,17 @@ struct PlayerView: View {
             s.externalRequest = nil
             apply(request)
         }
-        .background(WindowAccessor(
-            showChrome: $showChrome,
-            isPinned: chromeState.isPinned,
-            videoSize: isMulti
-                ? .zero
-                : CGSize(width: player.mediaInfo.width, height: player.mediaInfo.height),
-            onWindow: { window in session?.hostWindow = window }
-        ))
+        .background(PlayerObservationScope {
+            // mediaInfo also carries live latency; scope its read here.
+            WindowAccessor(
+                showChrome: $showChrome,
+                isPinned: chromeState.isPinned,
+                videoSize: isMulti
+                    ? .zero
+                    : CGSize(width: player.mediaInfo.width, height: player.mediaInfo.height),
+                onWindow: { window in session?.hostWindow = window }
+            )
+        })
         .background(
             PlayerKeyboardMonitor { command, window in
                 handleKeyboardCommand(command, in: window)
