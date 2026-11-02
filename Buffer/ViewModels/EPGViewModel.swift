@@ -85,18 +85,19 @@ class EPGViewModel {
     var programs: [String: [EPGProgram]] = [:] { // keyed by channel epgID
         didSet {
             guideVersion &+= 1
-            preparedGuideLookups = [:]
-            programHourBuckets = [:]
+            // Publishers install the matching timeline right after assigning;
+            // any other assignment falls back to the exact per-list search.
+            guideTimeline = nil
             // A running account sync refreshes Smart once when it finishes.
             if isSmartSportsActive, activeSyncTask == nil { refreshSmartSports() }
         }
     }
-    @ObservationIgnored private var preparedGuideLookups: [String: GuideLookup.Prepared] = [:]
 
-    /// Pre-bucketed programs by hour (unix hour since 1970) per channel.
-    /// Enables fast visible-range / timeline-window queries without scanning full per-channel program lists
-    /// (critical for 500-1000+ channel guides with catchup days of data). See Agent 02 / Master perf issue.
-    private var programHourBuckets: [String: [Int: [Int]]] = [:]
+    /// Flat start/end/max-end Int32 columns over `programs`, one contiguous
+    /// run per guide ID (see `GuideTimeline`). Built off the main thread by
+    /// the publishers; `nil` only between an unindexed assignment and the
+    /// next publication.
+    @ObservationIgnored private var guideTimeline: GuideTimeline?
 
     var storedGroupOrder: [String] = [] {
         didSet { rebuildGroupOrder() }
@@ -801,10 +802,12 @@ class EPGViewModel {
             return GuideLookup.program(in: programsForChannel(channel), containing: date)
         }
         _ = guideVersion
-        if let epgID = channel.epgChannelID, let lookup = preparedGuideLookups[epgID] {
-            return lookup.program(containing: date)
+        guard let epgID = channel.epgChannelID else { return nil }
+        if let timeline = guideTimeline {
+            guard let handle = timeline.handle(for: epgID) else { return nil }
+            return timeline.program(handle, at: date)
         }
-        return GuideLookup.program(in: programsForChannel(channel), containing: date)
+        return GuideLookup.program(in: programs[epgID] ?? [], containing: date)
     }
 
     // MARK: - Indexed State Rebuilders (Agent 03 - incremental, not per-access)
@@ -1004,14 +1007,6 @@ class EPGViewModel {
         let key = DataCache.cacheKey(for: config)
         let started = ContinuousClock.now
 
-        // The guide blob is the largest slot and is always read, so decode it
-        // alongside channels and the catalog. Catalog reads stay sequential:
-        // each is skipped once VOD is disabled mid-hydration.
-        let programsLoad = Task.detached(priority: .userInitiated) {
-            Self.timedCacheLoad { DataCache.loadPrograms(key: key) }
-        }
-        defer { programsLoad.cancel() }
-
         let (channelsCache, channelsMs) = await Task.detached(priority: .userInitiated) {
             Self.timedCacheLoad { DataCache.loadChannels(key: key) }
         }.value
@@ -1029,10 +1024,27 @@ class EPGViewModel {
             channels = hydratedChannels.map { SmartSportsSnapshotLoader.stamp($0, config: config) }
             lastUpdated = channelsCache.savedAt
         }
+        let channelsPublishedMs = AppLog.elapsedMilliseconds(since: started)
+
+        // The guide is the largest slot and is always read; decode it
+        // alongside the catalog. The columnar slot needs only the channel
+        // retention windows, which are applied on its Int32 columns so
+        // expired listings are never materialized, then the flat timeline
+        // is built on the same worker.
+        let retention = GuideHistory.retentionPolicy(
+            starts: GuideHistory.retentionStarts(channels: channels, now: Date()), now: Date())
+        let programsLoad = Task.detached(priority: .userInitiated) { () -> (PreparedGuideSnapshot?, Int, Int) in
+            let (cache, loadMs) = Self.timedCacheLoad { DataCache.loadPrograms(key: key, retaining: retention) }
+            guard let cache, !Task.isCancelled else { return (nil, loadMs, 0) }
+            let prepareStarted = ContinuousClock.now
+            let snapshot = Self.prepareGuideSnapshot(programs: cache.programs)
+            return (snapshot, loadMs, AppLog.elapsedMilliseconds(since: prepareStarted))
+        }
+        defer { programsLoad.cancel() }
+
         // Disabled catalogs can be large. Check before disk IO/decoding and
         // again after each await; preference changes must not publish an old
         // catalog or schedule the next disabled cache read.
-        let channelsPublishedMs = AppLog.elapsedMilliseconds(since: started)
         var vodMs = 0
         if !isVODDisabled, catalogID == catalogGeneration {
             let (vodCache, ms) = await Task.detached(priority: .userInitiated, operation: {
@@ -1066,21 +1078,12 @@ class EPGViewModel {
 
         let catalogPublishedMs = AppLog.elapsedMilliseconds(since: started)
 
-        let (programsCache, programsMs) = await programsLoad.value
+        let (programsSnapshot, programsMs, prepareMs) = await programsLoad.value
         guard !Task.isCancelled, isCurrentSource(generation, config: config) else { return }
-        var prepareMs = 0
-        if let programsCache {
-            let loadedPrograms = programsCache.programs
-            let starts = GuideHistory.retentionStarts(channels: channels, now: Date())
-            let prepareStarted = ContinuousClock.now
-            let snapshot = await Task.detached(priority: .userInitiated) {
-                Self.prepareGuideSnapshot(programs: GuideHistory.prune(loadedPrograms, starts: starts, now: Date()))
-            }.value
-            prepareMs = AppLog.elapsedMilliseconds(since: prepareStarted)
-            guard !Task.isCancelled, isCurrentSource(generation, config: config) else { return }
+        if let programsSnapshot {
             // Historical rows remain useful even when the live/future window
             // has expired; live coverage is checked separately for refresh.
-            publishPreparedGuide(snapshot)
+            publishPreparedGuide(programsSnapshot)
         }
         AppLog.sync.info("Hydration finished channels=\(self.channels.count, privacy: .public) programKeys=\(self.programs.count, privacy: .public) elapsedMs=\(AppLog.elapsedMilliseconds(since: started), privacy: .public) channelsLoadMs=\(channelsMs, privacy: .public) vodLoadMs=\(vodMs, privacy: .public) seriesLoadMs=\(seriesMs, privacy: .public) programsLoadMs=\(programsMs, privacy: .public) guidePrepareMs=\(prepareMs, privacy: .public) channelsPublishedMs=\(channelsPublishedMs, privacy: .public) catalogPublishedMs=\(catalogPublishedMs, privacy: .public)")
     }
@@ -1505,10 +1508,14 @@ class EPGViewModel {
             guard let self else { throw CancellationError() }
             try self.checkSync(id, generation: generation, config: config)
             let base = self.programs
+            let baseVersion = self.guideVersion
+            let baseTimeline = self.guideTimeline
             let now = Date()
             let starts = GuideHistory.retentionStarts(channels: self.channels, now: now)
             let pruneAll = stage == "current"
-            let worker = Task.detached(priority: .userInitiated) {
+            // The worker merges the changed IDs into a complete guide and
+            // builds its timeline; unchanged runs are column copies.
+            let worker = Task.detached(priority: .userInitiated) { () -> (delta: [String: [EPGProgram]], snapshot: PreparedGuideSnapshot) in
                 let started = ContinuousClock.now
                 let organized = Self.organize(incoming)
                 var delta: [String: [EPGProgram]] = [:]
@@ -1518,26 +1525,27 @@ class EPGViewModel {
                     guard let earliest = starts[epgID] else { delta[epgID] = []; continue }
                     delta[epgID] = GuideHistory.merge(existing: base[epgID] ?? [], incoming: organized[epgID] ?? [], earliest: earliest, now: now)
                 }
-                return Self.prepareGuideSnapshot(programs: delta, mergeMs: AppLog.elapsedMilliseconds(since: started))
+                var full = base
+                for (epgID, list) in delta { full[epgID] = list.isEmpty ? nil : list }
+                let mergeMs = AppLog.elapsedMilliseconds(since: started)
+                return (delta, Self.prepareGuideSnapshot(programs: full, reusing: baseTimeline, mergeMs: mergeMs))
             }
-            let prepared = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+            let (delta, prepared) = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
             try self.checkSync(id, generation: generation, config: config)
             let mainStarted = ContinuousClock.now
-            var full = self.programs
-            var buckets = self.programHourBuckets
-            var lookups = self.preparedGuideLookups
-            for (epgID, list) in prepared.programs {
-                if list.isEmpty {
-                    full[epgID] = nil; buckets[epgID] = nil; lookups[epgID] = nil
-                } else {
-                    full[epgID] = list
-                    buckets[epgID] = prepared.hourBuckets[epgID]
-                    lookups[epgID] = prepared.lookups[epgID]
-                }
+            let full: [String: [EPGProgram]]
+            if self.guideVersion == baseVersion {
+                full = prepared.programs
+                self.programs = full
+                self.guideTimeline = prepared.timeline
+            } else {
+                // The guide was replaced meanwhile (e.g. hydration); apply the
+                // delta to the newer guide and leave it to the exact lookup.
+                var merged = self.programs
+                for (epgID, list) in delta { merged[epgID] = list.isEmpty ? nil : list }
+                full = merged
+                self.programs = full
             }
-            self.programs = full
-            self.programHourBuckets = buckets
-            self.preparedGuideLookups = lookups
             self.rebuildSearchIndex()
             self.lastUpdated = now
             let elapsed = mainStarted.duration(to: .now).components
@@ -1548,7 +1556,7 @@ class EPGViewModel {
                 DataCache.enqueueSavePrograms(full, key: cacheKey)
                 self.lastGuidePersistedAt = .now
             }
-            AppLog.sync.info("Guide progressive publication stage=\(stage, privacy: .public) incoming=\(incoming.count, privacy: .public) changedKeys=\(prepared.programs.count, privacy: .public) totalKeys=\(full.count, privacy: .public) mergeMs=\(prepared.mergeMs, privacy: .public) bucketMs=\(prepared.bucketMs, privacy: .public) persisted=\(persist, privacy: .public) mainCommitMs=\(commitMs, privacy: .public)")
+            AppLog.sync.info("Guide progressive publication stage=\(stage, privacy: .public) incoming=\(incoming.count, privacy: .public) changedKeys=\(delta.count, privacy: .public) totalKeys=\(full.count, privacy: .public) mergeMs=\(prepared.mergeMs, privacy: .public) bucketMs=\(prepared.bucketMs, privacy: .public) persisted=\(persist, privacy: .public) mainCommitMs=\(commitMs, privacy: .public)")
         }
         guidePublicationTask = task
         try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
@@ -2375,54 +2383,34 @@ class EPGViewModel {
     private func publishPreparedGuide(_ snapshot: PreparedGuideSnapshot) {
         let mainWaitMs = AppLog.elapsedMilliseconds(since: snapshot.preparedAt)
         programs = snapshot.programs
-        programHourBuckets = snapshot.hourBuckets
-        preparedGuideLookups = snapshot.lookups
+        guideTimeline = snapshot.timeline
         rebuildSearchIndex()
         AppLog.sync.info("Guide published programKeys=\(snapshot.programs.count, privacy: .public) organizeMs=\(snapshot.organizeMs, privacy: .public) mergeMs=\(snapshot.mergeMs, privacy: .public) bucketMs=\(snapshot.bucketMs, privacy: .public) mainWaitMs=\(mainWaitMs, privacy: .public)")
     }
 
     private struct PreparedGuideSnapshot: Sendable {
         let programs: [String: [EPGProgram]]
-        let hourBuckets: [String: [Int: [Int]]]
-        let lookups: [String: GuideLookup.Prepared]
+        let timeline: GuideTimeline
         let organizeMs: Int
         let mergeMs: Int
+        /// Timeline column build (formerly hour buckets + per-key lookups).
         let bucketMs: Int
         let preparedAt: ContinuousClock.Instant
     }
 
-    nonisolated private static func makeProgramHourBuckets(
-        _ programs: [String: [EPGProgram]]
-    ) -> [String: [Int: [Int]]] {
-        var hourBuckets: [String: [Int: [Int]]] = [:]
-        hourBuckets.reserveCapacity(programs.count)
-        for (epgID, progs) in programs {
-            var buckets: [Int: [Int]] = [:]
-            buckets.reserveCapacity(max(1, progs.count / 8))
-            for (programIndex, p) in progs.enumerated() {
-                let startH = Int(floor(p.start.timeIntervalSince1970 / 3600))
-                let endH = Int(floor((p.end.timeIntervalSince1970 - 0.001) / 3600))
-                for h in startH...max(startH, endH) {
-                    buckets[h, default: []].append(programIndex)
-                }
-            }
-            hourBuckets[epgID] = buckets
-        }
-        return hourBuckets
-    }
-
+    /// Builds the flat timeline for a complete guide. Runs that share array
+    /// storage with `previous` are copied column-wise instead of recomputed.
     nonisolated private static func prepareGuideSnapshot(
         programs: [String: [EPGProgram]],
+        reusing previous: GuideTimeline? = nil,
         organizeMs: Int = 0,
         mergeMs: Int = 0
     ) -> PreparedGuideSnapshot {
         let bucketStarted = ContinuousClock.now
-        let hourBuckets = makeProgramHourBuckets(programs)
-        let lookups = programs.mapValues { GuideLookup.Prepared(programs: $0) }
+        let timeline = GuideTimeline(programs, reusing: previous)
         return PreparedGuideSnapshot(
             programs: programs,
-            hourBuckets: hourBuckets,
-            lookups: lookups,
+            timeline: timeline,
             organizeMs: organizeMs,
             mergeMs: mergeMs,
             bucketMs: AppLog.elapsedMilliseconds(since: bucketStarted),
@@ -2430,40 +2418,24 @@ class EPGViewModel {
         )
     }
 
-    /// Returns programs for the channel that intersect [start, end).
-    /// Uses pre-buckets when available for O(relevant hours) instead of O(all programs for channel).
-    /// This makes the now-limited visible row computations (rowData + buildBlocks) fast even with long catchup histories.
+    /// Returns programs for the channel that intersect [start, end), ordered
+    /// by (start, end). Two binary searches over the channel's contiguous
+    /// Int32 columns bound the run; only that slice is scanned.
     func programsForChannel(_ channel: Channel, between start: Date, and end: Date) -> [EPGProgram] {
         if channel.sourceOwnership?.logicalChannelID != nil ||
             (channel.sourceChannelIdentity != nil && channel.sourceChannelIdentity?.sourceID != activePlaylistID) {
             return programsForChannel(channel).filter { $0.end > start && $0.start < end }
                 .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
         }
+        _ = guideVersion
         guard let epgID = channel.epgChannelID else { return [] }
-        guard let buckets = programHourBuckets[epgID], !buckets.isEmpty else {
-            // Fallback (no buckets yet or empty)
-            return programsForChannel(channel)
-                .filter { $0.end > start && $0.start < end }
-                .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
+        if let timeline = guideTimeline {
+            guard let handle = timeline.handle(for: epgID) else { return [] }
+            return timeline.programs(handle, between: start, and: end)
         }
-        let allPrograms = programs[epgID] ?? []
-        let startH = Int(floor(start.timeIntervalSince1970 / 3600)) - 1
-        let endH = Int(ceil(end.timeIntervalSince1970 / 3600)) + 1
-        var candidates: [EPGProgram] = []
-        var seenIndices = Set<Int>()
-        for h in startH...endH {
-            if let list = buckets[h] {
-                for programIndex in list where seenIndices.insert(programIndex).inserted {
-                    guard allPrograms.indices.contains(programIndex) else { continue }
-                    let p = allPrograms[programIndex]
-                    if p.end > start && p.start < end {
-                        candidates.append(p)
-                    }
-                }
-            }
-        }
-        // Buckets are not globally sorted across hours, so sort the small result
-        return candidates.sorted { ($0.start, $0.end) < ($1.start, $1.end) }
+        return (programs[epgID] ?? [])
+            .filter { $0.end > start && $0.start < end }
+            .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
     }
 
     nonisolated private static func organize(_ allPrograms: [EPGProgram]) -> [String: [EPGProgram]] {
@@ -2801,7 +2773,6 @@ class EPGViewModel {
         vodItemDetailLoadErrors = [:]
         loadingVODItemIDs = []
         programs = [:]
-        programHourBuckets = [:]
         hasLoadedOnce = false
     }
 

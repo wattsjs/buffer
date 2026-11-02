@@ -42,6 +42,17 @@ import Foundation
         let elapsed = began.duration(to: .now).components
         let ms = Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1e15
         precondition(retained.values.reduce(0) { $0 + $1.count } == 357_120)
+        #if !BASELINE_GUIDE_HISTORY
+        // Pruning that removes nothing keeps the array storage (timeline reuse).
+        for (id, list) in retained {
+            let same = list.withUnsafeBufferPointer { a in schedules[id]!.withUnsafeBufferPointer { a.baseAddress == $0.baseAddress } }
+            precondition(same, "unchanged channel was copied by pruning")
+        }
+        // Allocation-free title check matches the trimming definition.
+        for text in ["", " ", "\t\n", "\u{00A0}", "\u{2028}", " \u{3000}", "a", " a ", "\u{00A0}x", "é", "\r\n", "\u{1680}", "\u{200B}", "\u{85}"] {
+            precondition(GuideHistory.hasVisibleText(text) == !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "title check differs for \(text.unicodeScalars.map { $0.value })")
+        }
+        #endif
         print("PASS sparse retention, coverage holes, bounds, duplicate precedence, 357120-listing scale")
         print("GUIDE_HISTORY_BENCH_JSON {\"fixture\":\"guide-history-240x1488-v1\",\"listings\":357120,\"pruneMs\":\(ms)}")
     }
