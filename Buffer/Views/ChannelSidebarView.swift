@@ -97,6 +97,7 @@ struct ChannelSidebarView: View {
             if !viewModel.playlists.isEmpty {
                 Section {
                     playlistPicker
+                    CountryFilterSidebarRow(viewModel: viewModel)
                 }
             }
 

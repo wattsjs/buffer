@@ -63,6 +63,7 @@ class EPGViewModel {
                 migrateM3UChannelPreferences(from: oldValue, to: channels)
             }
             channelCatalogVersion &+= 1
+            sourceChannelsVersion &+= 1
             rebuildChannelDerivedState()
             // A running account sync refreshes Smart once when it finishes.
             if isSmartSportsActive, activeSyncTask == nil { refreshSmartSports() }
@@ -139,7 +140,17 @@ class EPGViewModel {
     @ObservationIgnored private var smartRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var inactiveSourceRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var smartDisplayedCatalogSnapshot: [Channel]?
-    var displayedChannels: [Channel] { isSmartSportsActive ? smartSports.displayedChannels : channels }
+    var displayedChannels: [Channel] { isSmartSportsActive ? smartSports.displayedChannels : countryFilteredChannels }
+    /// The active source's channels the country filter keeps (favourites
+    /// are always kept). Smart Channels applies the same filter while grouping.
+    private var countryFilteredChannels: [Channel] = []
+    /// Region/category per channel of `channels`, rebuilt once per catalog.
+    @ObservationIgnored private var sourceRegionColumns = ChannelRegionColumns()
+    @ObservationIgnored private var sourceRegionColumnsVersion = -1
+    @ObservationIgnored private var sourceChannelsVersion = 0
+    /// Per-region counts for the active source, for the filter editor when
+    /// Smart Channels has not scanned every source yet.
+    private(set) var sourceRegionInventory: [SmartRegionSummary] = []
     var displayedPrograms: [String: [EPGProgram]] { isSmartSportsActive ? smartSports.displayedPrograms : programs }
     static let smartSportsReminderPlaylistID = UUID(uuidString: "AF314B3F-7111-49FC-9C25-8D548519DE96")!
     var displayedPlaylistID: UUID? { isSmartSportsActive ? Self.smartSportsReminderPlaylistID : activePlaylistID }
@@ -274,7 +285,14 @@ class EPGViewModel {
 
     /// Saves the Smart Channels filter and regroups under it.
     func applySmartChannelFilter(_ filter: SmartChannelFilter) {
+        guard filter != smartSports.filter else { return }
         smartSports.setFilter(filter)
+        if !isSmartSportsActive {
+            channelCatalogVersion &+= 1
+            rebuildChannelDerivedState()
+            rebuildSearchIndex()
+            if case .group(let name) = selection, !groups.contains(name) { selection = .allChannels }
+        }
         AppLog.app.info("Smart Channels filter applied enabled=\(filter.isEnabled, privacy: .public) regions=\(filter.regions.count, privacy: .public) alwaysInclude=\(filter.alwaysInclude.count, privacy: .public)")
         if isSmartSportsActive { refreshSmartSports(immediately: true) }
     }
@@ -819,12 +837,52 @@ class EPGViewModel {
     // MARK: - Indexed State Rebuilders (Agent 03 - incremental, not per-access)
 
     private func rebuildChannelDerivedState() {
+        refreshCountryFilteredChannels()
         channelByID = Dictionary(displayedChannels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         groupedChannels = Dictionary(grouping: displayedChannels, by: \.group)
         rebuildGroupOrder()
         rebuildRecentAndFavoriteChannels()
         rebuildScoreMaps()
         rebuildFilteredCaches()
+    }
+
+    private func refreshCountryFilteredChannels() {
+        let filter = smartSports.filter
+        if sourceRegionColumnsVersion != sourceChannelsVersion || sourceRegionColumns.count != channels.count {
+            let started = ContinuousClock.now
+            sourceRegionColumns = AutoChannelGrouper.classify(channels)
+            sourceRegionColumnsVersion = sourceChannelsVersion
+            sourceRegionInventory = AutoChannelGrouper.inventory(sourceRegionColumns)
+            PerfMetrics.shared.record("filter.country.classifyMs", PerfMetrics.milliseconds(since: started))
+        }
+        guard filter.isEnabled else {
+            countryFilteredChannels = channels
+            return
+        }
+        let compiled = CompiledRegionFilter(filter)
+        let regions = sourceRegionColumns.region
+        let categories = sourceRegionColumns.category
+        var kept: [Channel] = []
+        kept.reserveCapacity(channels.count)
+        for (index, channel) in channels.enumerated()
+        where compiled.allows(region: regions[index], category: categories[index]) || favoriteChannelIDs.contains(channel.id) {
+            kept.append(channel)
+        }
+        countryFilteredChannels = kept
+    }
+
+    /// Channels shown out of those available under the current view.
+    var countryFilterCounts: (shown: Int, total: Int) {
+        if isSmartSportsActive {
+            let filter = smartSports.filter
+            let inventory = smartSports.regionInventory
+            let total = inventory.reduce(0) { $0 + $1.total }
+            let shown = inventory.reduce(0) { sum, region in
+                sum + region.categoryCounts.reduce(0) { $0 + (filter.allows(region: region.region, category: $1.key) ? $1.value : 0) }
+            }
+            return (shown, total)
+        }
+        return (countryFilteredChannels.count, channels.count)
     }
 
     private func rebuildGroupOrder() {

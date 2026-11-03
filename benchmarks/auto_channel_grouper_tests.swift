@@ -151,6 +151,35 @@ import Foundation
             && columns.handles.enumerated().allSatisfy { UInt32(truncatingIfNeeded: $1) == UInt32($0) }
             && Set(columns.handles.map { $0 >> 32 }).count == 3, "Handles carry source and ordinal")
 
-        print("PASS auto channel grouping: region/quality normalisation, distinct timeshift/region, event-slot exclusion, cross-source feeds, stable IDs, curated precedence, language regions, region/category filter, inventory, guide-ID merging, country names, single-source sports, interner/map/bitset/packed vocabulary, rank handles")
+        // Single-source country filter: classify once, then one bit test per channel.
+        let source = [ch("1", "UK: Sky Sports Main Event", group: "UK | Sports"),
+                      ch("2", "FR: TF1", group: "France"),
+                      ch("3", "Cartoon Network", group: "FR | Kids"),
+                      ch("4", "##### USA #####", group: "USA | News"),
+                      ch("5", "Mystery Channel", group: "Misc")]
+        let regions = AutoChannelGrouper.classify(source)
+        let label = { (i: Int) in AutoChannelGrouper.Countries.labels[Int(regions.region[i])] }
+        let category = { (i: Int) in SmartChannelFilter.categories[Int(regions.category[i])] }
+        precondition(regions.count == 5 && label(0) == "UK" && category(0) == "Sports", "Prefixed sports channel classified")
+        precondition(label(1) == "FR" && label(2) == "FR" && category(2) == "Kids", "Group title supplies region and category")
+        precondition(label(3) == "US" && category(3) == "News", "Separator rows fall back to their group's region")
+        precondition(label(4) == SmartChannelFilter.unknownRegion, "No detectable region is Global")
+        var keepUK = SmartChannelFilter(isEnabled: true)
+        keepUK.regions = ["UK": .sportsOnly]
+        keepUK.alwaysInclude = ["Kids"]
+        let compiled = CompiledRegionFilter(keepUK)
+        let kept = (0..<regions.count).filter { compiled.allows(region: regions.region[$0], category: regions.category[$0]) }
+        precondition(kept == [0, 2], "Compiled filter matches SmartChannelFilter.allows: \(kept)")
+        for region in 0..<AutoChannelGrouper.Countries.labels.count {
+            for (c, name) in SmartChannelFilter.categories.enumerated() {
+                precondition(compiled.allows(region: UInt8(region), category: UInt8(c))
+                    == keepUK.allows(region: AutoChannelGrouper.Countries.labels[region], category: name), "Compiled bit table is exact")
+            }
+        }
+        let sourceInventory = AutoChannelGrouper.inventory(regions)
+        precondition(sourceInventory.reduce(0) { $0 + $1.total } == 5
+            && sourceInventory.first(where: { $0.region == "FR" })?.total == 2, "Source inventory counts every channel once")
+
+        print("PASS auto channel grouping: region/quality normalisation, distinct timeshift/region, event-slot exclusion, cross-source feeds, stable IDs, curated precedence, language regions, region/category filter, inventory, guide-ID merging, country names, single-source sports, interner/map/bitset/packed vocabulary, rank handles, single-source country classification and compiled filter")
     }
 }

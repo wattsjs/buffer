@@ -256,7 +256,7 @@ struct BufferApp: App {
                     }
                 }
                 Divider()
-                Button("Filter Smart Channels…") { openWindow(id: "smart-channel-filter") }
+                Button("Country Filter…") { openWindow(id: "smart-channel-filter") }
                 Button("Manage Sources…") { openWindow(id: "settings") }
                 Button("Review Smart Channels…") { openWindow(id: "smart-sports-reviews") }
             }
@@ -312,7 +312,7 @@ struct BufferApp: App {
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
 
-        Window("Smart Channel Filter", id: "smart-channel-filter") {
+        Window("Country Filter", id: "smart-channel-filter") {
             SmartChannelFilterView(viewModel: viewModel)
         }
         .defaultSize(width: 600, height: 680)

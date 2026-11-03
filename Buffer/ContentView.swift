@@ -638,6 +638,11 @@ struct ContentView: View {
                     }
                 }
             }
+            if !viewModel.playlists.isEmpty {
+                ToolbarItem(placement: .primaryAction) {
+                    CountryFilterToolbarButton(viewModel: viewModel)
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     openWindow(id: "settings")

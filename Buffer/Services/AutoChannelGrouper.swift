@@ -1347,3 +1347,94 @@ nonisolated struct Bitset: Equatable, Sendable {
         return result
     }
 }
+
+// MARK: - Country filter for a single source
+
+/// Region and category of each channel of one source, in channel order, so
+/// the country filter can hide channels outside Smart Channels too.
+nonisolated struct ChannelRegionColumns: Sendable {
+    /// `AutoChannelGrouper.Countries` id; 0 means no detectable region.
+    var region: [UInt8] = []
+    /// Index into `SmartChannelFilter.categories`.
+    var category: [UInt8] = []
+    var count: Int { region.count }
+}
+
+/// `SmartChannelFilter` flattened to one bit per (region, category) pair.
+nonisolated struct CompiledRegionFilter: Sendable {
+    private let allowed: Bitset
+    private static let categoryCount = SmartChannelFilter.categories.count
+
+    init(_ filter: SmartChannelFilter) {
+        var bits = Bitset(count: AutoChannelGrouper.Countries.labels.count * Self.categoryCount)
+        for (region, label) in AutoChannelGrouper.Countries.labels.enumerated() {
+            for (category, name) in SmartChannelFilter.categories.enumerated()
+            where filter.allows(region: label, category: name) {
+                bits.insert(region * Self.categoryCount + category)
+            }
+        }
+        allowed = bits
+    }
+
+    @inline(__always) func allows(region: UInt8, category: UInt8) -> Bool {
+        allowed.contains(Int(region) * Self.categoryCount + Int(category))
+    }
+}
+
+extension AutoChannelGrouper {
+    /// One pass over a source's channels with the same scanner Smart Channels
+    /// uses. Unparseable names (e.g. "##### UK #####" separators) fall back to
+    /// the region their group title names.
+    static func classify(_ channels: [Channel]) -> ChannelRegionColumns {
+        var columns = ChannelRegionColumns()
+        columns.region.reserveCapacity(channels.count)
+        columns.category.reserveCapacity(channels.count)
+        var scratch = Scanner.Scratch()
+        var groups = GroupFacts.Table()
+        for channel in channels {
+            let facts = groups.facts(for: channel.group)
+            let region: UInt8
+            switch Scanner.scan(channel.name, facts: facts, guide: channel.epgChannelID, scratch: &scratch) {
+            case .parsed(let country, _, _):
+                region = country
+            case .needsFoundation:
+                region = parseFoundation(channel).map { Countries.id(of: $0.identity.country) } ?? groupRegion(facts)
+            case .rejected:
+                region = groupRegion(facts)
+            }
+            columns.region.append(region)
+            columns.category.append(facts.category)
+        }
+        return columns
+    }
+
+    private static func groupRegion(_ facts: GroupFacts) -> UInt8 {
+        for candidate in [facts.leadingCountry, facts.namedCountry, facts.language] where candidate != GroupFacts.none {
+            return candidate
+        }
+        return 0
+    }
+
+    /// Channel counts per region and category, largest region first.
+    static func inventory(_ columns: ChannelRegionColumns) -> [SmartRegionSummary] {
+        let categoryCount = SmartChannelFilter.categories.count
+        var counts = [Int](repeating: 0, count: Countries.labels.count * categoryCount)
+        for i in 0..<columns.count {
+            counts[Int(columns.region[i]) * categoryCount + Int(columns.category[i])] += 1
+        }
+        var summaries: [SmartRegionSummary] = []
+        for (region, label) in Countries.labels.enumerated() {
+            var byCategory: [String: Int] = [:]
+            for c in 0..<categoryCount where counts[region * categoryCount + c] > 0 {
+                byCategory[SmartChannelFilter.categories[c], default: 0] += counts[region * categoryCount + c]
+            }
+            if byCategory.isEmpty { continue }
+            if let index = summaries.firstIndex(where: { $0.region == label }) {
+                summaries[index].categoryCounts.merge(byCategory, uniquingKeysWith: +)
+            } else {
+                summaries.append(SmartRegionSummary(region: label, categoryCounts: byCategory))
+            }
+        }
+        return summaries.sorted { ($0.total, $1.region) > ($1.total, $0.region) }
+    }
+}
