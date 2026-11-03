@@ -1619,7 +1619,12 @@ class EPGViewModel {
             let elapsed = mainStarted.duration(to: .now).components
             let commitMs = Double(elapsed.seconds) * 1000 + Double(elapsed.attoseconds) / 1e15
             self.guideMaximumCommitMilliseconds = max(self.guideMaximumCommitMilliseconds, commitMs)
-            let persist = forcePersist || self.lastGuidePersistedAt.map { AppLog.elapsedMilliseconds(since: $0) >= 3000 } ?? true
+            // Each save re-encodes the whole guide (millions of rows). While
+            // enrichment streams history in, save at most every two minutes;
+            // the sync saves once more when enrichment finishes.
+            let persist = forcePersist || self.lastGuidePersistedAt.map {
+                AppLog.elapsedMilliseconds(since: $0) >= (self.isGuideEnriching ? 120_000 : 3000)
+            } ?? true
             if persist {
                 DataCache.enqueueSavePrograms(full, key: cacheKey)
                 self.lastGuidePersistedAt = .now
