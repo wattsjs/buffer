@@ -14,9 +14,9 @@ nonisolated struct XtreamCategoryTable: Sendable {
     private(set) var names: [String] = []
     /// Open-addressing slots holding row + 1 (0 = empty), keyed by ID bytes.
     private var slots: [Int32] = []
-    /// String lookups when any ID is non-ASCII (Swift String equality is
-    /// canonical equivalence, which byte equality does not reproduce).
+    /// Swift String lookups (canonical equivalence) for non-ASCII IDs.
     private var byString: [String: Int]?
+    private var asciiOnly = true
 
     static let empty = XtreamCategoryTable()
 
@@ -39,24 +39,25 @@ nonisolated struct XtreamCategoryTable: Sendable {
         var table = XtreamCategoryTable()
         mutating func add(id: [UInt8], name: String) throws {
             let ref = try table.ids.append(id)
-            if !table.ids.isASCII(ref), table.byString == nil { table.byString = [:] }
+            if !table.ids.isASCII(ref) { table.asciiOnly = false }
             table.idRefs.append(ref)
             table.names.append(name)
         }
     }
 
-    /// Finalizes slots (last duplicate wins).
+    /// Finalizes lookups (last duplicate wins, as the reference dictionary).
     mutating func seal() {
+        // Swift String keys: the reference semantics (canonical equivalence),
+        // used for non-ASCII IDs on either side.
+        var map: [String: Int] = [:]
+        map.reserveCapacity(idRefs.count)
+        for (row, ref) in idRefs.enumerated() { map[ids.string(ref)!] = row }
+        byString = map
+        guard asciiOnly else { return }
         let rows = idRefs.count
         var capacity = 8
         while capacity < rows * 2 { capacity <<= 1 }
         slots = [Int32](repeating: 0, count: capacity)
-        if byString != nil {
-            var map: [String: Int] = [:]
-            for (row, ref) in idRefs.enumerated() { map[ids.string(ref)!] = row }
-            byString = map
-            return
-        }
         let mask = capacity - 1
         for (row, ref) in idRefs.enumerated() {
             var slot = Int(ids.hash(ref) & UInt64(mask))
@@ -68,12 +69,14 @@ nonisolated struct XtreamCategoryTable: Sendable {
         }
     }
 
-    /// Name for an ID given as bytes.
+    /// Name for an ID given as bytes. ASCII IDs against an ASCII table are
+    /// compared as bytes (canonical equivalence is byte equality there).
     func name(_ p: UnsafePointer<UInt8>, _ n: Int) -> String? {
-        if let byString {
-            return byString[String(decoding: UnsafeBufferPointer(start: p, count: n), as: UTF8.self)].map { names[$0] }
+        var ascii = asciiOnly && !slots.isEmpty
+        if ascii { for i in 0..<n where p[i] >= 0x80 { ascii = false; break } }
+        guard ascii else {
+            return byString?[String(decoding: UnsafeBufferPointer(start: p, count: n), as: UTF8.self)].map { names[$0] }
         }
-        guard !slots.isEmpty else { return nil }
         let mask = slots.count - 1
         var slot = Int(ConnectorStringTable.hash(p, n) & UInt64(mask))
         while true {

@@ -704,11 +704,6 @@ nonisolated struct ConnectorStringTable: Sendable {
         }
     }
 
-    func equals(_ ref: Ref, _ literal: StaticString) -> Bool {
-        guard ref != Self.none, Self.length(ref) == literal.utf8CodeUnitCount else { return false }
-        return withBytes(ref) { p, n in memcmp(p, literal.utf8Start, n) == 0 }
-    }
-
     func isASCII(_ ref: Ref) -> Bool {
         guard ref != Self.none else { return true }
         return withBytes(ref) { p, n in
@@ -734,22 +729,6 @@ nonisolated struct ConnectorStringTable: Sendable {
             memcmp($0.baseAddress! + Self.offset(a), $0.baseAddress! + Self.offset(b), Self.length(a)) == 0
         }
     }
-}
-
-/// Fixed-width bitset over row indices.
-nonisolated struct ConnectorBitset: Sendable {
-    private(set) var words: [UInt64] = []
-    init(capacity: Int = 0) { words.reserveCapacity((capacity + 63) / 64) }
-    @inline(__always) mutating func set(_ index: Int) {
-        let w = index >> 6
-        while words.count <= w { words.append(0) }
-        words[w] |= 1 << UInt64(index & 63)
-    }
-    @inline(__always) func contains(_ index: Int) -> Bool {
-        let w = index >> 6
-        return w < words.count && words[w] & (1 << UInt64(index & 63)) != 0
-    }
-    var count: Int { words.reduce(0) { $0 + $1.nonzeroBitCount } }
 }
 
 // MARK: - JSONDecoder field semantics

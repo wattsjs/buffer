@@ -203,9 +203,10 @@ struct ConnectorDecodeTests {
             "[{\"category_id\":\"5\",\"category_name\":\"First\"},{\"category_id\":5,\"category_name\":\"Second\"}]",
             "[{\"category_id\":\"5\",\"category_name\":null},{\"category_id\":\"\",\"category_name\":\"Empty\"}]",
             "[{\"category_id\":\"\u{212A}\",\"category_name\":\"Kelvin\"},{\"category_id\":\"5\",\"category_name\":\"Five\"}]",
-            "[{\"category_id\":\"5\",\"category_name\":3}]", "[{\"category_name\":\"no id\"}]", "{}", "[]", "",
+            "[{\"category_id\":\"5\",\"category_name\":3}]",
+            "[{\"category_id\":\"K\",\"category_name\":\"ASCII K\"},{\"category_id\":\"e\\u0301\",\"category_name\":\"decomposed\"}]", "[{\"category_name\":\"no id\"}]", "{}", "[]", "",
         ]
-        let kelvinStreams = data("[{\"stream_id\":1,\"category_id\":\"K\"},{\"stream_id\":2,\"category_id\":\"5\"},{\"stream_id\":3,\"category_id\":\"\"},{\"stream_id\":4,\"category_id\":5}]")
+        let kelvinStreams = data("[{\"stream_id\":0,\"category_id\":\"\\u212a\"},{\"stream_id\":-1,\"category_id\":\"\\u00e9\"},{\"stream_id\":1,\"category_id\":\"K\"},{\"stream_id\":2,\"category_id\":\"5\"},{\"stream_id\":3,\"category_id\":\"\"},{\"stream_id\":4,\"category_id\":5}]")
         for (k, cats) in quirkCategories.enumerated() { compareChannels(kelvinStreams, data(cats), "category quirk \(k)") }
 
         var mutator = Mutator(rng: FixtureRNG(42))
