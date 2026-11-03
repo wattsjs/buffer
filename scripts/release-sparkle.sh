@@ -89,7 +89,10 @@ activate_signing_keychain() {
     security unlock-keychain "$keychain_path" >/dev/null 2>&1 || true
   fi
   security list-keychains -d user -s "$keychain_path" "$HOME/Library/Keychains/login.keychain-db" /Library/Keychains/System.keychain >/dev/null
-  security default-keychain -s "$keychain_path" >/dev/null
+  # Never make the signing keychain the default: other apps save new
+  # credentials into the default keychain, and an interrupted run would
+  # leave them writing into a keychain the user cannot unlock. codesign
+  # finds the identity through the search list.
 }
 
 detect_signing_identity() {
