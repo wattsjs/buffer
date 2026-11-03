@@ -10,8 +10,10 @@ struct StalkerAccountInfo: Codable, Equatable {
     }
 }
 
-private struct StalkerFlexibleString: Decodable, Sendable {
+nonisolated private struct StalkerFlexibleString: Decodable, Sendable {
     let value: String
+
+    init(value: String) { self.value = value }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -70,6 +72,12 @@ actor StalkerClient {
         let maxPageItems: Int
         let data: [Item]
 
+        init(totalItems: Int, maxPageItems: Int, data: [Item]) {
+            self.totalItems = totalItems
+            self.maxPageItems = maxPageItems
+            self.data = data
+        }
+
         enum CodingKeys: String, CodingKey {
             case totalItems = "total_items"
             case maxPageItems = "max_page_items"
@@ -123,6 +131,26 @@ actor StalkerClient {
             case genresString = "genres_str"
             case ratingIMDB = "rating_imdb"
         }
+
+        /// Row `row` of columns decoded with `StalkerColumnarDecoder.mediaFields`.
+        init(columns: ConnectorRecordColumns, row: Int) {
+            typealias F = StalkerColumnarDecoder.MediaField
+            id = columns.string(row, F.id)!
+            name = columns.string(row, F.name)
+            categoryID = columns.string(row, F.categoryID).map(StalkerFlexibleString.init(value:))
+            cmd = columns.string(row, F.cmd)
+            screenshotURI = columns.string(row, F.screenshot)
+            pic = columns.string(row, F.pic)
+            genresString = columns.string(row, F.genres)
+            actors = columns.string(row, F.actors)
+            director = columns.string(row, F.director)
+            ratingIMDB = columns.string(row, F.rating).map(StalkerFlexibleString.init(value:))
+            year = columns.string(row, F.year)
+            added = columns.string(row, F.added)
+            description = columns.string(row, F.description)
+            series = columns.intList(row, F.series)
+            path = columns.string(row, F.path)
+        }
     }
 
     private struct LinkResult: Decodable {
@@ -166,9 +194,9 @@ actor StalkerClient {
 
     func fetchChannels(sampleOnly: Bool = false) async throws -> [Channel] {
         let categories = (try? await fetchCategories(type: "itv", action: "get_genres")) ?? [:]
-        let channels: [StalkerChannel]
+        let data: Data
         if sampleOnly {
-            let firstPage: OrderedList<StalkerChannel> = try await fetch(
+            data = try await fetchData(
                 "itv",
                 action: "get_ordered_list",
                 extra: [
@@ -179,13 +207,25 @@ actor StalkerClient {
                     URLQueryItem(name: "p", value: "1")
                 ]
             )
-            channels = firstPage.data
         } else {
-            let all: OrderedList<StalkerChannel> = try await fetch("itv", action: "get_all_channels")
-            channels = all.data
+            data = try await fetchData("itv", action: "get_all_channels")
         }
+        return try Self.decodeChannels(data, categories: categories)
+    }
 
-        return channels.compactMap { channel in
+    // MARK: - Decoding
+    // One-pass columnar decoders; when they decline, the original
+    // JSONDecoder path decodes (and reports errors) instead.
+
+    /// `get_all_channels` / `get_ordered_list` (itv) → channels.
+    static func decodeChannels(_ data: Data, categories: [String: String]) throws -> [Channel] {
+        if let list = try? StalkerColumnarDecoder.orderedList(data, fields: StalkerColumnarDecoder.channelFields) {
+            return ConnectorParallel.materialize(list.chunks, rows: \.count) { columns, rows, out in
+                appendChannels(columns, rows, categories: categories, to: &out)
+            }
+        }
+        let all = try JSONDecoder().decode(Envelope<OrderedList<StalkerChannel>>.self, from: data).js
+        return all.data.compactMap { channel in
             guard let command = channel.cmd,
                   let streamURL = Self.playableURL(fromCommand: command) else {
                 return nil
@@ -201,16 +241,146 @@ actor StalkerClient {
                 group: group,
                 streamURL: streamURL,
                 epgChannelID: Self.nonEmpty(channel.xmltvID) ?? channel.id,
-                catchup: makeStalkerCatchup(archive: channel)
+                catchup: makeStalkerCatchup(archive: channel.enableTVArchive?.value, duration: channel.tvArchiveDuration?.value)
             )
         }
+    }
+
+    private static func appendChannels(_ columns: ConnectorRecordColumns, _ rows: Range<Int>, categories: [String: String],
+                                       to channels: inout [Channel]) {
+        typealias F = StalkerColumnarDecoder.ChannelField
+        for row in rows {
+            guard let command = columns.string(row, F.cmd),
+                  let streamURL = playableURL(fromCommand: command) else { continue }
+            let id = columns.string(row, F.id)!
+            let group = nonEmpty(columns.string(row, F.genres))
+                ?? columns.string(row, F.genreID).flatMap { categories[$0] }
+                ?? "Uncategorized"
+            channels.append(Channel(
+                id: id,
+                name: columns.string(row, F.name) ?? "Unknown",
+                logoURL: columns.string(row, F.logo).flatMap { URL(string: $0) },
+                group: group,
+                streamURL: streamURL,
+                epgChannelID: nonEmpty(columns.string(row, F.xmltv)) ?? id,
+                catchup: makeStalkerCatchup(archive: columns.string(row, F.archive), duration: columns.string(row, F.archiveDays))
+            ))
+        }
+    }
+
+    /// One `get_ordered_list` media page.
+    private static func decodeMediaPage(_ data: Data) throws -> OrderedList<StalkerMediaItem> {
+        if let list = try? StalkerColumnarDecoder.orderedList(data, fields: StalkerColumnarDecoder.mediaFields, workers: 1) {
+            var items: [StalkerMediaItem] = []
+            items.reserveCapacity(list.count)
+            for columns in list.chunks {
+                for row in 0..<columns.count { items.append(StalkerMediaItem(columns: columns, row: row)) }
+            }
+            return OrderedList(totalItems: list.totalItems, maxPageItems: list.maxPageItems, data: items)
+        }
+        return try JSONDecoder().decode(Envelope<OrderedList<StalkerMediaItem>>.self, from: data).js
+    }
+
+    /// `get_genres` / `get_categories` → ID → title map.
+    static func decodeCategories(_ data: Data) throws -> [String: String] {
+        if let map = try? StalkerColumnarDecoder.categories(data, nonEmpty: nonEmpty) { return map }
+        let categories = try JSONDecoder().decode(Envelope<[Category]>.self, from: data).js
+        var map: [String: String] = [:]
+        for category in categories where category.id != "*" {
+            map[category.id] = Self.nonEmpty(category.title) ?? Self.nonEmpty(category.alias) ?? category.id
+        }
+        return map
+    }
+
+    /// `get_epg_info` → programmes mapped to the channels' guide IDs.
+    /// The reference decoder iterates a dictionary (unspecified order); the
+    /// fast path keeps response order.
+    static func decodeEPG(_ data: Data, channels: [Channel]) throws -> [EPGProgram] {
+        let guideIDs = Dictionary(channels.compactMap { channel -> (String, String)? in
+            guard let epgID = channel.epgChannelID else { return nil }
+            return (channel.id, epgID)
+        }, uniquingKeysWith: { first, _ in first })
+        if let chunks = try? StalkerColumnarDecoder.epgInfo(data) {
+            return ConnectorParallel.materialize(chunks, rows: \.keys.count) { info, groups, programs in
+                appendPrograms(info, groups: groups, guideIDs: guideIDs, to: &programs)
+            }
+        }
+        let epg = try JSONDecoder().decode(Envelope<EPGInfo>.self, from: data).js
+        return epg.data.flatMap { channelID, entries in
+            entries.compactMap { entry in
+                makeProgram(channelID: channelID, guideIDs: guideIDs, id: entry.id?.value, nativeChannelID: entry.channelID?.value,
+                            name: entry.name, description: entry.description,
+                            start: entry.startTimestamp?.value, stop: entry.stopTimestamp?.value)
+            }
+        }
+    }
+
+    private static func appendPrograms(_ info: StalkerColumnarDecoder.EPGInfo, groups: Range<Int>, guideIDs: [String: String],
+                                       to programs: inout [EPGProgram]) {
+        typealias F = StalkerColumnarDecoder.EPGField
+        let entries = info.entries
+        for group in groups {
+            let channelID = info.keys[group]
+            // Consecutive entries usually share a channel: resolve once.
+            var lastNative: String?
+            var lastResolved = ""
+            for row in info.rows[group] {
+                let start = entries.intOrZero(row, F.start)
+                let stop = entries.intOrZero(row, F.stop)
+                guard start > 0, stop > start,
+                      let title = entries.stalkerNonEmpty(row, F.name, fallback: nonEmpty) else { continue }
+                let resolvedChannelID: String
+                if let native = entries.stalkerNonEmpty(row, F.channelID, fallback: nonEmpty) {
+                    if let lastNative, lastNative.utf8.elementsEqual(native.utf8) {
+                        resolvedChannelID = lastResolved
+                    } else {
+                        resolvedChannelID = guideIDs[native] ?? guideIDs[channelID] ?? native
+                        lastNative = native
+                        lastResolved = resolvedChannelID
+                    }
+                } else {
+                    resolvedChannelID = guideIDs[channelID] ?? channelID
+                }
+                let id = entries.stalkerNonEmpty(row, F.id, fallback: nonEmpty)
+                    ?? "\(resolvedChannelID):\(entries.string(row, F.start) ?? ""):\(entries.string(row, F.stop) ?? "")"
+                programs.append(EPGProgram(
+                    id: id,
+                    channelID: resolvedChannelID,
+                    title: title,
+                    description: entries.string(row, F.description) ?? "",
+                    start: Date(timeIntervalSince1970: TimeInterval(start)),
+                    end: Date(timeIntervalSince1970: TimeInterval(stop))
+                ))
+            }
+        }
+    }
+
+    private static func makeProgram(channelID: String, guideIDs: [String: String], id: String?, nativeChannelID: String?,
+                                    name: String?, description: String?, start startValue: String?, stop stopValue: String?) -> EPGProgram? {
+        let start = TimeInterval(Int(startValue ?? "") ?? 0)
+        let stop = TimeInterval(Int(stopValue ?? "") ?? 0)
+        guard start > 0, stop > start else { return nil }
+        guard let title = Self.nonEmpty(name) else { return nil }
+        let nativeChannelID = Self.nonEmpty(nativeChannelID) ?? channelID
+        let resolvedChannelID = guideIDs[nativeChannelID] ?? guideIDs[channelID] ?? nativeChannelID
+        return EPGProgram(
+            id: Self.nonEmpty(id) ?? "\(resolvedChannelID):\(startValue ?? ""):\(stopValue ?? "")",
+            channelID: resolvedChannelID,
+            title: title,
+            description: description ?? "",
+            start: Date(timeIntervalSince1970: start),
+            end: Date(timeIntervalSince1970: stop)
+        )
     }
 
     func fetchVODItems(sampleOnly: Bool = false) async throws -> [VODItem] {
         let categories = (try? await fetchCategories(type: "vod", action: "get_categories")) ?? [:]
         let items: [StalkerMediaItem] = try await fetchPagedMedia(type: "vod", sampleOnly: sampleOnly)
+        return Self.vodItems(items, categories: categories)
+    }
 
-        return items.compactMap { item in
+    private static func vodItems(_ items: [StalkerMediaItem], categories: [String: String]) -> [VODItem] {
+        items.compactMap { item in
             guard let command = item.cmd,
                   let streamURL = Self.placeholderURL(type: "vod", command: command) else {
                 return nil
@@ -219,7 +389,7 @@ actor StalkerClient {
             return VODItem(
                 id: "stalker:vod:\(item.id)",
                 name: item.name ?? "Unknown",
-                posterURL: firstURL(item.screenshotURI, item.pic),
+                posterURL: Self.firstURL(item.screenshotURI, item.pic),
                 group: group,
                 streamURL: streamURL,
                 kind: .movie,
@@ -234,16 +404,13 @@ actor StalkerClient {
         }
     }
 
-    func fetchSeries(sampleOnly: Bool = false) async throws -> [VODSeries] {
-        let categories = (try? await fetchCategories(type: "series", action: "get_categories")) ?? [:]
-        let items: [StalkerMediaItem] = try await fetchPagedMedia(type: "series", sampleOnly: sampleOnly)
-
-        return items.map { item in
+    private static func series(_ items: [StalkerMediaItem], categories: [String: String]) -> [VODSeries] {
+        items.map { item in
             let group = item.categoryID.flatMap { categories[$0.value] } ?? "Series"
             return VODSeries(
                 id: "stalker:series:\(item.id)",
                 name: item.name ?? "Unknown",
-                posterURL: firstURL(item.screenshotURI, item.pic),
+                posterURL: Self.firstURL(item.screenshotURI, item.pic),
                 group: group,
                 genre: Self.nonEmpty(item.genresString) ?? group,
                 rating: Self.nonEmpty(item.ratingIMDB?.value),
@@ -255,9 +422,21 @@ actor StalkerClient {
         }
     }
 
+    /// One media page → (total, page size, VOD items, series), without the network.
+    static func decodeMediaPage(_ data: Data, categories: [String: String]) throws -> (total: Int, pageSize: Int, vod: [VODItem], series: [VODSeries]) {
+        let page = try decodeMediaPage(data)
+        return (page.totalItems, page.maxPageItems, vodItems(page.data, categories: categories), series(page.data, categories: categories))
+    }
+
+    func fetchSeries(sampleOnly: Bool = false) async throws -> [VODSeries] {
+        let categories = (try? await fetchCategories(type: "series", action: "get_categories")) ?? [:]
+        let items: [StalkerMediaItem] = try await fetchPagedMedia(type: "series", sampleOnly: sampleOnly)
+        return Self.series(items, categories: categories)
+    }
+
     func fetchSeriesEpisodes(series: VODSeries) async throws -> [VODItem] {
         let rawSeriesID = Self.rawStalkerID(from: series.id)
-        let seasons: OrderedList<StalkerMediaItem> = try await fetch(
+        let seasons = try Self.decodeMediaPage(try await fetchData(
             "series",
             action: "get_ordered_list",
             extra: [
@@ -269,7 +448,7 @@ actor StalkerClient {
                 URLQueryItem(name: "not_ended", value: "0"),
                 URLQueryItem(name: "p", value: "1")
             ]
-        )
+        ))
 
         var episodes: [VODItem] = []
         for season in seasons.data {
@@ -283,7 +462,7 @@ actor StalkerClient {
                 episodes.append(VODItem(
                     id: "\(series.id):s\(seasonNumber):e\(episodeNumber)",
                     name: Self.formattedEpisodeTitle(seriesName: series.name, season: seasonNumber, episode: episodeNumber),
-                    posterURL: firstURL(season.screenshotURI, season.pic) ?? series.posterURL,
+                    posterURL: Self.firstURL(season.screenshotURI, season.pic) ?? series.posterURL,
                     group: series.name,
                     streamURL: streamURL,
                     kind: .seriesEpisode,
@@ -303,33 +482,12 @@ actor StalkerClient {
     }
 
     func fetchEPG(periodHours: Int, channels: [Channel] = []) async throws -> [EPGProgram] {
-        let epg: EPGInfo = try await fetch(
+        let data = try await fetchData(
             "itv",
             action: "get_epg_info",
             extra: [URLQueryItem(name: "period", value: "\(periodHours)")]
         )
-        let guideIDs = Dictionary(channels.compactMap { channel -> (String, String)? in
-            guard let epgID = channel.epgChannelID else { return nil }
-            return (channel.id, epgID)
-        }, uniquingKeysWith: { first, _ in first })
-        return epg.data.flatMap { channelID, entries in
-            entries.compactMap { entry in
-                let start = TimeInterval(Int(entry.startTimestamp?.value ?? "") ?? 0)
-                let stop = TimeInterval(Int(entry.stopTimestamp?.value ?? "") ?? 0)
-                guard start > 0, stop > start else { return nil }
-                guard let title = Self.nonEmpty(entry.name) else { return nil }
-                let nativeChannelID = Self.nonEmpty(entry.channelID?.value) ?? channelID
-                let resolvedChannelID = guideIDs[nativeChannelID] ?? guideIDs[channelID] ?? nativeChannelID
-                return EPGProgram(
-                    id: Self.nonEmpty(entry.id?.value) ?? "\(resolvedChannelID):\(entry.startTimestamp?.value ?? ""):\(entry.stopTimestamp?.value ?? "")",
-                    channelID: resolvedChannelID,
-                    title: title,
-                    description: entry.description ?? "",
-                    start: Date(timeIntervalSince1970: start),
-                    end: Date(timeIntervalSince1970: stop)
-                )
-            }
-        }
+        return try Self.decodeEPG(data, channels: channels)
     }
 
     func resolvePlaybackURL(for item: VODItem) async throws -> URL {
@@ -406,20 +564,15 @@ actor StalkerClient {
     }
 
     private func fetchCategories(type: String, action: String) async throws -> [String: String] {
-        let categories: [Category] = try await fetch(type, action: action)
-        var map: [String: String] = [:]
-        for category in categories where category.id != "*" {
-            map[category.id] = Self.nonEmpty(category.title) ?? Self.nonEmpty(category.alias) ?? category.id
-        }
-        return map
+        try Self.decodeCategories(try await fetchData(type, action: action))
     }
 
     private func fetchPagedMedia(type: String, sampleOnly: Bool) async throws -> [StalkerMediaItem] {
-        let firstPage: OrderedList<StalkerMediaItem> = try await fetch(
+        let firstPage = try Self.decodeMediaPage(try await fetchData(
             type,
             action: "get_ordered_list",
             extra: mediaPageQuery(page: 1)
-        )
+        ))
         guard !sampleOnly else { return firstPage.data }
 
         let pageSize = max(firstPage.maxPageItems, max(firstPage.data.count, 1))
@@ -453,7 +606,7 @@ actor StalkerClient {
                         do {
                             let (data, response) = try await session.data(for: request)
                             try Self.validate(response)
-                            let next = try JSONDecoder().decode(Envelope<OrderedList<StalkerMediaItem>>.self, from: data).js
+                            let next = try Self.decodeMediaPage(data)
                             return (page, next.data)
                         } catch {
                             if attempt == 0 {
@@ -516,7 +669,7 @@ actor StalkerClient {
         throw XtreamError.decodingFailed
     }
 
-    private func firstURL(_ values: String?...) -> URL? {
+    nonisolated private static func firstURL(_ values: String?...) -> URL? {
         for value in values {
             if let raw = Self.nonEmpty(value), let url = URL(string: raw) {
                 return url
@@ -525,10 +678,10 @@ actor StalkerClient {
         return nil
     }
 
-    private func makeStalkerCatchup(archive: StalkerChannel) -> CatchupInfo? {
-        let isArchived = (Int(archive.enableTVArchive?.value ?? "") ?? 0) > 0
+    nonisolated private static func makeStalkerCatchup(archive: String?, duration: String?) -> CatchupInfo? {
+        let isArchived = (Int(archive ?? "") ?? 0) > 0
         guard isArchived else { return nil }
-        let providerDays = Int(archive.tvArchiveDuration?.value ?? "") ?? 0
+        let providerDays = Int(duration ?? "") ?? 0
         let days = max(providerDays, 1)
         // Stalker/Ministra catchup works by appending ?utcstart=&utcend= query
         // parameters to the live stream URL, matching the .shift kind.
