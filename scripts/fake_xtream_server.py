@@ -49,7 +49,7 @@ def build_fixture(directory: pathlib.Path) -> list[pathlib.Path]:
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30",
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-            "-t", "60", "-c:v", "libx264", "-preset", "veryfast", "-g", str(30 * SEGMENT_SECONDS),
+            "-t", "600", "-c:v", "libx264", "-preset", "ultrafast", "-g", str(30 * SEGMENT_SECONDS),
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
             "-f", "hls", "-hls_time", str(SEGMENT_SECONDS), "-hls_playlist_type", "vod",
             "-hls_segment_filename", str(directory / "seg%03d.ts"), str(playlist),

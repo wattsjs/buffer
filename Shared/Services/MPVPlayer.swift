@@ -954,9 +954,15 @@ final class MPVPlayer {
         setRuntimeDouble(handle, "demuxer-hysteresis-secs", Tuning.demuxerHysteresisSeconds(for: cacheFloorSecs))
         setRuntimeDouble(handle, "cache-pause-wait", Tuning.cachePauseWaitSeconds(for: cacheFloorSecs))
 
+#if os(macOS)
         setRuntimeProperty(handle, "scale", scaleFilter)
         setRuntimeProperty(handle, "cscale", cscaleFilter)
         setRuntimeProperty(handle, "dscale", scaleFilter)
+#else
+        // OpenGL ES keeps the single-pass scaler: spline36 needs float
+        // intermediate framebuffers, which GLES targets render unreliably.
+        _ = (scaleFilter, cscaleFilter)
+#endif
     }
 
     var mpvHandle: OpaquePointer? { handle }
@@ -1078,9 +1084,15 @@ final class MPVPlayer {
         setOption(newHandle, "opengl-swapinterval", "0")
 
         // Scaling defaults. configureResources() overrides per focus state.
+#if os(macOS)
         setOption(newHandle, "scale", "spline36")
         setOption(newHandle, "cscale", "spline36")
         setOption(newHandle, "dscale", "spline36")
+#else
+        setOption(newHandle, "scale", "bilinear")
+        setOption(newHandle, "cscale", "bilinear")
+        setOption(newHandle, "dscale", "bilinear")
+#endif
 
         // Disable all quality features we don't need for IPTV.
         setOption(newHandle, "deband", "no")
