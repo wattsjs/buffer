@@ -143,7 +143,7 @@ nonisolated struct ProgramSearchIndex: Sendable, RandomAccessCollection, Express
         precondition(total < Int(UInt32.max), "programme ordinals are UInt32")
 
         // 1. Intern raw titles; lowercase each distinct title exactly once.
-        var titles = ByteInterner(expected: Swift.max(1024, total / 4))
+        var titles = SearchByteInterner(expected: Swift.max(1024, total / 4))
         var lowerOffsets: [UInt32] = [0]
         var lowerBytes: [UInt8] = []
         lowerBytes.reserveCapacity(total * 4)
@@ -163,11 +163,11 @@ nonisolated struct ProgramSearchIndex: Sendable, RandomAccessCollection, Express
             }
         }
         let titleCount = titles.count
-        titles = ByteInterner(expected: 0)   // release raw title table
+        titles = SearchByteInterner(expected: 0)   // release raw title table
 
         // 2. Tokenize lowercased titles on " " and "\t" (the query splitter),
         //    intern tokens and collect deduplicated (token, title) postings.
-        var tokens = ByteInterner(expected: Swift.max(1024, titleCount))
+        var tokens = SearchByteInterner(expected: Swift.max(1024, titleCount))
         var pairTokens: [UInt32] = []
         pairTokens.reserveCapacity(titleCount * 4)
         var pairTitleStarts = [UInt32](repeating: 0, count: titleCount + 1)
@@ -612,7 +612,7 @@ nonisolated extension ProgramSearchIndex.Storage {
 
 /// Open-addressing table of UInt32 ids over a byte blob. Interns each
 /// distinct byte string once; ids are dense and assigned in first-seen order.
-nonisolated struct ByteInterner {
+nonisolated struct SearchByteInterner {
     private(set) var bytes: [UInt8] = []
     private(set) var offsets: [UInt32] = [0]
     private var hashes: [UInt32] = []
