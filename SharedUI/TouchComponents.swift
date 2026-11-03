@@ -1,4 +1,5 @@
 import NukeUI
+import OSLog
 import SwiftUI
 
 // MARK: - Channel rows
@@ -58,14 +59,16 @@ struct ChannelListRow: View {
 struct SourceEditorForm: View {
     let viewModel: EPGViewModel
     let onDone: () -> Void
-    @State private var session: SettingsSourceSession
+    private let isNew: Bool
+    @State private var draft: ServerConfig
     @State private var status: String?
     @State private var isTesting = false
 
     init(viewModel: EPGViewModel, existing: ServerConfig? = nil, onDone: @escaping () -> Void) {
         self.viewModel = viewModel
         self.onDone = onDone
-        _session = State(initialValue: SettingsSourceSession(config: existing ?? Self.prefilledConfig(), isNew: existing == nil))
+        isNew = existing == nil
+        _draft = State(initialValue: existing ?? Self.prefilledConfig())
     }
 
     /// UI tests on tvOS cannot type into the system keyboard reliably, so a
@@ -85,27 +88,27 @@ struct SourceEditorForm: View {
     var body: some View {
         Form {
             Section("Source") {
-                TextField("Name", text: $session.draft.name)
-                Picker("Type", selection: $session.draft.type) {
+                TextField("Name", text: $draft.name)
+                Picker("Type", selection: $draft.type) {
                     ForEach(ServerType.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }
             }
-            switch session.draft.type {
+            switch draft.type {
             case .xtream, .stalker:
-                Section(session.draft.type == .xtream ? "Xtream Codes" : "Stalker / MAG") {
-                    TextField("Server URL", text: $session.draft.serverURL)
+                Section(draft.type == .xtream ? "Xtream Codes" : "Stalker / MAG") {
+                    TextField("Server URL", text: $draft.serverURL)
                         .textContentType(.URL)
                         .modifier(PlainInput())
-                    TextField(session.draft.type == .xtream ? "Username" : "MAC address", text: $session.draft.username)
-                        .textContentType(.username)
+                    TextField(draft.type == .xtream ? "Username" : "MAC address", text: $draft.username)
                         .modifier(PlainInput())
-                    SecureField("Password", text: $session.draft.password)
-                        .textContentType(.password)
+                    // No password content type: IPTV portals are not website
+                    // logins, and AutoFill would offer to save them as one.
+                    SecureField("Password", text: $draft.password)
                 }
             case .m3u:
                 Section("M3U Playlist") {
-                    TextField("Playlist URL", text: $session.draft.m3uURL).modifier(PlainInput())
-                    TextField("Guide (XMLTV) URL", text: $session.draft.epgURL).modifier(PlainInput())
+                    TextField("Playlist URL", text: $draft.m3uURL).modifier(PlainInput())
+                    TextField("Guide (XMLTV) URL", text: $draft.epgURL).modifier(PlainInput())
                 }
             }
             Section {
@@ -118,11 +121,13 @@ struct SourceEditorForm: View {
                 if let status { Text(status) }
             }
         }
-        .navigationTitle(session.isNew ? "Add Source" : session.draft.name)
+#if os(iOS)
+        .scrollDismissesKeyboard(.interactively)
+#endif
+        .navigationTitle(isNew ? "Add Source" : draft.name)
     }
 
     private var isComplete: Bool {
-        let draft = session.draft
         switch draft.type {
         case .xtream: return !draft.serverURL.isEmpty && !draft.username.isEmpty && !draft.password.isEmpty
         case .stalker: return !draft.serverURL.isEmpty && !draft.username.isEmpty
@@ -133,7 +138,7 @@ struct SourceEditorForm: View {
     private func test() {
         isTesting = true
         status = "Checking this account and programme guide…"
-        let snapshot = session.draft
+        let snapshot = draft
         let includeVOD = !viewModel.isVODDisabled
         Task {
             do {
@@ -146,13 +151,13 @@ struct SourceEditorForm: View {
     }
 
     private func save() {
-        if session.draft.name.trimmingCharacters(in: .whitespaces).isEmpty {
-            session.draft.name = URL(string: session.draft.serverURL)?.host ?? "Source"
+        AppLog.app.info("Source editor saving type=\(draft.type.rawValue, privacy: .public) new=\(isNew, privacy: .public)")
+        if draft.name.trimmingCharacters(in: .whitespaces).isEmpty {
+            draft.name = URL(string: draft.serverURL)?.host ?? "Source"
         }
-        if session.isNew { viewModel.addPlaylist(session.draft, makeActive: true) }
-        else { viewModel.updatePlaylist(session.draft) }
-        viewModel.setActivePlaylist(id: session.id)
-        session.markApplied()
+        if isNew { viewModel.addPlaylist(draft, makeActive: true) }
+        else { viewModel.updatePlaylist(draft) }
+        viewModel.setActivePlaylist(id: draft.id)
         viewModel.startSyncScheduler()
         viewModel.sync()
         onDone()
@@ -290,6 +295,7 @@ struct SportsListView: View {
                 Section(section.group.title) {
                     ForEach(section.events) { event in
                         Button { selectedEvent = event } label: { SportEventRow(event: event) }
+                            .accessibilityIdentifier("sport-event")
                     }
                 }
             }

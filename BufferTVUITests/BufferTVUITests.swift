@@ -45,11 +45,15 @@ final class BufferTVUITests: XCTestCase {
         remote.press(.menu)
         sleep(2)
 
-        // Sidebar: Sports, then Countries.
+        // Moving up from the guide opens the tab sidebar; move down to the
+        // section and select it.
         for (name, shot) in [("Sports", "07-sports"), ("Countries", "08-countries"), ("Search", "09-search")] {
-            remote.press(.menu)
-            sleep(1)
-            focus(app.buttons[name].firstMatch, pressing: .down, attempts: 8, fallback: .up)
+            let tab = app.cells.containing(NSPredicate(format: "label == %@", name)).firstMatch
+            for _ in 0..<6 { remote.press(.up) }
+            // With nothing focusable in the content, Up only reaches the
+            // collapsed pill; Select expands it.
+            if !tab.waitForExistence(timeout: 1) { remote.press(.select); sleep(1) }
+            focus(tab, pressing: .down, attempts: 14, fallback: .up)
             remote.press(.select)
             sleep(name == "Sports" ? 8 : 2)
             snapshot(app, shot)
@@ -59,12 +63,13 @@ final class BufferTVUITests: XCTestCase {
     /// Presses `direction` until `element` holds focus.
     private func focus(_ element: XCUIElement, pressing direction: XCUIRemote.Button, attempts: Int = 12,
                        fallback: XCUIRemote.Button? = nil) {
+        guard element.waitForExistence(timeout: 2) else { return }
         for _ in 0..<attempts where !element.hasFocus { remote.press(direction) }
         if let fallback { for _ in 0..<attempts * 2 where !element.hasFocus { remote.press(fallback) } }
     }
 
     private func snapshot(_ app: XCUIApplication, _ name: String) {
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)

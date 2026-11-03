@@ -1028,13 +1028,25 @@ final class MPVPlayer {
         // hwdec-codecs=all enables VT for H.264, HEVC, AV1, VP9, etc.
         // vd-lavc-dr=yes requests direct rendering (zero-copy decode→GPU)
         // which avoids a CPU-side frame copy per decoded picture.
+#if targetEnvironment(simulator)
+        // The simulator's GLES has no VideoToolbox texture interop; frames
+        // arrive as garbage, so decode in software there (as MPVKit's demo).
+        setOption(newHandle, "hwdec", "no")
+#else
         setOption(newHandle, "hwdec", "videotoolbox")
+#endif
         setOption(newHandle, "hwdec-codecs", "all")
         // Xtream catchup TS seeks can start on damaged/incomplete GOPs. Fall
         // back to software decoding on the first failed hardware frame instead
         // of waiting through repeated VideoToolbox errors and cache stalls.
         setOption(newHandle, "hwdec-software-fallback", "yes")
+#if os(macOS)
         setOption(newHandle, "vd-lavc-dr", "yes")
+#else
+        // OpenGL ES has no persistent buffer mapping for direct rendering;
+        // decoded frames uploaded that way arrive mostly blank.
+        setOption(newHandle, "vd-lavc-dr", "no")
+#endif
         setOption(newHandle, "vd-lavc-show-all", "no")
 
         // Cap software decoder threads. When VideoToolbox is active these
@@ -1058,7 +1070,9 @@ final class MPVPlayer {
 
         // OpenGL performance tuning.
         setOption(newHandle, "opengl-early-flush", "yes")
+#if os(macOS)
         setOption(newHandle, "opengl-pbo", "yes")
+#endif
         // vsync is managed by CAOpenGLLayer's CVDisplayLink — let CoreAnimation
         // handle it. Setting swapinterval=1 fights the layer's own timing.
         setOption(newHandle, "opengl-swapinterval", "0")

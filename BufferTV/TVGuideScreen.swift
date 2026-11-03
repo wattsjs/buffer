@@ -1,41 +1,5 @@
 import SwiftUI
 
-/// Source/group column beside the focus-driven guide.
-struct TVGuideScreen: View {
-    let model: TouchAppModel
-
-    var body: some View {
-        @Bindable var viewModel = model.viewModel
-        NavigationStack {
-            HStack(alignment: .top, spacing: 40) {
-                List {
-                    SourcesList(viewModel: viewModel)
-                    Section("Channels") {
-                        groupButton("All Channels", .allChannels)
-                        groupButton("Favorites", .favorites)
-                        ForEach(viewModel.groups, id: \.self) { groupButton($0, .group($0)) }
-                    }
-                }
-                .frame(width: 420)
-                TVGuideGrid(model: model)
-            }
-            .onAppear {
-                if case .home = viewModel.selection { viewModel.selection = .allChannels }
-            }
-        }
-    }
-
-    private func groupButton(_ title: String, _ selection: SidebarSelection) -> some View {
-        Button { model.viewModel.selection = selection } label: {
-            HStack {
-                Text(title).lineLimit(1)
-                Spacer()
-                if model.viewModel.selection == selection { Image(systemName: "checkmark") }
-            }
-        }
-    }
-}
-
 /// Focus-driven guide. Rows are lazy; each row reads its cells from one
 /// `EPGRowLayout` and shows only those intersecting the visible time page.
 /// Moving focus past the page's edge pages the timeline by half its span.
@@ -48,7 +12,7 @@ struct TVGuideGrid: View {
     static let pixelsPerMinute = 6.0
     static let pageMinutes = 180.0
     static let rowHeight: CGFloat = 96
-    static let channelWidth: CGFloat = 260
+    static let channelWidth: CGFloat = 360
 
     private var pageEnd: Date { pageStart.addingTimeInterval(Self.pageMinutes * 60) }
 
@@ -152,8 +116,8 @@ private struct TVGuideRow: View {
         HStack(spacing: 20) {
             Button(action: onPlay) {
                 HStack(spacing: 14) {
-                    ChannelLogo(channel: channel, size: 44)
-                    Text(channel.name).font(.callout.weight(.semibold)).lineLimit(2)
+                    ChannelLogo(channel: channel, size: 40)
+                    Text(channel.name).font(.callout.weight(.semibold)).lineLimit(2).minimumScaleFactor(0.8)
                     Spacer(minLength: 0)
                 }
                 .frame(width: TVGuideGrid.channelWidth - 40, height: TVGuideGrid.rowHeight - 24)
@@ -210,12 +174,15 @@ private struct TVGuideRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(program.title).font(.callout.weight(.semibold)).lineLimit(1)
                 Text(EPGClockText.shared.compactRange(start: layout.start[cell], end: layout.end[cell]))
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
             }
-            .frame(width: max(40, x1 - x0 - 34), height: TVGuideGrid.rowHeight - 34, alignment: .leading)
+            .padding(.horizontal, 16)
+            // The card's width is the cell's span in the page, less a gutter.
+            .frame(width: max(24, x1 - x0 - 8), height: TVGuideGrid.rowHeight - 16, alignment: .leading)
+            .background(live ? Color.accentColor.opacity(0.35) : Color.white.opacity(0.08))
             .opacity(past ? 0.55 : 1)
         }
-        .tint(live ? .accentColor : nil)
+        .buttonStyle(.card)
         .focused(focused, equals: .program(row: row, start: program.start, end: program.end))
         .padding(.leading, x0)
     }

@@ -25,19 +25,19 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SEGMENT_SECONDS = 2
 WINDOW = 6
 
-CATEGORIES = [("1", "Sports"), ("2", "News"), ("3", "Entertainment")]
+CATEGORIES = [("1", "Sport"), ("2", "News"), ("3", "Entertainment")]
 CHANNELS = [
-    ("101", "ESPN", "1", ["NFL Live", "SportsCenter", "College Football", "NBA Countdown"]),
-    ("102", "Sky Sports Main Event", "1", ["Premier League Football", "Super Sunday", "Goals on Sunday"]),
-    ("103", "beIN Sports 1", "1", ["Champions League", "LaLiga", "Serie A Highlights"]),
-    ("104", "Fox Sports 1", "1", ["NASCAR Cup Series", "MLB Postgame", "UFC Countdown"]),
-    ("105", "TNT Sports", "1", ["NBA on TNT", "Inside the NBA", "NHL Tonight"]),
-    ("201", "BBC News", "2", ["BBC News at One", "World Business Report", "Newsnight"]),
-    ("202", "CNN International", "2", ["Connect the World", "Amanpour", "Quest Means Business"]),
-    ("203", "Sky News", "2", ["Sky News Breakfast", "The Briefing", "Sky News Tonight"]),
-    ("301", "BBC One", "3", ["EastEnders", "The Graham Norton Show", "Match of the Day"]),
-    ("302", "ITV1", "3", ["Coronation Street", "Emmerdale", "This Morning"]),
-    ("303", "Channel 4", "3", ["Gogglebox", "Grand Designs", "Taskmaster"]),
+    ("101", "US: ESPN", "1", ["NFL Live", "SportsCenter", "College Football", "NBA Countdown"]),
+    ("102", "UK: Sky Sports Main Event", "1", ["Premier League Football", "Super Sunday", "Goals on Sunday"]),
+    ("103", "FR: beIN Sports 1", "1", ["Champions League", "LaLiga", "Serie A Highlights"]),
+    ("104", "US: Fox Sports 1", "1", ["NASCAR Cup Series", "MLB Postgame", "UFC Countdown"]),
+    ("105", "US: TNT Sports", "1", ["NBA on TNT", "Inside the NBA", "NHL Tonight"]),
+    ("201", "UK: BBC News", "2", ["BBC News at One", "World Business Report", "Newsnight"]),
+    ("202", "US: CNN International", "2", ["Connect the World", "Amanpour", "Quest Means Business"]),
+    ("203", "UK: Sky News", "2", ["Sky News Breakfast", "The Briefing", "Sky News Tonight"]),
+    ("301", "UK: BBC One", "3", ["EastEnders", "The Graham Norton Show", "Match of the Day"]),
+    ("302", "UK: ITV1", "3", ["Coronation Street", "Emmerdale", "This Morning"]),
+    ("303", "UK: Channel 4", "3", ["Gogglebox", "Grand Designs", "Taskmaster"]),
 ]
 
 

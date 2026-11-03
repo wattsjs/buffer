@@ -314,29 +314,19 @@ private struct RegionRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(CountryFilterNames.flag(for: summary.region)).font(.title3)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(CountryFilterNames.displayName(summary.region)).font(.body.weight(.medium))
-                    Text("\(summary.region) · \(summary.total.formatted()) channels")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                }
-                if suggested {
-                    Text("Watched").font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                }
-                Spacer()
-                Picker("", selection: preset) {
-                    Text("Hide").tag(Preset.off)
-                    Text("Sports").tag(Preset.sports)
-                    Text("All").tag(Preset.everything)
-                    Text("Custom").tag(Preset.custom)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .fixedSize()
+#if os(iOS)
+            // Phone widths cannot fit the name beside the segmented control.
+            ViewThatFits(in: .horizontal) {
+                HStack { identity; Spacer(); presetPicker }
+                VStack(alignment: .leading, spacing: 6) { identity; presetPicker }
             }
+#else
+            HStack {
+                identity
+                Spacer()
+                presetPicker
+            }
+#endif
             if case .categories(let allowed) = scope, allowed != ["Sports"] {
                 HStack(spacing: 6) {
                     ForEach(SmartChannelFilter.categories.filter { summary.categoryCounts[$0] != nil }, id: \.self) { category in
@@ -354,6 +344,35 @@ private struct RegionRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private var identity: some View {
+        HStack {
+            Text(CountryFilterNames.flag(for: summary.region)).font(.title3)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(CountryFilterNames.displayName(summary.region)).font(.body.weight(.medium))
+                Text("\(summary.region) · \(summary.total.formatted()) channels")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            if suggested {
+                Text("Watched").font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+            }
+        }
+    }
+
+    private var presetPicker: some View {
+        Picker("", selection: preset) {
+            Text("Hide").tag(Preset.off)
+            Text("Sports").tag(Preset.sports)
+            Text("All").tag(Preset.everything)
+            Text("Custom").tag(Preset.custom)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
     }
 
     private enum Preset: Hashable { case off, sports, everything, custom }

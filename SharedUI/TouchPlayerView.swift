@@ -65,6 +65,7 @@ struct TouchPlayerView: View {
         .persistentSystemOverlays(.hidden)
 #endif
 #if os(tvOS)
+        .focusable(!showChrome)
         .onPlayPauseCommand { player.togglePause(); revealChrome() }
         .onExitCommand {
             if showChrome { showChrome = false } else { onClose() }

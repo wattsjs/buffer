@@ -11,22 +11,26 @@ final class BufferMobileUITests: XCTestCase {
 
     override func setUp() {
         continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
     }
 
     func testAddSourceBrowseAndPlay() throws {
         let app = XCUIApplication()
+        app.launchEnvironment["BUFFER_PREFILL_XTREAM"] = "\(server)|demo|demo"
         app.launch()
         let isPad = UIDevice.current.userInterfaceIdiom == .pad
-        if isPad { XCUIDevice.shared.orientation = .landscapeLeft }
 
         if app.buttons["welcome-add-source"].waitForExistence(timeout: 10) {
             snapshot(app, "01-welcome")
             app.buttons["welcome-add-source"].tap()
-            fill(app.textFields["Server URL"], server)
-            fill(app.textFields["Username"], "demo")
-            fill(app.secureTextFields["Password"], "demo")
+            // XCUITest typing into SecureField does not reach its binding on the
+            // iOS 27 simulator, so the form is pre-filled (DEBUG launch variable).
             snapshot(app, "02-add-source")
-            app.buttons["save-source"].tap()
+            let save = app.buttons["save-source"]
+            XCTAssertTrue(save.waitForExistence(timeout: 5))
+            save.tap()
+            sleep(3)
+            snapshot(app, "02b-after-save")
         }
 
         // The guide appears once channels sync; give the guide a moment too.
@@ -42,6 +46,14 @@ final class BufferMobileUITests: XCTestCase {
         }
         sleep(8)
         snapshot(app, "04-sports")
+        let event = app.buttons.matching(identifier: "sport-event").firstMatch
+        if event.exists {
+            event.tap()
+            sleep(4)
+            snapshot(app, "04b-sport-matches")
+            app.buttons["Done"].firstMatch.tap()
+            sleep(1)
+        }
 
         if isPad {
             app.buttons["country-filter"].firstMatch.tap()
@@ -74,7 +86,7 @@ final class BufferMobileUITests: XCTestCase {
     }
 
     private func snapshot(_ app: XCUIApplication, _ name: String) {
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)

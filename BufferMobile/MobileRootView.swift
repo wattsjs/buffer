@@ -99,6 +99,7 @@ private struct RegularRootView: View {
             .navigationTitle("Buffer")
         } detail: {
             NavigationStack {
+                Group {
                 switch destination ?? .guide(.allChannels) {
                 case .guide:
                     GuideScreen(model: model, compact: false)
@@ -111,6 +112,10 @@ private struct RegularRootView: View {
                                     prompt: "Programmes, channels, movies")
                 case .settings:
                     SettingsScreen(model: model)
+                }
+                }
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) { CountryFilterPopoverButton(model: model) }
                 }
             }
         }
@@ -218,9 +223,22 @@ private struct CountryFilterRow: View {
             }
         }
         .accessibilityIdentifier("country-filter")
-        .popover(isPresented: $model.isEditingCountryFilter, arrowEdge: .trailing) {
-            CountryFilterEditor(viewModel: viewModel)
-                .frame(minWidth: 420, idealWidth: 460, minHeight: 560, idealHeight: 620)
+    }
+}
+
+/// iPad toolbar button that owns the popover; the sidebar row opens it too.
+/// (A popover anchored in the sidebar list collapses to a sliver on iPadOS.)
+private struct CountryFilterPopoverButton: View {
+    let model: TouchAppModel
+
+    var body: some View {
+        @Bindable var model = model
+        Button { model.isEditingCountryFilter = true } label: {
+            Label("Countries", systemImage: model.viewModel.smartSports.filter.isEnabled ? "globe.americas.fill" : "globe.americas")
+        }
+        .popover(isPresented: $model.isEditingCountryFilter, arrowEdge: .top) {
+            CountryFilterEditor(viewModel: model.viewModel)
+                .frame(width: 460, height: 620)
         }
     }
 }

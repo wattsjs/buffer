@@ -75,7 +75,7 @@ final class MPVGLESHostView: UIView {
         lastPixelSize = pixels
         // The renderbuffer is reallocated from the layer on the render
         // queue; redraw immediately so a paused picture follows the resize.
-        renderer?.invalidateDrawable()
+        renderer?.prepareDrawable()
         renderer?.requestRender()
     }
 
@@ -99,6 +99,7 @@ final class MPVGLESHostView: UIView {
         guard ok else { return }
         self.renderer = renderer
         renderer.update(suspended: UIApplication.shared.applicationState == .background)
+        if bounds.width > 0, bounds.height > 0 { renderer.prepareDrawable() }
 
         let box = Unmanaged.passRetained(renderer)
         let pointer = box.toOpaque()
@@ -139,10 +140,10 @@ final class MPVGLESHostView: UIView {
             // Waits for an in-flight frame, then frees the mpv context and
             // GL objects with the EAGL context current.
             renderer.retire()
-            EAGLContext.setCurrent(renderer.context)
-            player?.resetRenderContext()
-            renderer.deleteDrawable()
-            EAGLContext.setCurrent(nil)
+            renderer.withCurrentContext {
+                player?.resetRenderContext()
+                renderer.deleteDrawable()
+            }
         } else {
             player?.resetRenderContext()
         }
@@ -155,8 +156,10 @@ final class MPVGLESHostView: UIView {
     }
 }
 
-/// Render-queue half of the GLES host. Everything GL happens on `renderQueue`
-/// (except teardown, which first drains the queue).
+/// Render-queue half of the GLES host. Frames are drawn on `renderQueue`.
+/// Binding the renderbuffer to the layer touches the layer, which UIKit
+/// allows only on the main thread, so that (and teardown) runs on main;
+/// `glLock` keeps the EAGL context current on one thread at a time.
 nonisolated final class MPVGLESRenderer: @unchecked Sendable {
     let context: EAGLContext
     private let layer: CAEAGLLayer
@@ -166,6 +169,7 @@ nonisolated final class MPVGLESRenderer: @unchecked Sendable {
     private let renderQueue = DispatchQueue(label: "com.wattsjs.buffer.mpv-render", qos: .userInteractive)
 
     private let stateLock = NSLock()
+    private let glLock = NSLock()
     private var suspended = false
     private var retired = false
     private var drawableValid = false
@@ -186,11 +190,21 @@ nonisolated final class MPVGLESRenderer: @unchecked Sendable {
 
     func update(suspended value: Bool) {
         stateLock.withLock { suspended = value }
-        if value { renderQueue.sync { if EAGLContext.setCurrent(context) { glFinish(); EAGLContext.setCurrent(nil) } } }
+        if value { withCurrentContext { glFinish() } }
     }
 
-    func invalidateDrawable() {
-        stateLock.withLock { drawableValid = false }
+    /// Main thread: (re)binds the colour renderbuffer to the layer's size.
+    func prepareDrawable() {
+        withCurrentContext { _ = allocateDrawable() }
+    }
+
+    /// Runs `body` with the EAGL context current, excluding the render queue.
+    func withCurrentContext(_ body: () -> Void) {
+        glLock.withLock {
+            guard EAGLContext.setCurrent(context) else { return }
+            body()
+            EAGLContext.setCurrent(nil)
+        }
     }
 
     /// Coalesced: at most one render is queued at a time.
@@ -214,12 +228,18 @@ nonisolated final class MPVGLESRenderer: @unchecked Sendable {
         gate.complete()
         let (isSuspended, isRetired, valid) = stateLock.withLock { (suspended, retired, drawableValid) }
         guard !isSuspended, !isRetired, target.hasContext else { return }
+        guard valid, framebuffer != 0 else {
+            DispatchQueue.main.async { [self] in
+                prepareDrawable()
+                requestRender()
+            }
+            return
+        }
+        glLock.lock()
+        defer { glLock.unlock() }
         guard EAGLContext.setCurrent(context) else { return }
         defer { EAGLContext.setCurrent(nil) }
 
-        if !valid || framebuffer == 0 {
-            guard allocateDrawable() else { return }
-        }
         guard pixelWidth > 0, pixelHeight > 0 else { return }
         if target.isBackgroundSuspended, pixelHeight < 140 { return }
 
@@ -281,11 +301,15 @@ nonisolated final class MPVGLESRenderer: @unchecked Sendable {
         if colorbuffer == 0 { glGenRenderbuffers(1, &colorbuffer) }
         glBindFramebuffer(GLenum(GL_FRAMEBUFFER), framebuffer)
         glBindRenderbuffer(GLenum(GL_RENDERBUFFER), colorbuffer)
-        guard context.renderbufferStorage(Int(GL_RENDERBUFFER), from: layer) else { return false }
+        guard context.renderbufferStorage(Int(GL_RENDERBUFFER), from: layer) else {
+            AppLog.playback.error("mpv GLES renderbuffer storage failed bounds=\(String(describing: self.layer.bounds), privacy: .public)")
+            return false
+        }
         glFramebufferRenderbuffer(GLenum(GL_FRAMEBUFFER), GLenum(GL_COLOR_ATTACHMENT0), GLenum(GL_RENDERBUFFER), colorbuffer)
         glGetRenderbufferParameteriv(GLenum(GL_RENDERBUFFER), GLenum(GL_RENDERBUFFER_WIDTH), &pixelWidth)
         glGetRenderbufferParameteriv(GLenum(GL_RENDERBUFFER), GLenum(GL_RENDERBUFFER_HEIGHT), &pixelHeight)
         let complete = glCheckFramebufferStatus(GLenum(GL_FRAMEBUFFER)) == GLenum(GL_FRAMEBUFFER_COMPLETE)
+        AppLog.playback.info("mpv GLES drawable width=\(self.pixelWidth, privacy: .public) height=\(self.pixelHeight, privacy: .public) complete=\(complete, privacy: .public)")
         stateLock.withLock { drawableValid = complete }
         return complete
     }
