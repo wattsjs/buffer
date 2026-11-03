@@ -1,8 +1,12 @@
 import Foundation
 import OSLog
 
-/// Public ESPN fixtures only. Disk access and encoding stay on the utility
-/// queue; queued snapshots coalesce so rapid refreshes retain bounded memory.
+/// Public ESPN fixtures only: network-only data, persisted as the Sports
+/// tab's store (not a memo of any computation). Disk access and encoding
+/// stay on the utility queue; queued snapshots coalesce so rapid refreshes
+/// retain bounded memory. Version 2 stores flat parallel columns
+/// (`events[i]` was confirmed at `confirmedAt[i]`); version 1 record files
+/// still load.
 nonisolated final class SportsFixtureCache: @unchecked Sendable {
     struct Snapshot: Sendable {
         let events: [SportEvent]
@@ -13,11 +17,23 @@ nonisolated final class SportsFixtureCache: @unchecked Sendable {
         let event: SportEvent
         let confirmedAt: Date
     }
+    /// Legacy (version 1) array-of-records layout; read only.
     private struct Envelope: Codable {
         let version: Int
         let refreshedAt: Date
         let records: [Record]
     }
+    /// Version 2: structure-of-arrays columns.
+    private struct FlatEnvelope: Codable {
+        let version: Int
+        let refreshedAt: Date
+        let events: [SportEvent]
+        let confirmedAt: [Date]
+    }
+    private struct VersionProbe: Decodable {
+        let version: Int
+    }
+    static let currentVersion = 2
     static let maximumEvents = 5_000
     static let maximumBytes = 4 * 1_024 * 1_024
     static let maximumAge: TimeInterval = 48 * 3_600
@@ -98,15 +114,28 @@ nonisolated final class SportsFixtureCache: @unchecked Sendable {
               let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
               size > 0, size <= Self.maximumBytes,
               let data = try? Data(contentsOf: fileURL), data.count <= Self.maximumBytes,
-              let envelope = try? JSONDecoder().decode(Envelope.self, from: data), envelope.version == 1,
-              envelope.records.count <= Self.maximumEvents,
-              envelope.refreshedAt.timeIntervalSince1970.isFinite,
-              now.timeIntervalSince(envelope.refreshedAt) >= -300,
-              now.timeIntervalSince(envelope.refreshedAt) <= Self.maximumAge else { return nil }
+              let probe = try? JSONDecoder().decode(VersionProbe.self, from: data) else { return nil }
+        let refreshedAt: Date
+        let events: [SportEvent]
+        let confirmed: [Date]
+        switch probe.version {
+        case Self.currentVersion:
+            guard let flat = try? JSONDecoder().decode(FlatEnvelope.self, from: data),
+                  flat.events.count == flat.confirmedAt.count else { return nil }
+            (refreshedAt, events, confirmed) = (flat.refreshedAt, flat.events, flat.confirmedAt)
+        case 1:
+            guard let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else { return nil }
+            (refreshedAt, events, confirmed) = (envelope.refreshedAt, envelope.records.map(\.event), envelope.records.map(\.confirmedAt))
+        default:
+            return nil
+        }
+        guard events.count <= Self.maximumEvents,
+              refreshedAt.timeIntervalSince1970.isFinite,
+              now.timeIntervalSince(refreshedAt) >= -300,
+              now.timeIntervalSince(refreshedAt) <= Self.maximumAge else { return nil }
         var dates: [String: Date] = [:]
-        for record in envelope.records { dates[Self.eventKey(record.event)] = record.confirmedAt }
-        let snapshot = Self.retained(events: envelope.records.map(\.event), confirmedAt: dates,
-                                     refreshedAt: envelope.refreshedAt, now: now)
+        for (event, date) in zip(events, confirmed) { dates[Self.eventKey(event)] = date }
+        let snapshot = Self.retained(events: events, confirmedAt: dates, refreshedAt: refreshedAt, now: now)
         return snapshot.events.isEmpty ? nil : snapshot
     }
 
@@ -122,14 +151,18 @@ nonisolated final class SportsFixtureCache: @unchecked Sendable {
         guard let fileURL else { return }
         let bounded = Self.retained(events: snapshot.events, confirmedAt: snapshot.confirmedAt,
                                     refreshedAt: snapshot.refreshedAt)
-        var records = bounded.events.compactMap { event -> Record? in
-            guard let date = bounded.confirmedAt[Self.eventKey(event)] else { return nil }
-            return Record(event: event, confirmedAt: date)
+        var events: [SportEvent] = []
+        var confirmed: [Date] = []
+        for event in bounded.events {
+            guard let date = bounded.confirmedAt[Self.eventKey(event)] else { continue }
+            events.append(event)
+            confirmed.append(date)
         }
         // Large titles/descriptions cannot grow the file past the byte cap.
         // Shrink on the utility queue, retaining the highest-priority records.
         for _ in 0..<3 {
-            let envelope = Envelope(version: 1, refreshedAt: bounded.refreshedAt, records: records)
+            let envelope = FlatEnvelope(version: Self.currentVersion, refreshedAt: bounded.refreshedAt,
+                                        events: events, confirmedAt: confirmed)
             guard let data = try? JSONEncoder().encode(envelope) else { return }
             if data.count <= Self.maximumBytes {
                 do {
@@ -138,8 +171,9 @@ nonisolated final class SportsFixtureCache: @unchecked Sendable {
                 } catch { AppLog.sports.error("Sports fixture cache write unavailable") }
                 return
             }
-            let count = max(0, records.count * Self.maximumBytes / data.count - 1)
-            records = Array(records.prefix(count))
+            let count = max(0, events.count * Self.maximumBytes / data.count - 1)
+            events = Array(events.prefix(count))
+            confirmed = Array(confirmed.prefix(count))
         }
     }
 }
