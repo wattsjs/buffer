@@ -74,6 +74,7 @@ import Foundation
 
     static func main() async throws {
         checkFallbackIdentities()
+        XMLTVDifferentialTests.run()
         // Disabling on-demand content must preserve the complete live model,
         // including catchup metadata and anonymous identities. VOD entries
         // remain excluded rather than being misclassified as live channels.
@@ -157,6 +158,37 @@ import Foundation
             let actual = M3UParser.parseContent(text)
             require(try canonicalChannels(actual.channels) == canonicalChannels(expected.channels), "M3U ASCII attribute grammar differs from regex")
             require(try encoder.encode(actual.vodItems) == encoder.encode(expected.vodItems), "M3U VOD attribute grammar differs from regex")
+            m3uChecks += 1
+        }
+        // Large playlists take the parallel path: parts start at #EXTINF
+        // lines, and entries left waiting for a URL at a part end carry over.
+        for round in 0..<4 {
+            var lines: [String] = []
+            var anonymousOrder = 0
+            while lines.count < 40_000 {
+                switch random(14) {
+                case 0: lines += ["#EXTINF:-1 tvg-id=\"orphan\(lines.count)\",Missing URL"]
+                case 1: lines += ["#EXTINF:-1,Anonymous \(anonymousOrder)", "http://127.0.0.1/shared.ts"]; anonymousOrder += 1
+                case 2: lines += fixtures[random(fixtures.count)]
+                case 3: lines += ["# comment", "", "#EXTVLCOPT:x=1"]
+                case 4: lines += ["#EXTINF:7200 tvg-type=\"movie\" tvg-name=\"Film \(lines.count)\",Film", "http://127.0.0.1/movie/\(lines.count).mkv"]
+                case 5: lines += ["#EXTINF:-1 tvg-id=\"u\(lines.count)\" tvg-name=\"Équipe 日本語 \(lines.count)\" group-title=\"Sport\",Équipe", "http://127.0.0.1/u/\(lines.count).ts"]
+                default:
+                    let fragments = (0..<random(6)).map { _ in attributeFragments[random(attributeFragments.count)] }
+                    lines += ["#EXTINF:-1 tvg-id=\"ch\(lines.count)\" \(fragments.joined(separator: " ")),Channel \(lines.count)", "http://127.0.0.1/live/\(lines.count).ts"]
+                }
+            }
+            let separator = separators[round % separators.count]
+            let text = lines.joined(separator: separator) + separator
+            precondition(text.utf8.count > 1 << 20, "large playlist fixture must take the parallel path")
+            let expected = ReferenceM3UParser.parseContent(text)
+            let actual = M3UParser.parseContent(text)
+            require(try canonicalChannels(actual.channels) == canonicalChannels(expected.channels), "parallel M3U channels differ (round \(round))")
+            require(try encoder.encode(actual.vodItems) == encoder.encode(expected.vodItems), "parallel M3U VOD differs (round \(round))")
+            // Duplicate fallback identities are numbered in playlist order across parts.
+            let shared = actual.channels.filter { $0.streamURL.absoluteString == "http://127.0.0.1/shared.ts" && $0.epgChannelID == nil }
+            let base = M3UParser.parse("#EXTINF:-1,X\nhttp://127.0.0.1/shared.ts\n")[0].id
+            require(shared.enumerated().allSatisfy { $0.element.id == ($0.offset == 0 ? base : "\(base):\($0.offset + 1)") }, "fallback occurrences out of order")
             m3uChecks += 1
         }
         let attrs = ["start=\"20261004000000 +0000\"", "stop=\"20261004003000 +0000\"", "channel=\"test\""]

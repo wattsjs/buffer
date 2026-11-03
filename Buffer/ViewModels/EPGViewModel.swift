@@ -1302,9 +1302,9 @@ class EPGViewModel {
             // M3U EPG fetch is independent of channel metadata. Xtream XMLTV
             // needs channel catchup durations to request the full previous-days
             // window, so it must wait until channels are loaded/refreshed.
-            let prefetchedEPG: Task<[EPGProgram], any Error>?
+            let prefetchedEPG: Task<XMLTVGuide, any Error>?
             if scope == .all, config.type == .m3u, let epgURL = epgURL(for: config) {
-                prefetchedEPG = Task { try await XMLTVParser.parse(from: epgURL) }
+                prefetchedEPG = Task { try await XMLTVParser.parseGuide(from: epgURL) }
             } else {
                 prefetchedEPG = nil
             }
@@ -1424,13 +1424,13 @@ class EPGViewModel {
                 defer { priorityGuideTask?.cancel() }
                 var currentSignature: XtreamGuideSignature?
                 do {
-                    let current: [EPGProgram]
+                    let current: XMLTVGuide
                     if let task = prefetchedEPG {
                         current = try await withTaskCancellationHandler {
                             try await task.value
                         } onCancel: { task.cancel() }
                     } else {
-                        current = try await XMLTVParser.parse(from: epgURL)
+                        current = try await XMLTVParser.parseGuide(from: epgURL)
                     }
                     if config.type == .xtream { currentSignature = XtreamGuideSignature(current) }
                     try await publishGuidePrograms(current, id: id, generation: generation,
@@ -1456,7 +1456,7 @@ class EPGViewModel {
                        let url = xtreamLookbackEPGURL(for: config) {
                         lookbackTask = Task { [weak self] in
                             do {
-                                let history = try await XMLTVParser.parse(from: url)
+                                let history = try await XMLTVParser.parseGuide(from: url)
                                 try Task.checkCancellation()
                                 // Some providers ignore prev_days and return
                                 // the same document. Remember that so later
@@ -1567,6 +1567,25 @@ class EPGViewModel {
     private func publishGuidePrograms(_ incoming: [EPGProgram], id: UUID, generation: UUID,
                                       config: ServerConfig, cacheKey: String, stage: String,
                                       forcePersist: Bool = false) async throws {
+        try await publishGuide(incomingCount: incoming.count, organizeIncoming: { Self.organize(incoming) }, id: id,
+                               generation: generation, config: config, cacheKey: cacheKey, stage: stage,
+                               forcePersist: forcePersist)
+    }
+
+    /// XMLTV guides arrive as columns; the worker groups them per channel
+    /// directly (`XMLTVGuide.programsByChannel` equals `organize` over the
+    /// flat list) instead of materializing and regrouping a flat array.
+    private func publishGuidePrograms(_ incoming: XMLTVGuide, id: UUID, generation: UUID,
+                                      config: ServerConfig, cacheKey: String, stage: String,
+                                      forcePersist: Bool = false) async throws {
+        try await publishGuide(incomingCount: incoming.count, organizeIncoming: { incoming.programsByChannel() }, id: id,
+                               generation: generation, config: config, cacheKey: cacheKey, stage: stage,
+                               forcePersist: forcePersist)
+    }
+
+    private func publishGuide(incomingCount: Int, organizeIncoming: @escaping @Sendable () -> [String: [EPGProgram]],
+                              id: UUID, generation: UUID, config: ServerConfig, cacheKey: String, stage: String,
+                              forcePersist: Bool) async throws {
         let predecessor = guidePublicationTask
         let task = Task { [weak self] in
             _ = await predecessor?.result
@@ -1585,7 +1604,7 @@ class EPGViewModel {
                 let started = ContinuousClock.now
                 // A full channel scan per publication; keep it off the main actor.
                 let starts = GuideHistory.retentionStarts(channels: channels, now: now)
-                let organized = Self.organize(incoming)
+                let organized = organizeIncoming()
                 var delta: [String: [EPGProgram]] = [:]
                 let ids = pruneAll ? Set(base.keys).union(organized.keys) : Set(organized.keys)
                 for epgID in ids {
@@ -1629,7 +1648,7 @@ class EPGViewModel {
                 DataCache.enqueueSavePrograms(full, key: cacheKey)
                 self.lastGuidePersistedAt = .now
             }
-            AppLog.sync.info("Guide progressive publication stage=\(stage, privacy: .public) incoming=\(incoming.count, privacy: .public) changedKeys=\(delta.count, privacy: .public) totalKeys=\(full.count, privacy: .public) mergeMs=\(prepared.mergeMs, privacy: .public) bucketMs=\(prepared.bucketMs, privacy: .public) persisted=\(persist, privacy: .public) mainCommitMs=\(commitMs, privacy: .public)")
+            AppLog.sync.info("Guide progressive publication stage=\(stage, privacy: .public) incoming=\(incomingCount, privacy: .public) changedKeys=\(delta.count, privacy: .public) totalKeys=\(full.count, privacy: .public) mergeMs=\(prepared.mergeMs, privacy: .public) bucketMs=\(prepared.bucketMs, privacy: .public) persisted=\(persist, privacy: .public) mainCommitMs=\(commitMs, privacy: .public)")
         }
         guidePublicationTask = task
         try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
@@ -2278,6 +2297,12 @@ class EPGViewModel {
             count = programs.count
             earliestStart = programs.lazy.map(\.start).min()
             latestEnd = programs.lazy.map(\.end).max()
+        }
+
+        init(_ guide: XMLTVGuide) {
+            count = guide.count
+            earliestStart = guide.earliestStart
+            latestEnd = guide.latestEnd
         }
     }
 
