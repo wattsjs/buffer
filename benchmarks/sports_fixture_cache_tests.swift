@@ -78,6 +78,21 @@ import Foundation
         let bytesBounded = await restarted.load(now: now)
         precondition(bytesBounded?.events.isEmpty == false && bytesBounded!.events.count < huge.count)
 
+        // Version 2 writes flat parallel columns; a version 1 record file
+        // saved by an earlier build still loads.
+        cache.enqueueSave(snapshot([live, tomorrow]))
+        await cache.flush()
+        let flat = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        precondition(flat["version"] as? Int == 2 && (flat["events"] as? [Any])?.count == 2
+                     && (flat["confirmedAt"] as? [Any])?.count == 2 && flat["records"] == nil, "Fixture store is not flat")
+        struct LegacyRecord: Encodable { let event: SportEvent; let confirmedAt: Date }
+        struct LegacyEnvelope: Encodable { let version: Int; let refreshedAt: Date; let records: [LegacyRecord] }
+        try JSONEncoder().encode(LegacyEnvelope(version: 1, refreshedAt: now,
+            records: [LegacyRecord(event: tomorrow, confirmedAt: now)])).write(to: url)
+        let migrated = await restarted.load(now: now)
+        precondition(migrated?.events.map(\.id) == ["tomorrow"] && migrated?.confirmedAt[SportsFixtureCache.eventKey(tomorrow)] == now,
+                     "Version 1 fixture store did not load")
+
         try Data("{malformed".utf8).write(to: url)
         let malformed = await restarted.load()
         precondition(malformed == nil)
@@ -88,6 +103,6 @@ import Foundation
         await cache.flush()
         let cleared = await restarted.load()
         precondition(cleared == nil, "Fresh successful empty feed left a prior cache visible")
-        print("PASS sports fixture restart persistence, live/finished/schedule expiry, confirmation bounds, ordered/coalesced writes, record/byte bounds, malformed/oversized rejection, empty replacement")
+        print("PASS sports fixture restart persistence, live/finished/schedule expiry, confirmation bounds, ordered/coalesced writes, record/byte bounds, malformed/oversized rejection, empty replacement, flat v2 columns, v1 record migration")
     }
 }

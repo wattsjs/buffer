@@ -84,14 +84,14 @@ final class SportsViewModel {
     }
 
     var isStreamIndexReady: Bool {
-        !isStreamIndexBuilding && !searchIndex.entries.isEmpty && searchIndex.epgTitleCount > 0
+        !isStreamIndexBuilding && searchIndex.entryCount > 0 && searchIndex.epgTitleCount > 0
     }
 
     var streamIndexUnavailableMessage: String? {
         if isStreamIndexBuilding {
             return "Indexing channels and guide data…"
         }
-        if searchIndex.entries.isEmpty || searchIndex.epgTitleCount == 0 {
+        if searchIndex.entryCount == 0 || searchIndex.epgTitleCount == 0 {
             return "Channel search index is not ready yet"
         }
         return nil
@@ -145,17 +145,17 @@ final class SportsViewModel {
             searchIndexVersion &+= 1
         }
         if deferGuideIndex {
-            if catalogChanged || (!searchIndex.entries.isEmpty && (indexRebuildTask != nil || indexWorkerTask != nil)) {
+            if catalogChanged || (searchIndex.entryCount > 0 && (indexRebuildTask != nil || indexWorkerTask != nil)) {
                 indexBuildGeneration &+= 1
                 indexRebuildTask?.cancel()
                 indexRebuildTask = nil
                 indexWorkerTask?.cancel()
                 indexWorkerTask = nil
             }
-            isStreamIndexBuilding = !channels.isEmpty && searchIndex.entries.isEmpty
+            isStreamIndexBuilding = !channels.isEmpty && searchIndex.entryCount == 0
             // Cold launch still gets one useful current-guide index. Further
             // enrichment keeps that snapshot until the quiet tail completes.
-            if searchIndex.entries.isEmpty, !programs.isEmpty,
+            if searchIndex.entryCount == 0, !programs.isEmpty,
                indexRebuildTask == nil, indexWorkerTask == nil {
                 scheduleIndexRebuild()
             }
@@ -221,7 +221,7 @@ final class SportsViewModel {
         if pr.isEmpty {
             // Channels are loaded but EPG hasn't arrived yet.
             // Keep whatever index we have (if any) and mark building.
-            if searchIndex.entries.isEmpty {
+            if searchIndex.entryCount == 0 {
                 isStreamIndexBuilding = true
             }
             let now = Date()
@@ -235,7 +235,7 @@ final class SportsViewModel {
             return
         }
 
-        isStreamIndexBuilding = searchIndex.entries.isEmpty
+        isStreamIndexBuilding = searchIndex.entryCount == 0
         AppLog.sports.info("Sports stream index build started generation=\(generation, privacy: .public) channels=\(ch.count, privacy: .public) programKeys=\(pr.count, privacy: .public)")
 
         let playbackActive = PlayerSessionRegistry.shared.activeSession != nil
@@ -267,7 +267,7 @@ final class SportsViewModel {
 #if DEBUG
                 if index.programKeyCount > 1000 { self.runDiagnosticMatchValidationIfRequested() }
 #endif
-                AppLog.sports.info("Sports stream index ready generation=\(generation, privacy: .public) entries=\(index.entries.count, privacy: .public) programKeys=\(index.programKeyCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) buildMs=\(buildMs, privacy: .public) mainWaitMs=\(AppLog.elapsedMilliseconds(since: preparedAt), privacy: .public)")
+                AppLog.sports.info("Sports stream index ready generation=\(generation, privacy: .public) entries=\(index.entryCount, privacy: .public) programKeys=\(index.programKeyCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) buildMs=\(buildMs, privacy: .public) mainWaitMs=\(AppLog.elapsedMilliseconds(since: preparedAt), privacy: .public)")
             }
         }
     }
@@ -428,8 +428,8 @@ final class SportsViewModel {
         let channelScores = channelPreferenceScores
         let groupScores = groupPreferenceScores
         let quality = channelQuality
-        guard !index.entries.isEmpty, index.epgTitleCount > 0 else {
-            AppLog.sports.info("Sports stream match skipped; index not ready event=\(event.displayTitle, privacy: .public) entries=\(index.entries.count, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public)")
+        guard index.entryCount > 0, index.epgTitleCount > 0 else {
+            AppLog.sports.info("Sports stream match skipped; index not ready event=\(event.displayTitle, privacy: .public) entries=\(index.entryCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public)")
             return []
         }
 #if SPORTS_MATCH_TESTING
@@ -445,7 +445,7 @@ final class SportsViewModel {
             let signpostState = AppLog.sportsSignposter.beginInterval(
                 "SportsStreamMatch",
                 id: signpostID,
-                "event=\(event.displayTitle, privacy: .public) entries=\(index.entries.count, privacy: .public)"
+                "event=\(event.displayTitle, privacy: .public) entries=\(index.entryCount, privacy: .public)"
             )
             let start = ContinuousClock.now
             defer {
@@ -467,7 +467,7 @@ final class SportsViewModel {
                 let q = quality[match.channel.preferenceIdentity]
                 AppLog.sports.info("Sports stream match rank=\(rank, privacy: .public) event=\(event.displayTitle, privacy: .public) channel=\(match.channel.name, privacy: .public) group=\(match.channel.group, privacy: .public) favorite=\(favIDs.contains(match.channel.preferenceIdentity), privacy: .public) relevance=\(match.relevance.rawValue, privacy: .public) score=\(match.score, format: .fixed(precision: 1), privacy: .public) height=\(q?.observedHeight ?? 0, privacy: .public) fps=\(q?.observedFPS ?? 0, format: .fixed(precision: 1), privacy: .public) bitrate=\(q?.observedBitRate ?? 0, privacy: .public) availability=\(q?.availability.rawValue ?? -1, privacy: .public) programme=\(match.programTitle ?? "", privacy: .public)")
             }
-            AppLog.sports.info("Sports stream match finished event=\(event.displayTitle, privacy: .public) matches=\(matches.count, privacy: .public) entries=\(index.entries.count, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) matchMs=\(milliseconds, privacy: .public)")
+            AppLog.sports.info("Sports stream match finished event=\(event.displayTitle, privacy: .public) matches=\(matches.count, privacy: .public) entries=\(index.entryCount, privacy: .public) epgTitles=\(index.epgTitleCount, privacy: .public) matchMs=\(milliseconds, privacy: .public)")
             return matches
         }
         let matches = await withTaskCancellationHandler {

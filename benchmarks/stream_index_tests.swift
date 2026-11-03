@@ -50,6 +50,34 @@ struct StreamIndexTests {
         let interrupted = StreamMatcher.buildIndex(channels: channels, programs: programs, shouldCancel: { probe.cancelled() })
         precondition(interrupted.entries.isEmpty && interrupted.tokenToEntryIndices.isEmpty, "Partial cancelled index escaped")
         print("PASS cancellation before and during index build")
+
+        // Interning: one ID per canonical string; NFC/NFD spellings share it.
+        var table = SportsTokenTable(trivial: ["the", "open"])
+        let cafe = table.intern("cafe\u{301}")
+        precondition(table.intern("café") == cafe && table.lookup("cafe\u{301}") == cafe && table.lookup("café") == cafe)
+        precondition(table.charCount(cafe) == 4 && !table.isASCII(cafe) && table.isIndexable(cafe))
+        let open = table.lookup("open")!
+        precondition(!table.isIndexable(open) && table.intern("open") == open, "Trivial words must stay unindexed")
+        for i in 0..<20_000 { precondition(table.intern("w\(i)") == table.lookup("w\(i)")!) }
+        precondition(table.lookup("missing") == nil && table.string(cafe) == "café")
+
+        // Packed entry columns, posting lists and the bitset-friendly layout.
+        let packed = StreamMatcher.buildIndex(channels: channels, programs: programs, hiddenGroups: ["Hidden"])
+        for e in 0..<packed.entryCount {
+            let flags = packed.entryNameAndFlags[e]
+            precondition((flags & StreamSearchIndex.EntryFlag.hidden != 0) == (e == 1), "Hidden flag packed into the name column")
+            precondition(flags & StreamSearchIndex.EntryFlag.sports != 0, "Sports flag packed into the name column")
+            precondition(packed.nameLowerString(packed.nameID(ofEntry: e)) == channels[e].name.lowercased())
+        }
+        for postings in [(packed.namePostingStart, packed.namePostings), (packed.guidePostingStart, packed.guidePostings)] {
+            for t in 0..<packed.tokens.count {
+                let list = postings.1[Int(postings.0[t])..<Int(postings.0[t + 1])]
+                precondition(zip(list, list.dropFirst()).allSatisfy { $0 < $1 }, "Posting lists must be strictly ascending")
+            }
+        }
+        precondition(packed.guideKeys == ["shared"] && packed.guideEntries == [0, 1, 2], "Variants share one guide row block")
+        precondition(packed.rowStart.count == 1, "Only in-window programmes are laid out")
+        print("PASS token interning (NFC identity, trivial words), packed entry flags, ascending posting lists, shared guide rows")
         print("PASS shared-guide cache equals independent production indexing: entries, tokens, IDF, Unicode, hidden groups, empty guide")
     }
 }
