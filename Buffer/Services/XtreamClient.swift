@@ -518,30 +518,199 @@ actor XtreamClient {
         ])
 
         // Fetch categories and streams concurrently — independent HTTP requests
-        async let categoriesMap = fetchCategories()
+        async let categoriesTable = fetchCategoryTable(action: "get_live_categories")
         let data = try await fetchData(from: target)
-        let streams = try JSONDecoder().decode([XtreamStream].self, from: data)
-        let cats = try await categoriesMap
+        let streams = try Self.decodeLiveStreams(data)
+        let cats = try await categoriesTable
+        return Self.channels(from: streams, categories: cats, config: config)
+    }
 
-        var channels: [Channel] = []
-        channels.reserveCapacity(streams.count)
-        guard let baseURL = config.xtreamStreamBase else { return [] }
-        let baseStr = baseURL.absoluteString
-        for stream in streams {
-            guard let streamURL = URL(string: "\(baseStr)/\(stream.stream_id).m3u8") else { continue }
-            let categoryName = stream.category_id.flatMap { cats[$0] } ?? "Uncategorized"
+    // MARK: - Decoding
+    // Each endpoint decodes in one pass into columns; when the fast path
+    // declines, the original Codable decoder and mapping run instead.
 
-            channels.append(Channel(
-                id: stream.stream_id,
-                name: stream.name,
-                logoURL: stream.stream_icon.flatMap { URL(string: $0) },
-                group: categoryName,
-                streamURL: streamURL,
-                epgChannelID: nonEmpty(stream.epg_channel_id) ?? "xtream-stream-\(stream.stream_id)",
-                catchup: makeXtreamCatchup(streamID: stream.stream_id, archive: stream)
+    private enum LiveStreamsPayload {
+        case columns([XtreamLiveStreamColumns])
+        case legacy([XtreamStream])
+    }
+
+    private static func decodeLiveStreams(_ data: Data) throws -> LiveStreamsPayload {
+        if let columns = try? XtreamLiveStreamColumns.decode(data) { return .columns(columns) }
+        return .legacy(try JSONDecoder().decode([XtreamStream].self, from: data))
+    }
+
+    private static func channels(from payload: LiveStreamsPayload, categories: XtreamCategoryTable, config: ServerConfig) -> [Channel] {
+        switch payload {
+        case .columns(let columns):
+            return XtreamLiveStreamColumns.channels(columns, categories: categories, config: config)
+        case .legacy(let streams):
+            let cats = categories.dictionary
+            var channels: [Channel] = []
+            channels.reserveCapacity(streams.count)
+            guard let baseURL = config.xtreamStreamBase else { return [] }
+            let baseStr = baseURL.absoluteString
+            for stream in streams {
+                guard let streamURL = URL(string: "\(baseStr)/\(stream.stream_id).m3u8") else { continue }
+                let categoryName = stream.category_id.flatMap { cats[$0] } ?? "Uncategorized"
+
+                channels.append(Channel(
+                    id: stream.stream_id,
+                    name: stream.name,
+                    logoURL: stream.stream_icon.flatMap { URL(string: $0) },
+                    group: categoryName,
+                    streamURL: streamURL,
+                    epgChannelID: nonEmpty(stream.epg_channel_id) ?? "xtream-stream-\(stream.stream_id)",
+                    catchup: makeXtreamCatchup(streamID: stream.stream_id, archive: stream, config: config)
+                ))
+            }
+            return channels
+        }
+    }
+
+    /// `get_live_streams` + categories → channels, without the network.
+    static func decodeChannels(streams: Data, categories: Data, config: ServerConfig) throws -> [Channel] {
+        let payload = try decodeLiveStreams(streams)
+        return channels(from: payload, categories: try decodeCategoryTable(categories), config: config)
+    }
+
+    static func decodeCategoryTable(_ data: Data) throws -> XtreamCategoryTable {
+        if let table = try? XtreamCategoryTable.decode(data) { return table }
+        let categories = try JSONDecoder().decode([XtreamCategory].self, from: data)
+        var map: [String: String] = [:]
+        map.reserveCapacity(categories.count)
+        for cat in categories {
+            map[cat.category_id] = cat.category_name ?? "Unknown"
+        }
+        return XtreamCategoryTable(dictionary: map)
+    }
+
+    private enum RecordPayload<Legacy> {
+        case columns([ConnectorRecordColumns])
+        case legacy([Legacy])
+    }
+
+    private static func decodeVODStreams(_ data: Data) throws -> RecordPayload<XtreamVODStream> {
+        if let columns = try? XtreamVODColumns.decode(data) { return .columns(columns) }
+        return .legacy(try JSONDecoder().decode([XtreamVODStream].self, from: data))
+    }
+
+    private static func vodItems(from payload: RecordPayload<XtreamVODStream>, categories: XtreamCategoryTable,
+                                 config: ServerConfig) -> [VODItem] {
+        switch payload {
+        case .columns(let columns):
+            return XtreamVODColumns.items(columns, categories: categories, config: config)
+        case .legacy(let streams):
+            let cats = categories.dictionary
+            return streams.compactMap { stream in
+                let ext = normalizedContainerExtension(stream.container_extension)
+                guard let streamURL = URL(string: "\(config.xtreamBaseURL)/movie/\(config.username)/\(config.password)/\(stream.stream_id).\(ext)") else {
+                    return nil
+                }
+                let categoryName = stream.category_id.flatMap { cats[$0] } ?? "Movies"
+
+                return VODItem(
+                    id: stream.stream_id,
+                    name: stream.name,
+                    posterURL: stream.stream_icon.flatMap { URL(string: $0) },
+                    group: categoryName,
+                    streamURL: streamURL,
+                    kind: .movie,
+                    genre: nonEmpty(stream.genre) ?? categoryName,
+                    durationSeconds: Int(stream.duration_secs ?? ""),
+                    rating: stream.rating?.isEmpty == false ? stream.rating : stream.rating_5based,
+                    releaseDate: stream.releaseDate ?? stream.year,
+                    containerExtension: ext,
+                    summary: stream.plot,
+                    director: stream.director,
+                    cast: stream.cast,
+                    country: stream.country
+                )
+            }
+        }
+    }
+
+    /// `get_vod_streams` + categories → items, without the network.
+    static func decodeVODItems(streams: Data, categories: XtreamCategoryTable, config: ServerConfig) throws -> [VODItem] {
+        vodItems(from: try decodeVODStreams(streams), categories: categories, config: config)
+    }
+
+    private static func decodeSeriesList(_ data: Data) throws -> RecordPayload<XtreamSeries> {
+        if let columns = try? XtreamSeriesColumns.decode(data) { return .columns(columns) }
+        return .legacy(try JSONDecoder().decode([XtreamSeries].self, from: data))
+    }
+
+    private static func series(from payload: RecordPayload<XtreamSeries>, categories: XtreamCategoryTable) -> [VODSeries] {
+        switch payload {
+        case .columns(let columns):
+            return XtreamSeriesColumns.series(columns, categories: categories)
+        case .legacy(let series):
+            let cats = categories.dictionary
+            return series.map { entry in
+                VODSeries(
+                    id: entry.series_id,
+                    name: entry.name ?? "Unknown",
+                    posterURL: entry.cover.flatMap { URL(string: $0) },
+                    group: entry.category_id.flatMap { cats[$0] } ?? "Series",
+                    genre: entry.genre ?? entry.category_id.flatMap { cats[$0] },
+                    rating: nonEmpty(entry.rating),
+                    releaseDate: entry.releaseDate,
+                    summary: entry.plot,
+                    director: entry.director,
+                    cast: entry.cast
+                )
+            }
+        }
+    }
+
+    /// `get_series` + categories → series, without the network.
+    static func decodeSeries(_ data: Data, categories: XtreamCategoryTable) throws -> [VODSeries] {
+        series(from: try decodeSeriesList(data), categories: categories)
+    }
+
+    struct CatchupListings: Sendable {
+        var programs: [EPGProgram]
+        var receivedListings: Int
+        var responseEarliestEpoch: Double
+        var responseLatestEpoch: Double
+    }
+
+    /// One `get_simple_data_table` response → programmes, without the network.
+    static func decodeCatchupListings(_ data: Data, channelID: String, epgID: String, minimumStart: Date?) throws -> CatchupListings {
+        if let columns = try? XtreamShortEPGColumns.decode(data, minimumStart: minimumStart) {
+            return CatchupListings(programs: columns.programs(channelID: channelID, epgID: epgID),
+                                   receivedListings: columns.receivedListings,
+                                   responseEarliestEpoch: columns.responseEarliestEpoch,
+                                   responseLatestEpoch: columns.responseLatestEpoch)
+        }
+        let envelope = try JSONDecoder().decode(XtreamEPGEnvelope.self, from: data)
+        var programs: [EPGProgram] = []
+        programs.reserveCapacity(envelope.listings.count)
+        var earliest = Double.infinity
+        var latest = 0.0
+        for listing in envelope.listings {
+            guard let start = date(fromEpochString: listing.startTimestamp),
+                  let end = date(fromEpochString: listing.stopTimestamp),
+                  end > start else { continue }
+            earliest = min(earliest, start.timeIntervalSince1970)
+            latest = max(latest, end.timeIntervalSince1970)
+            if let minimumStart, end <= minimumStart { continue }
+            // Missing text is unavailable metadata, not an invented
+            // "No Event" interval. Explicit provider No Event text stays.
+            guard let title = decodedEPGText(listing.title) else { continue }
+            let listingID = listing.id?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let id = (listingID?.isEmpty == false ? listingID! : nil)
+                ?? "\(Int(start.timeIntervalSince1970))-\(Int(end.timeIntervalSince1970))"
+            programs.append(EPGProgram(
+                id: "xtream-simple-\(channelID)-\(id)",
+                channelID: epgID,
+                title: title,
+                description: decodedEPGText(listing.description) ?? "",
+                start: start,
+                end: end
             ))
         }
-        return channels
+        return CatchupListings(programs: programs, receivedListings: envelope.listings.count,
+                               responseEarliestEpoch: earliest.isFinite ? earliest : 0, responseLatestEpoch: latest)
     }
 
     struct CatchupProgress: Sendable {
@@ -637,36 +806,11 @@ actor XtreamClient {
             URLQueryItem(name: "action", value: "get_vod_streams")
         ])
 
-        async let categoriesMap = fetchCategories(action: "get_vod_categories")
+        async let categoriesTable = fetchCategoryTable(action: "get_vod_categories")
         let data = try await fetchData(from: target)
-        let streams = try JSONDecoder().decode([XtreamVODStream].self, from: data)
-        let cats = (try? await categoriesMap) ?? [:]
-
-        return streams.compactMap { stream in
-            let ext = normalizedContainerExtension(stream.container_extension)
-            guard let streamURL = URL(string: "\(config.xtreamBaseURL)/movie/\(config.username)/\(config.password)/\(stream.stream_id).\(ext)") else {
-                return nil
-            }
-            let categoryName = stream.category_id.flatMap { cats[$0] } ?? "Movies"
-
-            return VODItem(
-                id: stream.stream_id,
-                name: stream.name,
-                posterURL: stream.stream_icon.flatMap { URL(string: $0) },
-                group: categoryName,
-                streamURL: streamURL,
-                kind: .movie,
-                genre: nonEmpty(stream.genre) ?? categoryName,
-                durationSeconds: Int(stream.duration_secs ?? ""),
-                rating: stream.rating?.isEmpty == false ? stream.rating : stream.rating_5based,
-                releaseDate: stream.releaseDate ?? stream.year,
-                containerExtension: ext,
-                summary: stream.plot,
-                director: stream.director,
-                cast: stream.cast,
-                country: stream.country
-            )
-        }
+        let streams = try Self.decodeVODStreams(data)
+        let cats = (try? await categoriesTable) ?? .empty
+        return Self.vodItems(from: streams, categories: cats, config: config)
     }
 
     func fetchVODItemDetails(item: VODItem) async throws -> VODItem {
@@ -689,20 +833,20 @@ actor XtreamClient {
 
         return VODItem(
             id: item.id,
-            name: nonEmpty(info?.name) ?? nonEmpty(movieData?.name) ?? item.name,
+            name: Self.nonEmpty(info?.name) ?? Self.nonEmpty(movieData?.name) ?? item.name,
             posterURL: posterURL,
             group: item.group,
             streamURL: item.streamURL,
             kind: item.kind,
-            genre: nonEmpty(info?.genre) ?? item.genre,
+            genre: Self.nonEmpty(info?.genre) ?? item.genre,
             durationSeconds: durationSeconds(seconds: info?.duration_secs, duration: info?.duration) ?? item.durationSeconds,
-            rating: nonEmpty(info?.rating) ?? item.rating,
+            rating: Self.nonEmpty(info?.rating) ?? item.rating,
             releaseDate: firstNonEmpty(info?.releaseDate, info?.releasedate, epochDateString(from: movieData?.added), item.releaseDate),
-            containerExtension: nonEmpty(movieData?.container_extension) ?? item.containerExtension,
+            containerExtension: Self.nonEmpty(movieData?.container_extension) ?? item.containerExtension,
             summary: firstNonEmpty(info?.plot, info?.description, item.summary),
-            director: nonEmpty(info?.director) ?? item.director,
-            cast: nonEmpty(info?.cast) ?? item.cast,
-            country: nonEmpty(info?.country) ?? item.country,
+            director: Self.nonEmpty(info?.director) ?? item.director,
+            cast: Self.nonEmpty(info?.cast) ?? item.cast,
+            country: Self.nonEmpty(info?.country) ?? item.country,
             seasonNumber: item.seasonNumber,
             episodeNumber: item.episodeNumber
         )
@@ -715,25 +859,11 @@ actor XtreamClient {
             URLQueryItem(name: "action", value: "get_series")
         ])
 
-        async let categoriesMap = fetchCategories(action: "get_series_categories")
+        async let categoriesTable = fetchCategoryTable(action: "get_series_categories")
         let data = try await fetchData(from: target)
-        let series = try JSONDecoder().decode([XtreamSeries].self, from: data)
-        let cats = (try? await categoriesMap) ?? [:]
-
-        return series.map { entry in
-            VODSeries(
-                id: entry.series_id,
-                name: entry.name ?? "Unknown",
-                posterURL: entry.cover.flatMap { URL(string: $0) },
-                group: entry.category_id.flatMap { cats[$0] } ?? "Series",
-                genre: entry.genre ?? entry.category_id.flatMap { cats[$0] },
-                rating: nonEmpty(entry.rating),
-                releaseDate: entry.releaseDate,
-                summary: entry.plot,
-                director: entry.director,
-                cast: entry.cast
-            )
-        }
+        let series = try Self.decodeSeriesList(data)
+        let cats = (try? await categoriesTable) ?? .empty
+        return Self.series(from: series, categories: cats)
     }
 
     func fetchSeriesEpisodes(series: VODSeries) async throws -> [VODItem] {
@@ -755,7 +885,7 @@ actor XtreamClient {
             let fallbackSeasonNumber = Int(seasonKey) ?? 0
             for episode in episodes {
                 guard !episode.id.isEmpty else { continue }
-                let ext = normalizedContainerExtension(episode.container_extension)
+                let ext = Self.normalizedContainerExtension(episode.container_extension)
                 guard let streamURL = URL(string: "\(config.xtreamBaseURL)/series/\(config.username)/\(config.password)/\(episode.id).\(ext)") else {
                     continue
                 }
@@ -767,7 +897,7 @@ actor XtreamClient {
                     ?? posterURL
                 items.append(VODItem(
                     id: "\(series.id):\(episode.id)",
-                    name: nonEmpty(episode.title) ?? nonEmpty(episode.name) ?? fallbackTitle,
+                    name: Self.nonEmpty(episode.title) ?? Self.nonEmpty(episode.name) ?? fallbackTitle,
                     posterURL: imageURL,
                     group: categoryName,
                     streamURL: streamURL,
@@ -791,7 +921,7 @@ actor XtreamClient {
         }
     }
 
-    private func makeXtreamCatchup(streamID: String, archive: XtreamStream) -> CatchupInfo? {
+    private static func makeXtreamCatchup(streamID: String, archive: XtreamStream, config: ServerConfig) -> CatchupInfo? {
         // Fast path: tv_archive is "0" or "1" in Xtream responses
         guard let tvArchive = archive.tv_archive, tvArchive == "1" else { return nil }
 
@@ -813,11 +943,7 @@ actor XtreamClient {
         return CatchupInfo(kind: .xc, days: days, source: source)
     }
 
-    private func fetchCategories() async throws -> [String: String] {
-        try await fetchCategories(action: "get_live_categories")
-    }
-
-    private func fetchCategories(action: String) async throws -> [String: String] {
+    private func fetchCategoryTable(action: String) async throws -> XtreamCategoryTable {
         let target = try xtreamURL(with: [
             URLQueryItem(name: "username", value: config.username),
             URLQueryItem(name: "password", value: config.password),
@@ -825,17 +951,10 @@ actor XtreamClient {
         ])
 
         let data = try await fetchData(from: target)
-        let categories = try JSONDecoder().decode([XtreamCategory].self, from: data)
-
-        var map: [String: String] = [:]
-        map.reserveCapacity(categories.count)
-        for cat in categories {
-            map[cat.category_id] = cat.category_name ?? "Unknown"
-        }
-        return map
+        return try Self.decodeCategoryTable(data)
     }
 
-    private func normalizedContainerExtension(_ value: String?) -> String {
+    private static func normalizedContainerExtension(_ value: String?) -> String {
         let trimmed = (value ?? "mp4")
             .trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
         return trimmed.isEmpty ? "mp4" : trimmed
@@ -867,20 +986,20 @@ actor XtreamClient {
         }
     }
 
-    private func nonEmpty(_ value: String?) -> String? {
+    private static func nonEmpty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
     }
 
     private func firstNonEmpty(_ values: String?...) -> String? {
         values.lazy
-            .compactMap { self.nonEmpty($0) }
+            .compactMap { Self.nonEmpty($0) }
             .first
     }
 
     private func firstURL(_ values: String?...) -> URL? {
         values.lazy
-            .compactMap { self.nonEmpty($0).flatMap(URL.init(string:)) }
+            .compactMap { Self.nonEmpty($0).flatMap(URL.init(string:)) }
             .first
     }
 
@@ -933,36 +1052,10 @@ actor XtreamClient {
                !(200..<400).contains(http.statusCode) {
                 return CatchupBatch(channelID: job.channelID, epgID: job.epgID, programs: [], error: URLError(.badServerResponse))
             }
-            let envelope = try JSONDecoder().decode(XtreamEPGEnvelope.self, from: data)
-            var programs: [EPGProgram] = []
-            programs.reserveCapacity(envelope.listings.count)
-            var earliest = Double.infinity
-            var latest = 0.0
-            for listing in envelope.listings {
-                guard let start = date(fromEpochString: listing.startTimestamp),
-                      let end = date(fromEpochString: listing.stopTimestamp),
-                      end > start else { continue }
-                earliest = min(earliest, start.timeIntervalSince1970)
-                latest = max(latest, end.timeIntervalSince1970)
-                if let minimumStart = job.minimumStart, end <= minimumStart { continue }
-                // Missing text is unavailable metadata, not an invented
-                // "No Event" interval. Explicit provider No Event text stays.
-                guard let title = decodedEPGText(listing.title) else { continue }
-                let listingID = listing.id?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let id = (listingID?.isEmpty == false ? listingID! : nil)
-                    ?? "\(Int(start.timeIntervalSince1970))-\(Int(end.timeIntervalSince1970))"
-                programs.append(EPGProgram(
-                    id: "xtream-simple-\(job.channelID)-\(id)",
-                    channelID: job.epgID,
-                    title: title,
-                    description: decodedEPGText(listing.description) ?? "",
-                    start: start,
-                    end: end
-                ))
-            }
-            return CatchupBatch(channelID: job.channelID, epgID: job.epgID, programs: programs, error: nil,
-                receivedListings: envelope.listings.count, responseEarliestEpoch: earliest.isFinite ? earliest : 0,
-                responseLatestEpoch: latest)
+            let decoded = try decodeCatchupListings(data, channelID: job.channelID, epgID: job.epgID, minimumStart: job.minimumStart)
+            return CatchupBatch(channelID: job.channelID, epgID: job.epgID, programs: decoded.programs, error: nil,
+                receivedListings: decoded.receivedListings, responseEarliestEpoch: decoded.responseEarliestEpoch,
+                responseLatestEpoch: decoded.responseLatestEpoch)
         } catch {
             return CatchupBatch(channelID: job.channelID, epgID: job.epgID, programs: [], error: error)
         }

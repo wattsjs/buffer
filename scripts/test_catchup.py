@@ -21,6 +21,7 @@ class CatchupHTTPTests(unittest.TestCase):
         sources = ['Buffer/Models/SourceChannelIdentity.swift', 'Buffer/Models/Channel.swift', 'Buffer/Models/EPGProgram.swift',
                    'Buffer/Models/ServerConfig.swift', 'Buffer/Models/VODItem.swift',
                    'Buffer/Models/VODSeries.swift', 'Buffer/Services/XtreamClient.swift',
+                   'Buffer/Services/ConnectorJSONScanner.swift', 'Buffer/Services/XtreamColumnarDecoder.swift',
                    'Buffer/Support/AppLog.swift', 'benchmarks/catchup_integration.swift']
         subprocess.run(['swiftc', '-O', *sources, '-o', str(cls.executable)], cwd=ROOT, check=True, timeout=60)
 

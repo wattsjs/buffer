@@ -28,6 +28,7 @@ SOURCES = [
     'Buffer/Models/ProgramReminder.swift', 'Buffer/Models/SyncInterval.swift',
     'Buffer/Models/PlaybackRequest.swift',
     'Buffer/Services/XtreamClient.swift', 'Buffer/Services/StalkerClient.swift',
+    'Buffer/Services/ConnectorJSONScanner.swift', 'Buffer/Services/XtreamColumnarDecoder.swift', 'Buffer/Services/StalkerColumnarDecoder.swift',
     'Buffer/Services/M3UParser.swift', 'Buffer/Support/PerfMetrics.swift', 'Buffer/Services/XMLTVParser.swift',
     'Buffer/Support/AppLog.swift', 'Buffer/Support/GuideLookup.swift', 'Buffer/Support/GuideHistory.swift',
     'Buffer/Views/ProgramSearchIndex.swift', 'benchmarks/sync_test_support.swift', 'Buffer/ViewModels/EPGViewModel.swift',
