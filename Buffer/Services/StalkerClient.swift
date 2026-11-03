@@ -300,22 +300,10 @@ actor StalkerClient {
             guard let epgID = channel.epgChannelID else { return nil }
             return (channel.id, epgID)
         }, uniquingKeysWith: { first, _ in first })
-        if let info = try? StalkerColumnarDecoder.epgInfo(data) {
-            typealias F = StalkerColumnarDecoder.EPGField
-            let entries = info.entries
-            var programs: [EPGProgram] = []
-            programs.reserveCapacity(entries.count)
-            for (group, channelID) in info.keys.enumerated() {
-                for row in info.rows[group] {
-                    if let program = makeProgram(channelID: channelID, guideIDs: guideIDs, id: entries.string(row, F.id),
-                                                 nativeChannelID: entries.string(row, F.channelID), name: entries.string(row, F.name),
-                                                 description: entries.string(row, F.description),
-                                                 start: entries.string(row, F.start), stop: entries.string(row, F.stop)) {
-                        programs.append(program)
-                    }
-                }
+        if let chunks = try? StalkerColumnarDecoder.epgInfo(data) {
+            return ConnectorParallel.materialize(chunks, rows: \.keys.count) { info, groups, programs in
+                appendPrograms(info, groups: groups, guideIDs: guideIDs, to: &programs)
             }
-            return programs
         }
         let epg = try JSONDecoder().decode(Envelope<EPGInfo>.self, from: data).js
         return epg.data.flatMap { channelID, entries in
@@ -323,6 +311,46 @@ actor StalkerClient {
                 makeProgram(channelID: channelID, guideIDs: guideIDs, id: entry.id?.value, nativeChannelID: entry.channelID?.value,
                             name: entry.name, description: entry.description,
                             start: entry.startTimestamp?.value, stop: entry.stopTimestamp?.value)
+            }
+        }
+    }
+
+    private static func appendPrograms(_ info: StalkerColumnarDecoder.EPGInfo, groups: Range<Int>, guideIDs: [String: String],
+                                       to programs: inout [EPGProgram]) {
+        typealias F = StalkerColumnarDecoder.EPGField
+        let entries = info.entries
+        for group in groups {
+            let channelID = info.keys[group]
+            // Consecutive entries usually share a channel: resolve once.
+            var lastNative: String?
+            var lastResolved = ""
+            for row in info.rows[group] {
+                let start = entries.intOrZero(row, F.start)
+                let stop = entries.intOrZero(row, F.stop)
+                guard start > 0, stop > start,
+                      let title = entries.stalkerNonEmpty(row, F.name, fallback: nonEmpty) else { continue }
+                let resolvedChannelID: String
+                if let native = entries.stalkerNonEmpty(row, F.channelID, fallback: nonEmpty) {
+                    if let lastNative, lastNative.utf8.elementsEqual(native.utf8) {
+                        resolvedChannelID = lastResolved
+                    } else {
+                        resolvedChannelID = guideIDs[native] ?? guideIDs[channelID] ?? native
+                        lastNative = native
+                        lastResolved = resolvedChannelID
+                    }
+                } else {
+                    resolvedChannelID = guideIDs[channelID] ?? channelID
+                }
+                let id = entries.stalkerNonEmpty(row, F.id, fallback: nonEmpty)
+                    ?? "\(resolvedChannelID):\(entries.string(row, F.start) ?? ""):\(entries.string(row, F.stop) ?? "")"
+                programs.append(EPGProgram(
+                    id: id,
+                    channelID: resolvedChannelID,
+                    title: title,
+                    description: entries.string(row, F.description) ?? "",
+                    start: Date(timeIntervalSince1970: TimeInterval(start)),
+                    end: Date(timeIntervalSince1970: TimeInterval(stop))
+                ))
             }
         }
     }

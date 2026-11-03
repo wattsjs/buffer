@@ -161,7 +161,8 @@ struct ConnectorDecodeBenchmark {
         if let index = arguments.firstIndex(of: "--case") {
             // Child: one case, one implementation.
             let name = arguments[index + 1]
-            let fast = arguments[index + 2] == "fast"
+            let fast = arguments[index + 2] != "legacy"
+            if arguments[index + 2] == "fast1" { ConnectorParallel.workerOverride = 1 }
             let runs = Int(arguments[index + 3]) ?? 5
             guard let bench = makeCases().first(where: { $0.name == name }) else { exit(2) }
             installAllocationCounter()
@@ -187,9 +188,9 @@ struct ConnectorDecodeBenchmark {
         }
 
         let runs = 5
-        print("connector decode benchmark — median of \(runs) runs; allocations = malloc calls in one run; peak = RSS growth over the prepared input")
+        print("connector decode benchmark — median of \(runs) runs; allocations = malloc calls in one run (fast: 1-core run); peak = RSS growth over the prepared input")
         print(String(repeating: "-", count: 132))
-        print("case".padding(toLength: 40, withPad: " ", startingAt: 0), "rows", "legacy ms", "fast ms", "speedup", "legacy allocs", "fast allocs", "legacy peak MB", "fast peak MB", separator: "\t")
+        print("case".padding(toLength: 40, withPad: " ", startingAt: 0), "rows", "legacy ms", "fast ms", "speedup", "1-core ms", "1-core x", "legacy allocs", "fast allocs", "legacy peak MB", "fast peak MB", separator: "\t")
         var json: [String] = []
         for bench in makeCases() {
             func child(_ impl: String) -> (Double, Int, Int, Int) {
@@ -206,13 +207,15 @@ struct ConnectorDecodeBenchmark {
             }
             let legacy = child("legacy")
             let fast = child("fast")
-            precondition(legacy.3 == fast.3, "\(bench.name): result counts differ \(legacy.3) vs \(fast.3)")
+            let single = child("fast1")
+            precondition(legacy.3 == fast.3 && legacy.3 == single.3, "\(bench.name): result counts differ \(legacy.3) vs \(fast.3)")
             let speedup = legacy.0 / fast.0
             print(bench.name.padding(toLength: 40, withPad: " ", startingAt: 0), legacy.3,
                   String(format: "%.1f", legacy.0), String(format: "%.1f", fast.0), String(format: "%.1fx", speedup),
-                  legacy.1, fast.1, String(format: "%.1f", Double(legacy.2) / 1_048_576), String(format: "%.1f", Double(fast.2) / 1_048_576),
+                  String(format: "%.1f", single.0), String(format: "%.1fx", legacy.0 / single.0),
+                  legacy.1, single.1, String(format: "%.1f", Double(legacy.2) / 1_048_576), String(format: "%.1f", Double(fast.2) / 1_048_576),
                   separator: "\t")
-            json.append("{\"case\":\"\(bench.name)\",\"rows\":\(legacy.3),\"legacyMs\":\(legacy.0),\"fastMs\":\(fast.0),\"speedup\":\(speedup),\"legacyAllocations\":\(legacy.1),\"fastAllocations\":\(fast.1),\"legacyPeakBytes\":\(legacy.2),\"fastPeakBytes\":\(fast.2)}")
+            json.append("{\"case\":\"\(bench.name)\",\"rows\":\(legacy.3),\"legacyMs\":\(legacy.0),\"fastMs\":\(fast.0),\"speedup\":\(speedup),\"singleCoreMs\":\(single.0),\"legacyAllocations\":\(legacy.1),\"fastAllocations\":\(single.1),\"legacyPeakBytes\":\(legacy.2),\"fastPeakBytes\":\(fast.2)}")
         }
         print("CONNECTOR_BENCH_JSON [\(json.joined(separator: ","))]")
 

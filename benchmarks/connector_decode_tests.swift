@@ -150,7 +150,7 @@ struct ConnectorDecodeTests {
     static func data(_ text: String) -> Data { Data(text.utf8) }
 
     static func main() {
-        let rounds = CommandLine.arguments.contains("--quick") ? 300 : 3000
+        let rounds = CommandLine.arguments.contains("--quick") ? 300 : CommandLine.arguments.contains("--deep") ? 30000 : 3000
         // Default chunking, then tiny chunks so every payload is split at
         // (candidate) element boundaries, including mutated ones.
         runSuite(mutationRounds: rounds)

@@ -135,40 +135,66 @@ nonisolated enum StalkerColumnarDecoder {
         var rows: [Range<Int>] = []
     }
 
-    /// `Envelope<EPGInfo>` where `data` is `[String: [EPGEntry]]`. Groups
-    /// keep response order; duplicate or non-ASCII keys decline (the
-    /// reference dictionary would merge them).
-    static func epgInfo(_ data: Data) throws -> EPGInfo {
+    /// `Envelope<EPGInfo>` where `data` is `[String: [EPGEntry]]`, as
+    /// response-ordered chunks (several cores for large guides). Duplicate
+    /// or non-ASCII keys decline (the reference dictionary merges them).
+    static func epgInfo(_ data: Data, workers: Int = ConnectorParallel.workerCount) throws -> [EPGInfo] {
         try withEnvelope(data) { c in
             guard c.peek() == 0x7B else { throw ConnectorJSONDecline() }
-            var info: EPGInfo?
+            var info: [EPGInfo]?
             if try c.beginObject() {
                 repeat {
                     let key = try c.readKey()
                     guard info == nil, c.keyEquals(key, "data") else { try c.skipValue(depth: 2); continue }
                     guard c.peek() == 0x7B else { throw ConnectorJSONDecline() }
-                    var decoded = EPGInfo()
-                    var seen = Set<String>()
-                    var scratch: [UInt8] = []
-                    if try c.beginObject() {
-                        repeat {
-                            let channelKey = try c.readKey()
-                            for i in channelKey.start..<channelKey.end where c.byte(i) >= 0x80 { throw ConnectorJSONDecline() }
-                            let name = c.string(channelKey, scratch: &scratch)
-                            guard seen.insert(name).inserted, c.peek() == 0x5B else { throw ConnectorJSONDecline() }
-                            let first = decoded.entries.count
-                            if try c.beginArray() {
-                                repeat { try decoded.entries.appendRecord(&c, fields: epgFields, depth: 4) } while try c.nextElement()
-                            }
-                            decoded.keys.append(name)
-                            decoded.rows.append(first..<decoded.entries.count)
-                        } while try c.nextMember()
+                    info = try ConnectorParallel.decodeObjectOfArrays(&c, workers: workers, makeResult: { _ in EPGInfo() }) { c, decoded in
+                        let channelKey = try c.readKey()
+                        for i in channelKey.start..<channelKey.end where c.byte(i) >= 0x80 { throw ConnectorJSONDecline() }
+                        var scratch: [UInt8] = []
+                        let name = c.string(channelKey, scratch: &scratch)
+                        guard c.peek() == 0x5B else { throw ConnectorJSONDecline() }
+                        let first = decoded.entries.count
+                        if try c.beginArray() {
+                            repeat { try decoded.entries.appendRecord(&c, fields: epgFields, depth: 4) } while try c.nextElement()
+                        }
+                        decoded.keys.append(name)
+                        decoded.rows.append(first..<decoded.entries.count)
                     }
-                    info = decoded
                 } while try c.nextMember()
             }
             guard let info else { throw ConnectorJSONDecline() }
+            var seen = Set<String>()
+            for chunk in info { for key in chunk.keys { guard seen.insert(key).inserted else { throw ConnectorJSONDecline() } } }
             return info
         }
+    }
+}
+
+nonisolated extension ConnectorRecordColumns {
+    /// Stalker `nonEmpty`: trimmed, nil when empty or "N/A" (any case).
+    /// ASCII is decided from the bytes; other text uses `fallback`.
+    func stalkerNonEmpty(_ row: Int, _ field: Int, fallback: (String?) -> String?) -> String? {
+        let ref = self[row, field]
+        guard ref != ConnectorStringTable.none else { return nil }
+        return text.withBytes(ref) { p, n -> String? in
+            var ascii = true
+            for i in 0..<n where p[i] >= 0x80 { ascii = false; break }
+            guard ascii else { return fallback(String(decoding: UnsafeBufferPointer(start: p, count: n), as: UTF8.self)) }
+            let (s, e) = ConnectorText.trimmedRange(p, 0, n)
+            guard e > s else { return nil }
+            if e - s == 3, p[s] | 0x20 == 0x6E, p[s + 1] == 0x2F, p[s + 2] | 0x20 == 0x61 { return nil }
+            return String(decoding: UnsafeBufferPointer(start: p + s, count: e - s), as: UTF8.self)
+        }
+    }
+
+    /// `Int(value ?? "") ?? 0`.
+    func intOrZero(_ row: Int, _ field: Int) -> Int {
+        int(row, field) ?? 0
+    }
+
+    func bytesEqual(_ row: Int, _ field: Int, _ other: [UInt8]) -> Bool {
+        let ref = self[row, field]
+        guard ref != ConnectorStringTable.none, ConnectorStringTable.length(ref) == other.count else { return false }
+        return text.withBytes(ref) { p, n in other.withUnsafeBufferPointer { n == 0 || memcmp(p, $0.baseAddress!, n) == 0 } }
     }
 }

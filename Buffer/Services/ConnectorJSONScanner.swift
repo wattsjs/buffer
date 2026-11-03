@@ -814,12 +814,19 @@ nonisolated enum ConnectorParallel {
     /// closures to `concurrentPerform` workers.
     struct Shared<T>: @unchecked Sendable { let value: T }
 
-    static var workerCount: Int { max(1, min(8, ProcessInfo.processInfo.activeProcessorCount)) }
+    static var workerCount: Int {
+        #if CONNECTOR_TESTING
+        if let workerOverride { return workerOverride }
+        #endif
+        return max(1, min(8, ProcessInfo.processInfo.activeProcessorCount))
+    }
     #if CONNECTOR_TESTING
     /// Tests shrink these to force chunk boundaries into tiny payloads.
     nonisolated(unsafe) static var minimumChunkBytes = 512 << 10
     nonisolated(unsafe) static var facadeRowsPerTask = 4096
     nonisolated(unsafe) static var parallelDecodes = 0
+    /// Benchmarks pin the worker count (1 = single core).
+    nonisolated(unsafe) static var workerOverride: Int?
     nonisolated(unsafe) static var chunkFallbacks = 0
     #else
     static let minimumChunkBytes = 512 << 10
@@ -830,7 +837,24 @@ nonisolated enum ConnectorParallel {
     static func decodeArray<R>(_ c: inout ConnectorJSONCursor, workers: Int = workerCount,
                                makeResult: (_ bytes: Int) -> R,
                                element: (inout ConnectorJSONCursor, inout R) throws -> Void) throws -> [R] {
-        guard try c.beginArray() else { return [makeResult(0)] }
+        try decodeContainer(&c, object: false, workers: workers, makeResult: makeResult, element: element)
+    }
+
+    /// Object whose member values are arrays (`{"k": [...], ...}`); `member`
+    /// reads the key and its value.
+    static func decodeObjectOfArrays<R>(_ c: inout ConnectorJSONCursor, workers: Int = workerCount,
+                                        makeResult: (_ bytes: Int) -> R,
+                                        member: (inout ConnectorJSONCursor, inout R) throws -> Void) throws -> [R] {
+        try decodeContainer(&c, object: true, workers: workers, makeResult: makeResult, element: member)
+    }
+
+    private static func decodeContainer<R>(_ c: inout ConnectorJSONCursor, object: Bool, workers: Int,
+                                           makeResult: (_ bytes: Int) -> R,
+                                           element: (inout ConnectorJSONCursor, inout R) throws -> Void) throws -> [R] {
+        // Element boundaries: `}`,`{` between objects; `]`,`"` between array-valued members.
+        let close: UInt8 = object ? 0x7D : 0x5D
+        let (boundaryClose, boundaryOpen): (UInt8, UInt8) = object ? (0x5D, 0x22) : (0x7D, 0x7B)
+        guard try (object ? c.beginObject() : c.beginArray()) else { return [makeResult(0)] }
         c.skipWhitespace()
         let first = c.pos
         let total = c.count - first
@@ -839,7 +863,8 @@ nonisolated enum ConnectorParallel {
         let chunkCount = workers > 1 ? min(workers, total / minimumChunkBytes) : 1
         if chunkCount > 1 {
             for k in 1..<chunkCount {
-                guard let (comma, start) = boundary(c, from: first + total * k / chunkCount), start > starts.last! else { continue }
+                guard let (comma, start) = boundary(c, from: first + total * k / chunkCount, close: boundaryClose, open: boundaryOpen),
+                      start > starts.last! else { continue }
                 separators.append(comma)
                 starts.append(start)
             }
@@ -848,6 +873,7 @@ nonisolated enum ConnectorParallel {
             var results = [R?](repeating: nil, count: starts.count)
             var ends = [Int](repeating: -1, count: starts.count)
             let sharedBase = Shared(value: c.base), count = c.count
+            let starts = starts, separators = separators
             withoutActuallyEscaping(makeResult) { makeResult in withoutActuallyEscaping(element) { element in
             let sharedMake = Shared(value: makeResult), sharedElement = Shared(value: element)
             results.withUnsafeMutableBufferPointer { resultBuffer in
@@ -861,7 +887,7 @@ nonisolated enum ConnectorParallel {
                         var result = makeResult((last ? count : separators[k]) - starts[k])
                         do {
                             if last {
-                                repeat { try element(&cursor, &result) } while try cursor.nextElement()
+                                repeat { try element(&cursor, &result) } while try (object ? cursor.nextMember() : cursor.nextElement())
                             } else {
                                 let stop = separators[k]
                                 while true {
@@ -870,7 +896,7 @@ nonisolated enum ConnectorParallel {
                                     if cursor.pos == stop { break }
                                     guard cursor.pos < stop, cursor.byte(cursor.pos) == 0x2C else { throw ConnectorJSONDecline() }
                                     cursor.pos += 1
-                                    if cursor.peek() == 0x5D { throw ConnectorJSONDecline() }
+                                    if cursor.peek() == close { throw ConnectorJSONDecline() }
                                 }
                             }
                             outResults.value[k] = result
@@ -891,23 +917,23 @@ nonisolated enum ConnectorParallel {
         // Sequential (small arrays, or a chunk that did not line up).
         c.pos = first
         var result = makeResult(total)
-        repeat { try element(&c, &result) } while try c.nextElement()
+        repeat { try element(&c, &result) } while try (object ? c.nextMember() : c.nextElement())
         return [result]
     }
 
-    /// First `}` ws* `,` ws* `{` at or after `from`: (comma, element start).
-    private static func boundary(_ c: ConnectorJSONCursor, from: Int) -> (Int, Int)? {
+    /// First `close` ws* `,` ws* `open` at or after `from`: (comma, element start).
+    private static func boundary(_ c: ConnectorJSONCursor, from: Int, close: UInt8, open: UInt8) -> (Int, Int)? {
         var i = from
         let limit = c.count - 2
         while i < limit {
-            guard let hit = memchr(c.base + i, 0x7D, limit - i) else { return nil }
+            guard let hit = memchr(c.base + i, Int32(close), limit - i) else { return nil }
             var j = c.base.distance(to: hit.assumingMemoryBound(to: UInt8.self)) + 1
             while j < c.count, ConnectorText.isJSONWhitespace(c.byte(j)) { j += 1 }
             if j < c.count, c.byte(j) == 0x2C {
                 let comma = j
                 j += 1
                 while j < c.count, ConnectorText.isJSONWhitespace(c.byte(j)) { j += 1 }
-                if j < c.count, c.byte(j) == 0x7B { return (comma, j) }
+                if j < c.count, c.byte(j) == open { return (comma, j) }
             }
             i = c.base.distance(to: hit.assumingMemoryBound(to: UInt8.self)) + 1
         }
@@ -1206,11 +1232,21 @@ nonisolated struct ConnectorJSONTape: Sendable {
         return result
     }
 
+    /// The string as JSONSerialization delivers it: like JSONDecoder, but
+    /// one leading U+FEFF is dropped (NSString treats it as a byte-order mark).
     func string(_ node: Int32) -> String? {
         guard kind[Int(node)] == .string else { return nil }
         return withCursor { c in
-            var scratch: [UInt8] = []
-            return c.string(span(node), scratch: &scratch)
+            let s = span(node)
+            if !s.escaped {
+                var start = s.start
+                if s.end - start >= 3, c.byte(start) == 0xEF, c.byte(start + 1) == 0xBB, c.byte(start + 2) == 0xBF { start += 3 }
+                return String(decoding: UnsafeBufferPointer(start: c.base + start, count: s.end - start), as: UTF8.self)
+            }
+            var bytes: [UInt8] = []
+            c.appendUnescaped(s, to: &bytes)
+            if bytes.starts(with: [0xEF, 0xBB, 0xBF]) { bytes.removeFirst(3) }
+            return String(decoding: bytes, as: UTF8.self)
         }
     }
 
