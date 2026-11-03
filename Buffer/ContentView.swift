@@ -12,20 +12,7 @@ struct ContentView: View {
     @State var viewModel: EPGViewModel
     @State private var searchController = ProgramSearchController()
     @State private var sportsViewModel = SportsViewModel()
-    @State private var sportsMatchingChannels: [Channel] = []
-    @State private var sportsMatchingCatalogVersion = 0
-    @State private var sportsMatchingUsesSmart = false
-    @State private var sportsMatchingSourceVersion = -1
-    @State private var sportsQualityCache: [String: StreamMatchQuality] = [:]
-    @State private var sportsQualityProbeVersion = -1
-    @State private var sportsQualityCatalogVersion = -1
-    @State private var sportsQualityUpdatedAt = Date.distantPast
-    @State private var sportsPreferencesCache: (favorites: Set<String>, scores: [String: Double]) = ([], [:])
-    @State private var sportsPreferencesCatalogVersion = -1
-    @State private var sportsPreferencesSourceVersion = -1
-    @State private var sportsPreferencesScoreVersion = -1
-    @State private var sportsPreferencesFavorites: Set<String> = []
-    @State private var sportsPreferencesLogicalBindings: [String: String] = [:]
+    @State private var sportsMatching = SportsMatchingContext()
     @State private var appFeedback = AppFeedbackCenter.shared
     @State private var selectionBeforeSearch: SidebarSelection?
     @State private var didSchedulePlayerPrewarm = false
@@ -131,133 +118,11 @@ struct ContentView: View {
     }
 
     private func updateSportsMatchingContext() {
-        let snapshot = viewModel.isSmartSportsActive
-            ? viewModel.smartSports.sportsMatchingSnapshot(activeConfig: viewModel.serverConfig,
-                activeChannels: viewModel.channels, activePrograms: viewModel.programs,
-                activeCatalogVersion: viewModel.channelCatalogVersion)
-            : (channels: viewModel.channels, programs: viewModel.programs)
-        // Every assignment to an ordinary account's channels bumps its catalog
-        // version, so guide publications skip the per-channel comparison.
-        let sameSourceCatalog = !viewModel.isSmartSportsActive && !sportsMatchingUsesSmart
-            && sportsMatchingSourceVersion == viewModel.channelCatalogVersion
-        sportsMatchingSourceVersion = viewModel.channelCatalogVersion
-        let unchanged = sameSourceCatalog || sportsMatchingUsesSmart == viewModel.isSmartSportsActive
-            && sportsMatchingChannels.count == snapshot.channels.count
-            && zip(sportsMatchingChannels, snapshot.channels).allSatisfy { lhs, rhs in
-                lhs.id == rhs.id && lhs.name == rhs.name && lhs.group == rhs.group
-                    && lhs.streamURL == rhs.streamURL && lhs.epgChannelID == rhs.epgChannelID
-                    && lhs.catchup == rhs.catchup && lhs.contentType == rhs.contentType && lhs.sourceOwnership == rhs.sourceOwnership
-            }
-        if !unchanged {
-            sportsMatchingChannels = snapshot.channels
-            sportsMatchingUsesSmart = viewModel.isSmartSportsActive
-            sportsMatchingCatalogVersion &+= 1
-        }
-        let preferences = sportsMatchingPreferences()
-        sportsViewModel.updateStreamMatchingContext(
-            channels: snapshot.channels,
-            programs: snapshot.programs,
-            favoriteChannelIDs: preferences.favorites,
-            channelPreferenceScores: preferences.scores,
-            groupPreferenceScores: viewModel.groupPreferenceScores,
-            hiddenGroups: viewModel.hiddenGroupNames,
-            guideVersion: viewModel.guideVersion,
-            channelSetVersion: sportsMatchingCatalogVersion,
-            deferGuideIndex: viewModel.isGuideEnriching || (viewModel.isSmartSportsActive && viewModel.smartSports.isLoading),
-            qualityByChannel: sportsMatchingQuality()
-        )
+        sportsMatching.updateContext(viewModel: viewModel, sports: sportsViewModel)
     }
 
     private func updateSportsMatchingPreferences() {
-        let preferences = sportsMatchingPreferences()
-        sportsViewModel.updateStreamMatchingPreferences(
-            favoriteChannelIDs: preferences.favorites,
-            channelPreferenceScores: preferences.scores,
-            groupPreferenceScores: viewModel.groupPreferenceScores,
-            qualityByChannel: sportsMatchingQuality()
-        )
-    }
-
-    /// Ordinary preference IDs belong to their active playlist. Logical Smart
-    /// favorites may prefer each eligible physical variant without changing
-    /// the endpoint's action ownership or copying a guide to another source.
-    private func sportsMatchingPreferences() -> (favorites: Set<String>, scores: [String: Double]) {
-        var logicalByPhysical: [String: String] = [:]
-        if viewModel.isSmartSportsActive {
-            for feed in viewModel.smartSports.catalog?.feeds ?? [] {
-                for variant in feed.variants { logicalByPhysical[variant.key.rawValue] = feed.id }
-            }
-        }
-        if sportsPreferencesCatalogVersion == sportsMatchingCatalogVersion,
-           sportsPreferencesSourceVersion == viewModel.channelCatalogVersion,
-           sportsPreferencesScoreVersion == viewModel.preferenceScoresVersion,
-           sportsPreferencesFavorites == viewModel.favoriteChannelIDs,
-           sportsPreferencesLogicalBindings == logicalByPhysical { return sportsPreferencesCache }
-        var favorites = Set<String>()
-        var scores: [String: Double] = [:]
-        for channel in sportsMatchingChannels {
-            let key = channel.preferenceIdentity
-            let preferenceKey: String?
-            if viewModel.isSmartSportsActive { preferenceKey = logicalByPhysical[key] }
-            else if channel.sourceChannelIdentity?.sourceID == viewModel.activePlaylistID || channel.sourceChannelIdentity == nil {
-                preferenceKey = channel.id
-            } else { preferenceKey = nil }
-            guard let preferenceKey else { continue }
-            if viewModel.favoriteChannelIDs.contains(preferenceKey) { favorites.insert(key) }
-            if let score = viewModel.channelPreferenceScores[preferenceKey] { scores[key] = score }
-        }
-        sportsPreferencesCache = (favorites, scores)
-        sportsPreferencesCatalogVersion = sportsMatchingCatalogVersion
-        sportsPreferencesSourceVersion = viewModel.channelCatalogVersion
-        sportsPreferencesScoreVersion = viewModel.preferenceScoresVersion
-        sportsPreferencesFavorites = viewModel.favoriteChannelIDs
-        sportsPreferencesLogicalBindings = logicalByPhysical
-        return sportsPreferencesCache
-    }
-
-    private func sportsMatchingQuality(now: Date = Date()) -> [String: StreamMatchQuality] {
-        let probeVersion = StreamProbeService.shared.version
-        if sportsQualityProbeVersion == probeVersion,
-           sportsQualityCatalogVersion == sportsMatchingCatalogVersion,
-           now.timeIntervalSince(sportsQualityUpdatedAt) < 60 { return sportsQualityCache }
-        var result: [String: StreamMatchQuality] = [:]
-        for channel in sportsMatchingChannels {
-            guard let probe = StreamProbeService.shared.probe(for: channel),
-                  probe.endpointFingerprint == StreamProbe.endpointFingerprint(for: channel.streamURL) else { continue }
-            var quality = StreamMatchQuality()
-            let probeAge = now.timeIntervalSince(probe.probedAt)
-            if probeAge >= -60 && probeAge <= 15 * 60 {
-                if probe.status != .ok { quality.availability = .failed }
-                quality.isUnstable = probe.streamHealth.isUnstable
-            }
-            if let evidence = probe.passivePlaybackEvidence, evidence.ordinaryLive == true {
-                let age = now.timeIntervalSince(evidence.lastObservedAt)
-                if age >= -60 && age <= 24 * 3600, evidence.healthySeconds.isFinite, evidence.healthySeconds >= 0,
-                   evidence.bufferingSeconds.isFinite, evidence.bufferingSeconds >= 0 {
-                    quality.healthySeconds = evidence.healthySeconds
-                    quality.observedSeconds = evidence.healthySeconds + evidence.bufferingSeconds
-                    quality.bufferingSeconds = evidence.bufferingSeconds
-                    if evidence.bufferingSeconds > 3 { quality.availability = .failed }
-                    else if quality.availability != .failed && evidence.healthySeconds >= 180 && evidence.bufferingSeconds <= 0.5 {
-                        quality.availability = .observedAvailable
-                    }
-                }
-            }
-            if probe.metadataProvenance != nil, let date = probe.metadataObservedAt {
-                let age = now.timeIntervalSince(date)
-                if age >= -60 && age <= 14 * 86400 {
-                    quality.observedHeight = max(0, probe.height)
-                    quality.observedFPS = probe.fps.isFinite ? max(0, probe.fps) : 0
-                    quality.observedBitRate = max(0, probe.bitRate)
-                }
-            }
-            result[channel.preferenceIdentity] = quality
-        }
-        sportsQualityCache = result
-        sportsQualityProbeVersion = probeVersion
-        sportsQualityCatalogVersion = sportsMatchingCatalogVersion
-        sportsQualityUpdatedAt = now
-        return result
+        sportsMatching.updatePreferences(viewModel: viewModel, sports: sportsViewModel)
     }
 
     private func handleSidebarSelectionChange(from oldValue: SidebarSelection, to newValue: SidebarSelection) {

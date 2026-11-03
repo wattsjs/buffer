@@ -1,4 +1,6 @@
+#if os(macOS)
 import AppKit
+#endif
 import Foundation
 import Darwin
 
@@ -8,14 +10,14 @@ import Darwin
 enum SavedPlaybackScenario {
     private(set) static var isCapturing = false
     static var isEnabled: Bool {
-#if DEBUG
+#if DEBUG && os(macOS)
         CommandLine.arguments.contains("--saved-playback-scenario")
 #else
         false
 #endif
     }
 
-#if DEBUG
+#if DEBUG && os(macOS)
     private static var task: Task<Void, Never>?
     private static var output: DiagnosticOutput?
     private static var didStart = false
@@ -65,7 +67,7 @@ enum SavedPlaybackScenario {
 #endif
 }
 
-#if DEBUG
+#if DEBUG && os(macOS)
 @MainActor
 private final class SavedScenarioAppBackend: SavedPlaybackScenarioBackend {
     struct PreparedPlayback {

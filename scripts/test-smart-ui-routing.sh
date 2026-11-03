@@ -11,7 +11,7 @@ output = Path('.local/bench/smart-ui-routing-tests')
 output.parent.mkdir(parents=True, exist_ok=True)
 sources = [source for source in SOURCES if source != 'benchmarks/sync_integration.swift']
 sources.append('benchmarks/smart_ui_routing_tests.swift')
-subprocess.run(['swiftc', '-D', 'PROGRAM_SEARCH_INDEX_TESTING', '-I', 'Buffer/SwiftLibxml2',
+subprocess.run(['swiftc', '-D', 'PROGRAM_SEARCH_INDEX_TESTING', '-I', 'Shared/SwiftLibxml2',
     '-import-objc-header', BRIDGE_HEADER, *sources, '-o', str(output)], check=True)
 subprocess.run([str(output)], check=True)
 PY

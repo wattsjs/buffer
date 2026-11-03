@@ -1,4 +1,6 @@
+#if os(macOS)
 import AppKit
+#endif
 import Foundation
 
 /// Debug-only real-renderer validation. Structured stdout is the evidence
@@ -12,7 +14,7 @@ enum PlaybackValidation {
         let httpRetry: Bool
     }
     static let config: Config? = {
-#if DEBUG
+#if DEBUG && os(macOS)
         parse(arguments: CommandLine.arguments)
 #else
         nil
@@ -42,6 +44,7 @@ enum PlaybackValidation {
 
     @MainActor
     static func run(open request: PlaybackRequest) {
+#if os(macOS)
         guard let config, !started else { return }
         started = true
         guard let output = DiagnosticOutput.capturingStdout(prefix: "BUFFER_PLAYBACK_JSON ") else {
@@ -140,6 +143,7 @@ enum PlaybackValidation {
             }
             NSApplication.shared.terminate(nil)
         }
+#endif
     }
 
     private static func parse(arguments: [String]) -> Config? {

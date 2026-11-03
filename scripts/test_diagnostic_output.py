@@ -12,7 +12,7 @@ class DiagnosticTransportIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.folder = tempfile.TemporaryDirectory()
         cls.executable = pathlib.Path(cls.folder.name) / 'diagnostic-output-tests'
-        subprocess.run(['swiftc', '-O', str(ROOT / 'Buffer/Support/DiagnosticOutput.swift'),
+        subprocess.run(['swiftc', '-O', str(ROOT / 'Shared/Support/DiagnosticOutput.swift'),
             str(ROOT / 'benchmarks/diagnostic_output_tests.swift'), '-o', str(cls.executable)],
             capture_output=True, text=True, check=True, timeout=60)
 

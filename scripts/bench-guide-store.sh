@@ -11,8 +11,8 @@ ref=${4:-HEAD}
 out=.local/bench
 base=.local/bench/guide-store-baseline-src
 mkdir -p "$out" "$base"
-for f in Buffer/Services/DataCache.swift Buffer/Support/GuideLookup.swift Buffer/Support/GuideHistory.swift \
-         Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift Buffer/Models/SourceChannelIdentity.swift; do
+for f in Shared/Services/DataCache.swift Shared/Support/GuideLookup.swift Shared/Support/GuideHistory.swift \
+         Shared/Models/Channel.swift Shared/Models/EPGProgram.swift Shared/Models/SourceChannelIdentity.swift; do
   git show "$ref:$f" > "$base/$(basename "$f")"
 done
 # The baseline needs the same cache-directory override to run outside ~/Library/Caches.
@@ -29,19 +29,19 @@ s = s.replace("try? data.write(to: url, options: .atomic)",
               "let staged = url.appendingPathExtension(\"tmp\"); try? data.write(to: staged); _ = rename(staged.path, url.path)")
 p.write_text(s)
 PY
-common=(Buffer/Models/VODItem.swift Buffer/Models/VODSeries.swift Buffer/Models/ServerConfig.swift
-        Buffer/Models/StreamProbe.swift Buffer/Support/PerfMetrics.swift Buffer/Support/AppLog.swift)
-swiftc -O -swift-version 6 -module-cache-path .local/module-cache -D BASELINE -import-objc-header Buffer/Services/BufferProbe.h \
+common=(Shared/Models/VODItem.swift Shared/Models/VODSeries.swift Shared/Models/ServerConfig.swift
+        Shared/Models/StreamProbe.swift Shared/Support/PerfMetrics.swift Shared/Support/AppLog.swift)
+swiftc -O -swift-version 6 -module-cache-path .local/module-cache -D BASELINE -import-objc-header Shared/Services/BufferProbe.h \
   "$base/SourceChannelIdentity.swift" "$base/Channel.swift" "$base/EPGProgram.swift" \
   "$base/DataCache.swift" "$base/GuideLookup.swift" "$base/GuideHistory.swift" "${common[@]}" \
   benchmarks/guide_store_benchmark.swift -o "$out/guide-store-baseline"
-swiftc -O -swift-version 6 -module-cache-path .local/module-cache -import-objc-header Buffer/Services/BufferProbe.h \
-  Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift \
-  Buffer/Services/DataCache.swift Buffer/Support/GuideLookup.swift Buffer/Support/GuideHistory.swift "${common[@]}" \
+swiftc -O -swift-version 6 -module-cache-path .local/module-cache -import-objc-header Shared/Services/BufferProbe.h \
+  Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift \
+  Shared/Services/DataCache.swift Shared/Support/GuideLookup.swift Shared/Support/GuideHistory.swift "${common[@]}" \
   benchmarks/guide_store_benchmark.swift -o "$out/guide-store-columnar"
-swiftc -O -swift-version 6 -module-cache-path .local/module-cache -D VERIFY_PRUNE -import-objc-header Buffer/Services/BufferProbe.h \
-  Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift \
-  Buffer/Services/DataCache.swift Buffer/Support/GuideLookup.swift Buffer/Support/GuideHistory.swift "${common[@]}" \
+swiftc -O -swift-version 6 -module-cache-path .local/module-cache -D VERIFY_PRUNE -import-objc-header Shared/Services/BufferProbe.h \
+  Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift \
+  Shared/Services/DataCache.swift Shared/Support/GuideLookup.swift Shared/Support/GuideHistory.swift "${common[@]}" \
   benchmarks/guide_store_benchmark.swift -o "$out/guide-store-verify"
 for variant in baseline columnar; do
   dir="$PWD/$out/guide-store-cache-$variant"

@@ -1,5 +1,7 @@
 import Foundation
+#if os(macOS)
 import IOKit.pwr_mgt
+#endif
 import Libmpv
 import Observation
 import OSLog
@@ -412,7 +414,9 @@ final class MPVPlayer {
     /// Outstanding async property reads: fixed ring indexed by serial & mask.
     @ObservationIgnored private var propertyRequests = MPVPropertyRequestRing()
     @ObservationIgnored private var firstRenderedLoadGeneration = 0
+#if os(macOS)
     @ObservationIgnored private var displayPowerAssertion = IOPMAssertionID(0)
+#endif
     @ObservationIgnored private var holdsDisplayPowerAssertion = false
     @ObservationIgnored private var lastTelemetryFrameDrops: Int64 = 0
     @ObservationIgnored private var lastTelemetryDecoderDrops: Int64 = 0
@@ -1944,6 +1948,7 @@ final class MPVPlayer {
         }
     }
 
+#if os(macOS)
     private func acquireDisplayPowerAssertion() {
         guard !holdsDisplayPowerAssertion else { return }
         let reason = "Buffer is playing video" as CFString
@@ -1968,6 +1973,13 @@ final class MPVPlayer {
         displayPowerAssertion = IOPMAssertionID(0)
         AppLog.playback.info("display sleep assertion released")
     }
+#else
+    // iOS and tvOS keep the screen awake through the player view's idle
+    // timer; only the bookkeeping is shared.
+    private func acquireDisplayPowerAssertion() { holdsDisplayPowerAssertion = true }
+
+    private func releaseDisplayPowerAssertion() { holdsDisplayPowerAssertion = false }
+#endif
 
     private func refreshPlaybackTuningStats(
         renderProfile: String? = nil,

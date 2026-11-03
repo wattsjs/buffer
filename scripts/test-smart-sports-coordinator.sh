@@ -3,14 +3,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .local/bench
 swiftc -swift-version 6 -default-isolation MainActor \
-  -import-objc-header Buffer/Services/BufferProbe.h \
-  Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift \
-  Buffer/Models/EPGProgram.swift Buffer/Models/SmartSports.swift \
-  Buffer/Models/ServerConfig.swift Buffer/Models/VODItem.swift Buffer/Models/VODSeries.swift \
-  Buffer/Models/StreamProbe.swift Buffer/Support/PerfMetrics.swift Buffer/Support/AppLog.swift Buffer/Services/DataCache.swift \
-  Buffer/Support/GuideHistory.swift \
-  Buffer/Services/ServerPasswordStore.swift Buffer/Services/AccountCapacityLedger.swift \
-  Buffer/Services/SmartSportsCatalog.swift Buffer/Services/SmartSportsCatalogStore.swift \
-  Buffer/Services/SmartSportsSnapshotLoader.swift Buffer/Models/SmartChannelFilter.swift Buffer/Services/AutoChannelGrouper.swift Buffer/Services/SmartSportsCoordinator.swift \
+  -import-objc-header Shared/Services/BufferProbe.h \
+  Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift \
+  Shared/Models/EPGProgram.swift Shared/Models/SmartSports.swift \
+  Shared/Models/ServerConfig.swift Shared/Models/VODItem.swift Shared/Models/VODSeries.swift \
+  Shared/Models/StreamProbe.swift Shared/Support/PerfMetrics.swift Shared/Support/AppLog.swift Shared/Services/DataCache.swift \
+  Shared/Support/GuideHistory.swift \
+  Shared/Services/ServerPasswordStore.swift Shared/Services/AccountCapacityLedger.swift \
+  Shared/Services/SmartSportsCatalog.swift Shared/Services/SmartSportsCatalogStore.swift \
+  Shared/Services/SmartSportsSnapshotLoader.swift Shared/Models/SmartChannelFilter.swift Shared/Services/AutoChannelGrouper.swift Shared/Services/SmartSportsCoordinator.swift \
   benchmarks/smart_sports_coordinator_tests.swift -o .local/bench/smart-sports-coordinator-tests
 .local/bench/smart-sports-coordinator-tests

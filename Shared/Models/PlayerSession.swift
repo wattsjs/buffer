@@ -1,4 +1,6 @@
+#if os(macOS)
 import AppKit
+#endif
 import Foundation
 import Observation
 import OSLog
@@ -1073,7 +1075,9 @@ final class PlayerSession {
     /// The NSWindow hosting this session's PlayerView. Registered by the
     /// view so `PlayerSessionRegistry.deliver(_:)` can raise the window when
     /// it hands a new request to an already-open session.
+#if os(macOS)
     @ObservationIgnored weak var hostWindow: NSWindow?
+#endif
     /// A request delivered while this session's window is already open.
     /// PlayerView observes and consumes it.
     var externalRequest: PlaybackRequest?

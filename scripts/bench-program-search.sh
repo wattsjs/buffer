@@ -5,6 +5,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .local/bench
 swiftc -O -swift-version 6 -parse-as-library \
-    Buffer/Models/EPGProgram.swift Buffer/Views/ProgramSearchIndex.swift benchmarks/program_search_bench.swift \
+    Shared/Models/EPGProgram.swift Shared/Support/ProgramSearchIndex.swift benchmarks/program_search_bench.swift \
     -o .local/bench/program-search-bench
 .local/bench/program-search-bench "$@"

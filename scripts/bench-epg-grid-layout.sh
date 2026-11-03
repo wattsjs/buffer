@@ -4,8 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .local/bench
-swiftc -O -swift-version 5 -default-isolation MainActor -module-cache-path "${TMPDIR:-/tmp}/epg-module-cache" Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift \
-  Buffer/Support/EPGRowLayout.swift Buffer/Support/EPGGridStyle.swift Buffer/Support/EPGProgramCanvas.swift Buffer/Support/EPGTextLine.swift \
-  Buffer/Support/PerfMetrics.swift Buffer/Support/AppLog.swift Buffer/Views/EPGScrollGrid.swift \
+swiftc -O -swift-version 5 -default-isolation MainActor -module-cache-path "${TMPDIR:-/tmp}/epg-module-cache" Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift \
+  Shared/Support/EPGRowLayout.swift Buffer/Support/EPGGridStyle.swift Buffer/Support/EPGProgramCanvas.swift Buffer/Support/EPGTextLine.swift \
+  Shared/Support/PerfMetrics.swift Shared/Support/AppLog.swift Buffer/Views/EPGScrollGrid.swift \
   benchmarks/epg_grid_layout_benchmark.swift -o .local/bench/epg-grid-layout-benchmark
 .local/bench/epg-grid-layout-benchmark "$@"

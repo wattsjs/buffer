@@ -1,5 +1,7 @@
 import Foundation
+#if os(macOS)
 import AppKit
+#endif
 import Darwin
 import OSLog
 
@@ -8,7 +10,7 @@ import OSLog
 @MainActor
 enum SessionObservation {
     static var audioOutputOverride: String? {
-#if DEBUG
+#if DEBUG && os(macOS)
         let arguments = CommandLine.arguments
         guard arguments.contains("--observe-session") || arguments.contains("--saved-playback-scenario"),
               let i = arguments.firstIndex(of: "--observe-session-ao"),
@@ -19,7 +21,7 @@ enum SessionObservation {
         return nil
 #endif
     }
-#if DEBUG
+#if DEBUG && os(macOS)
     private static var task: Task<Void, Never>?
     private static var output: DiagnosticOutput?
     private static var didStart = false

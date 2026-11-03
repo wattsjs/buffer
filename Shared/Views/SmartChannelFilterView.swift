@@ -1,5 +1,6 @@
 import SwiftUI
 
+#if os(macOS)
 /// Window form of the country filter (Sources ▸ Country Filter…).
 struct SmartChannelFilterView: View {
     @Bindable var viewModel: EPGViewModel
@@ -62,6 +63,8 @@ struct CountryFilterToolbarButton: View {
     }
 }
 
+#endif
+
 enum CountryFilterSummary {
     /// "🇺🇸 🇬🇧 🇦🇺 🇳🇿 + Kids", or "All countries" when off.
     static func title(_ filter: SmartChannelFilter) -> String {
@@ -108,6 +111,7 @@ enum CountryFilterNames {
     }
 }
 
+#if !os(tvOS)
 /// Chooses which countries, languages and categories every source and Smart
 /// Channels show. Changes apply as they are made.
 struct CountryFilterEditor: View {
@@ -145,7 +149,11 @@ struct CountryFilterEditor: View {
                                   footer: "Channels whose name and group don't mention a country or language.")
                     if query.isEmpty, !showsAllRegions, inventory.count > visibleRegions.count {
                         Button("Show all \(inventory.count) countries and languages") { showsAllRegions = true }
+#if os(macOS)
                             .buttonStyle(.link)
+#else
+                            .buttonStyle(.borderless)
+#endif
                     }
                     Section {
                         HStack(spacing: 6) {
@@ -367,3 +375,4 @@ private struct RegionRow: View {
         })
     }
 }
+#endif

@@ -1,5 +1,9 @@
 import SwiftUI
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import OSLog
 
 /// Central coordinator for app lifecycle state (sleep, background, termination).
@@ -27,6 +31,7 @@ final class AppLifecycleCoordinator {
     }
 
     private func registerObservers() {
+#if os(macOS)
         // macOS sleep/wake
         sleepObserver = NotificationCenter.default.addObserver(
             forName: NSWorkspace.willSleepNotification,
@@ -55,6 +60,36 @@ final class AppLifecycleCoordinator {
             name: NSApplication.willTerminateNotification,
             object: nil
         )
+#else
+        // iOS / tvOS: the app is suspended in the background, so treat
+        // entering it like sleep and returning like wake.
+        sleepObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleWillSleep()
+            }
+        }
+
+        wakeObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleDidWake()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
+#endif
     }
 
     private func handleWillSleep() {
@@ -78,10 +113,12 @@ final class AppLifecycleCoordinator {
         // Resume player watchdogs / reconnects / cache timers for any open sessions.
         PlayerSessionRegistry.shared.resumeAllBackgroundWork()
 
+#if os(macOS)
         // Trigger recording wake reconciliation (Agent 05/09)
         Task { @MainActor in
             RecordingManager.shared.reconcileWakeEvents()
         }
+#endif
     }
 
     @objc private func handleWillTerminate() {

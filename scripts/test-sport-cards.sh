@@ -2,20 +2,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .local/bench
-swiftc Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift \
-  Buffer/Models/SportEvent.swift Buffer/Support/PerfMetrics.swift Buffer/Support/AppLog.swift Buffer/Services/StreamMatcher.swift \
-  Buffer/Support/SportEventMatchState.swift benchmarks/sport_card_matching_tests.swift \
+swiftc Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift \
+  Shared/Models/SportEvent.swift Shared/Support/PerfMetrics.swift Shared/Support/AppLog.swift Shared/Services/StreamMatcher.swift \
+  Shared/Support/SportEventMatchState.swift benchmarks/sport_card_matching_tests.swift \
   -o .local/bench/sport-card-tests
 .local/bench/sport-card-tests
-swiftc Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift \
-  Buffer/Models/SportEvent.swift Buffer/Support/PerfMetrics.swift Buffer/Support/AppLog.swift Buffer/Services/StreamMatcher.swift \
-  Buffer/Support/StreamMatchVisibility.swift Buffer/Support/SportsProgrammeBinding.swift benchmarks/stream_match_tests.swift \
+swiftc Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift \
+  Shared/Models/SportEvent.swift Shared/Support/PerfMetrics.swift Shared/Support/AppLog.swift Shared/Services/StreamMatcher.swift \
+  Shared/Support/StreamMatchVisibility.swift Shared/Support/SportsProgrammeBinding.swift benchmarks/stream_match_tests.swift \
   -o .local/bench/stream-match-tests
 .local/bench/stream-match-tests
 # Flat interned matcher vs the frozen pre-redesign String matcher (oracle),
 # plus the per-scalar Unicode normalisation table vs Foundation.
-matcher=(Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift
-         Buffer/Models/SportEvent.swift Buffer/Support/PerfMetrics.swift Buffer/Support/AppLog.swift Buffer/Services/StreamMatcher.swift
+matcher=(Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift
+         Shared/Models/SportEvent.swift Shared/Support/PerfMetrics.swift Shared/Support/AppLog.swift Shared/Services/StreamMatcher.swift
          benchmarks/sports_matching_fixture.swift)
 swiftc -O "${matcher[@]}" benchmarks/legacy_stream_matcher.swift benchmarks/sports_matching_equivalence_tests.swift \
   -o .local/bench/sports-matching-equivalence-tests

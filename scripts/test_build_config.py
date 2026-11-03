@@ -129,7 +129,7 @@ class BinaryMetadataTests(unittest.TestCase):
             for index, (flags, expected) in enumerate(profiles):
                 with self.subTest(flags=flags):
                     binary = root / f'metadata-{index}'
-                    subprocess.run(['swiftc', *flags, str(ROOT / 'Buffer/Support/BufferBuildConfiguration.swift'),
+                    subprocess.run(['swiftc', *flags, str(ROOT / 'Shared/Support/BufferBuildConfiguration.swift'),
                                     str(main), '-o', str(binary)], capture_output=True, text=True,
                                    timeout=60, check=True)
                     self.assertTrue(build_config.has_metadata_protocol(binary))

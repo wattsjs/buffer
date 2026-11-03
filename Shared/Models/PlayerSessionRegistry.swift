@@ -48,7 +48,9 @@ final class PlayerSessionRegistry {
             }
             session.focus(slotID: slot.id)
             session.externalRequest = request
+#if os(macOS)
             session.hostWindow?.makeKeyAndOrderFront(nil)
+#endif
             return true
         }
         return false
@@ -78,6 +80,7 @@ final class PlayerSessionRegistry {
 // The old proxy registry was removed — player sessions now key off
 // the upstream URL directly, so no external lookup table is needed.
 
+#if os(macOS)
 /// Context-menu item for the main window's channel rows. Shows only when
 /// there's an active player session that still has room for more slots.
 struct AddToMultiViewMenuItem: View {
@@ -107,3 +110,4 @@ struct AddToMultiViewMenuItem: View {
         }
     }
 }
+#endif

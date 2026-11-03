@@ -11,16 +11,73 @@
 		7DEE000500000000000000AA /* Nuke in Frameworks */ = {isa = PBXBuildFile; productRef = 7DEE000400000000000000AA /* Nuke */; };
 		7DEE002300000000000000AA /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = 7DEE002200000000000000AA /* MPVKit */; };
 		7DEE004300000000000000AA /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 7DEE004200000000000000AA /* Sparkle */; };
+		7DAA00310000000000000000 /* Nuke in Frameworks */ = {isa = PBXBuildFile; productRef = 7DAA00300000000000000000 /* Nuke */; };
+		7DAA00330000000000000000 /* NukeUI in Frameworks */ = {isa = PBXBuildFile; productRef = 7DAA00320000000000000000 /* NukeUI */; };
+		7DAA00350000000000000000 /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = 7DAA00340000000000000000 /* MPVKit */; };
+		7DAA00410000000000000000 /* Nuke in Frameworks */ = {isa = PBXBuildFile; productRef = 7DAA00400000000000000000 /* Nuke */; };
+		7DAA00430000000000000000 /* NukeUI in Frameworks */ = {isa = PBXBuildFile; productRef = 7DAA00420000000000000000 /* NukeUI */; };
+		7DAA00450000000000000000 /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = 7DAA00440000000000000000 /* MPVKit */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		7DAB001A0000000000000000 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 7DD210D42F8DDBCF00032A0F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 7DAA00100000000000000000;
+			remoteInfo = "Buffer iOS";
+		};
+		7DAB002A0000000000000000 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 7DD210D42F8DDBCF00032A0F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 7DAA00200000000000000000;
+			remoteInfo = "Buffer tvOS";
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		7DD210DC2F8DDBCF00032A0F /* Buffer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buffer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7DAA00110000000000000000 /* Buffer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buffer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7DAA00210000000000000000 /* Buffer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Buffer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7DAB00110000000000000000 /* Buffer iOS UITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Buffer iOS UITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		7DAB00210000000000000000 /* Buffer tvOS UITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Buffer tvOS UITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		7DD210DE2F8DDBCF00032A0F /* Buffer */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Buffer;
+			sourceTree = "<group>";
+		};
+		7DAA00010000000000000000 /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		7DAA00020000000000000000 /* SharedUI */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = SharedUI;
+			sourceTree = "<group>";
+		};
+		7DAA00030000000000000000 /* BufferMobile */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = BufferMobile;
+			sourceTree = "<group>";
+		};
+		7DAA00040000000000000000 /* BufferTV */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = BufferTV;
+			sourceTree = "<group>";
+		};
+		7DAB00120000000000000000 /* BufferMobileUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = BufferMobileUITests;
+			sourceTree = "<group>";
+		};
+		7DAB00220000000000000000 /* BufferTVUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = BufferTVUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -37,6 +94,40 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		7DAA00130000000000000000 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7DAA00310000000000000000 /* Nuke in Frameworks */,
+				7DAA00330000000000000000 /* NukeUI in Frameworks */,
+				7DAA00350000000000000000 /* MPVKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAA00230000000000000000 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7DAA00410000000000000000 /* Nuke in Frameworks */,
+				7DAA00430000000000000000 /* NukeUI in Frameworks */,
+				7DAA00450000000000000000 /* MPVKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAB00140000000000000000 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAB00240000000000000000 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -44,6 +135,12 @@
 			isa = PBXGroup;
 			children = (
 				7DD210DE2F8DDBCF00032A0F /* Buffer */,
+				7DAA00010000000000000000 /* Shared */,
+				7DAA00020000000000000000 /* SharedUI */,
+				7DAA00030000000000000000 /* BufferMobile */,
+				7DAA00040000000000000000 /* BufferTV */,
+				7DAB00120000000000000000 /* BufferMobileUITests */,
+				7DAB00220000000000000000 /* BufferTVUITests */,
 				7DD210DD2F8DDBCF00032A0F /* Products */,
 			);
 			sourceTree = "<group>";
@@ -52,6 +149,10 @@
 			isa = PBXGroup;
 			children = (
 				7DD210DC2F8DDBCF00032A0F /* Buffer.app */,
+				7DAB00210000000000000000 /* Buffer tvOS UITests.xctest */,
+				7DAB00110000000000000000 /* Buffer iOS UITests.xctest */,
+				7DAA00110000000000000000 /* Buffer.app */,
+				7DAA00210000000000000000 /* Buffer.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -73,6 +174,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				7DD210DE2F8DDBCF00032A0F /* Buffer */,
+				7DAA00010000000000000000 /* Shared */,
 			);
 			name = Buffer;
 			packageProductDependencies = (
@@ -84,6 +186,102 @@
 			productName = Buffer;
 			productReference = 7DD210DC2F8DDBCF00032A0F /* Buffer.app */;
 			productType = "com.apple.product-type.application";
+		};
+		7DAA00100000000000000000 /* Buffer iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7DAA00150000000000000000;
+			buildPhases = (
+				7DAA00120000000000000000 /* Sources */,
+				7DAA00130000000000000000 /* Frameworks */,
+				7DAA00140000000000000000 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				7DAA00010000000000000000 /* Shared */,
+				7DAA00020000000000000000 /* SharedUI */,
+				7DAA00030000000000000000,
+			);
+			name = "Buffer iOS";
+			packageProductDependencies = (
+				7DAA00300000000000000000 /* Nuke */,
+				7DAA00320000000000000000 /* NukeUI */,
+				7DAA00340000000000000000 /* MPVKit */,
+			);
+			productName = Buffer;
+			productReference = 7DAA00110000000000000000 /* Buffer.app */;
+			productType = "com.apple.product-type.application";
+		};
+		7DAA00200000000000000000 /* Buffer tvOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7DAA00250000000000000000;
+			buildPhases = (
+				7DAA00220000000000000000 /* Sources */,
+				7DAA00230000000000000000 /* Frameworks */,
+				7DAA00240000000000000000 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				7DAA00010000000000000000 /* Shared */,
+				7DAA00020000000000000000 /* SharedUI */,
+				7DAA00040000000000000000,
+			);
+			name = "Buffer tvOS";
+			packageProductDependencies = (
+				7DAA00400000000000000000 /* Nuke */,
+				7DAA00420000000000000000 /* NukeUI */,
+				7DAA00440000000000000000 /* MPVKit */,
+			);
+			productName = Buffer;
+			productReference = 7DAA00210000000000000000 /* Buffer.app */;
+			productType = "com.apple.product-type.application";
+		};
+		7DAB00100000000000000000 /* Buffer iOS UITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7DAB00160000000000000000;
+			buildPhases = (
+				7DAB00130000000000000000 /* Sources */,
+				7DAB00140000000000000000 /* Frameworks */,
+				7DAB00150000000000000000 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				7DAB00190000000000000000 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				7DAB00120000000000000000 /* BufferMobileUITests */,
+			);
+			name = "Buffer iOS UITests";
+			productName = "Buffer iOS UITests";
+			productReference = 7DAB00110000000000000000 /* Buffer iOS UITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		7DAB00200000000000000000 /* Buffer tvOS UITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7DAB00260000000000000000;
+			buildPhases = (
+				7DAB00230000000000000000 /* Sources */,
+				7DAB00240000000000000000 /* Frameworks */,
+				7DAB00250000000000000000 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				7DAB00290000000000000000 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				7DAB00220000000000000000 /* BufferTVUITests */,
+			);
+			name = "Buffer tvOS UITests";
+			productName = "Buffer tvOS UITests";
+			productReference = 7DAB00210000000000000000 /* Buffer tvOS UITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
 		};
 /* End PBXNativeTarget section */
 
@@ -97,6 +295,12 @@
 				TargetAttributes = {
 					7DD210DB2F8DDBCF00032A0F = {
 						CreatedOnToolsVersion = 26.4;
+					};
+					7DAA00100000000000000000 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+					7DAA00200000000000000000 = {
+						CreatedOnToolsVersion = 27.0;
 					};
 				};
 			};
@@ -120,12 +324,44 @@
 			projectRoot = "";
 			targets = (
 				7DD210DB2F8DDBCF00032A0F /* Buffer */,
+				7DAA00100000000000000000 /* Buffer iOS */,
+				7DAA00200000000000000000 /* Buffer tvOS */,
+				7DAB00100000000000000000 /* Buffer iOS UITests */,
+				7DAB00200000000000000000 /* Buffer tvOS UITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		7DD210DA2F8DDBCF00032A0F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAA00140000000000000000 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAA00240000000000000000 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAB00150000000000000000 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAB00250000000000000000 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -142,7 +378,48 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		7DAA00120000000000000000 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAA00220000000000000000 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAB00130000000000000000 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7DAB00230000000000000000 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		7DAB00190000000000000000 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 7DAA00100000000000000000 /* Buffer iOS */;
+			targetProxy = 7DAB001A0000000000000000 /* PBXContainerItemProxy */;
+		};
+		7DAB00290000000000000000 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 7DAA00200000000000000000 /* Buffer tvOS */;
+			targetProxy = 7DAB002A0000000000000000 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		7DD210E52F8DDBD000032A0F /* Debug */ = {
@@ -298,7 +575,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SDKROOT)/usr/include/libxml2",
-					"$(SRCROOT)/Buffer/ffmpeg-compat",
+					"$(SRCROOT)/Shared/ffmpeg-compat",
 				);
 				INFOPLIST_FILE = Config/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -315,8 +592,8 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Buffer/SwiftLibxml2";
-				SWIFT_OBJC_BRIDGING_HEADER = "Buffer/Buffer-Bridging-Header.h";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Shared/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/Buffer-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -351,7 +628,7 @@
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SDKROOT)/usr/include/libxml2",
-					"$(SRCROOT)/Buffer/ffmpeg-compat",
+					"$(SRCROOT)/Shared/ffmpeg-compat",
 				);
 				INFOPLIST_FILE = Config/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -368,10 +645,258 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Buffer/SwiftLibxml2";
-				SWIFT_OBJC_BRIDGING_HEADER = "Buffer/Buffer-Bridging-Header.h";
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Shared/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/Buffer-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		7DAA00160000000000000000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 35;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SDKROOT)/usr/include/libxml2",
+					"$(SRCROOT)/Shared/ffmpeg-compat",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = Buffer;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 4.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer;
+				PRODUCT_NAME = Buffer;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Shared/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/Buffer-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_FILE = "Config/Info-iOS.plist";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		7DAA00170000000000000000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 35;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SDKROOT)/usr/include/libxml2",
+					"$(SRCROOT)/Shared/ffmpeg-compat",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = Buffer;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 4.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer;
+				PRODUCT_NAME = Buffer;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Shared/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/Buffer-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				INFOPLIST_FILE = "Config/Info-iOS.plist";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		7DAA00260000000000000000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 35;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SDKROOT)/usr/include/libxml2",
+					"$(SRCROOT)/Shared/ffmpeg-compat",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = Buffer;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 4.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer;
+				PRODUCT_NAME = Buffer;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Shared/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/Buffer-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				INFOPLIST_FILE = "Config/Info-tvOS.plist";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UIUserInterfaceStyle = Automatic;
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Debug;
+		};
+		7DAA00270000000000000000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 35;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SDKROOT)/usr/include/libxml2",
+					"$(SRCROOT)/Shared/ffmpeg-compat",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = Buffer;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 4.0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer;
+				PRODUCT_NAME = Buffer;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_INCLUDE_PATHS = "$(inherited) $(SRCROOT)/Shared/SwiftLibxml2";
+				SWIFT_OBJC_BRIDGING_HEADER = "Shared/Buffer-Bridging-Header.h";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				INFOPLIST_FILE = "Config/Info-tvOS.plist";
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UIUserInterfaceStyle = Automatic;
+				SDKROOT = appletvos;
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Release;
+		};
+		7DAB00170000000000000000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer.iosuitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = "Buffer iOS";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		7DAB00180000000000000000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer.iosuitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = "Buffer iOS";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		7DAB00270000000000000000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer.tvuitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = "Buffer tvOS";
+				SDKROOT = appletvos;
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Debug;
+		};
+		7DAB00280000000000000000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Q7YAQ49F8V;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.wattsjs.buffer.tvuitests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = "Buffer tvOS";
+				SDKROOT = appletvos;
+				TARGETED_DEVICE_FAMILY = 3;
+				TVOS_DEPLOYMENT_TARGET = 26.0;
 			};
 			name = Release;
 		};
@@ -392,6 +917,42 @@
 			buildConfigurations = (
 				7DD210E82F8DDBD000032A0F /* Debug */,
 				7DD210E92F8DDBD000032A0F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7DAA00150000000000000000 /* Build configuration list for PBXNativeTarget "Buffer iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7DAA00160000000000000000 /* Debug */,
+				7DAA00170000000000000000 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7DAA00250000000000000000 /* Build configuration list for PBXNativeTarget "Buffer tvOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7DAA00260000000000000000 /* Debug */,
+				7DAA00270000000000000000 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7DAB00160000000000000000 /* Build configuration list for PBXNativeTarget "Buffer iOS UITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7DAB00170000000000000000 /* Debug */,
+				7DAB00180000000000000000 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7DAB00260000000000000000 /* Build configuration list for PBXNativeTarget "Buffer tvOS UITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7DAB00270000000000000000 /* Debug */,
+				7DAB00280000000000000000 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -445,6 +1006,36 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 7DEE004100000000000000AA /* XCRemoteSwiftPackageReference "Sparkle" */;
 			productName = Sparkle;
+		};
+		7DAA00300000000000000000 /* Nuke */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7DEE000100000000000000AA;
+			productName = Nuke;
+		};
+		7DAA00320000000000000000 /* NukeUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7DEE000100000000000000AA;
+			productName = NukeUI;
+		};
+		7DAA00340000000000000000 /* MPVKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7DEE002100000000000000AA;
+			productName = MPVKit;
+		};
+		7DAA00400000000000000000 /* Nuke */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7DEE000100000000000000AA;
+			productName = Nuke;
+		};
+		7DAA00420000000000000000 /* NukeUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7DEE000100000000000000AA;
+			productName = NukeUI;
+		};
+		7DAA00440000000000000000 /* MPVKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7DEE002100000000000000AA;
+			productName = MPVKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
