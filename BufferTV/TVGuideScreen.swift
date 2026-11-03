@@ -48,6 +48,7 @@ struct TVGuideGrid: View {
                 .scrollClipDisabled()
             }
         }
+        .defaultFocus($focused, .channel(0))
         .onAppear { resetPage() }
         .onMoveCommand { direction in page(direction) }
     }
@@ -209,7 +210,8 @@ struct TVCountryFilterView: View {
             }
             Section("Countries and languages") {
                 ForEach(inventory) { summary in
-                    Button { cycle(summary.region) } label: {
+                    // Gate in the action: `.disabled` drops rows from the focus chain.
+                    Button { if draft.isEnabled { cycle(summary.region) } } label: {
                         HStack {
                             Text(CountryFilterNames.flag(for: summary.region))
                             VStack(alignment: .leading) {
@@ -219,16 +221,19 @@ struct TVCountryFilterView: View {
                             Spacer()
                             Text(label(for: draft.regions[summary.region] ?? .off)).foregroundStyle(.secondary)
                         }
+                        .opacity(draft.isEnabled ? 1 : 0.5)
                     }
-                    .disabled(!draft.isEnabled)
                 }
             }
             Section("Always keep, from any country") {
                 ForEach(SmartChannelFilter.categories, id: \.self) { category in
                     Toggle(category, isOn: Binding(
                         get: { draft.alwaysInclude.contains(category) },
-                        set: { on in if on { draft.alwaysInclude.insert(category) } else { draft.alwaysInclude.remove(category) } }))
-                    .disabled(!draft.isEnabled)
+                        set: { on in
+                            guard draft.isEnabled else { return }
+                            if on { draft.alwaysInclude.insert(category) } else { draft.alwaysInclude.remove(category) }
+                        }))
+                    .opacity(draft.isEnabled ? 1 : 0.5)
                 }
             }
         }

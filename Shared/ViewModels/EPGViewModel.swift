@@ -2701,7 +2701,7 @@ class EPGViewModel {
         let removed = playlists.remove(at: index)
         resolveProvidedCredentials(for: removed)
         Task { _ = await ServerPasswordStore.deletePasswordAsync(for: removed.id) }
-#if os(macOS)
+#if !os(tvOS)
         NotificationManager.shared.cancelReminders(forPlaylistID: id)
 #endif
         savePlaylists()

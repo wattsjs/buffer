@@ -1,6 +1,11 @@
+#if !os(tvOS)
 import Foundation
 import UserNotifications
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import OSLog
 import SwiftUI
 
@@ -295,6 +300,7 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         return base + "\n" + program.description
     }
 
+#if os(macOS)
     private func presentDeniedAlert() {
         let alert = NSAlert()
         alert.messageText = "Notifications are off for Buffer"
@@ -308,6 +314,18 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
             }
         }
     }
+#else
+    /// iOS: explain in a toast and offer the app's notification settings.
+    private func presentDeniedAlert() {
+        AppFeedbackCenter.shared.show(AppFeedbackMessage(
+            title: "Notifications are off for Buffer",
+            message: "Allow notifications for Buffer in Settings to get programme reminders.",
+            symbol: "bell.slash", tone: .warning, showsActivity: false))
+        if let url = URL(string: UIApplication.openNotificationSettingsURLString) {
+            UIApplication.shared.open(url)
+        }
+    }
+#endif
 
     // MARK: - UNUserNotificationCenterDelegate
 
@@ -331,10 +349,13 @@ final class NotificationManager: NSObject, @preconcurrency UNUserNotificationCen
         removeFromIndex(id: id)
         saveReminders()
 
+#if os(macOS)
         NSApp.activate(ignoringOtherApps: true)
+#endif
         NotificationCenter.default.post(
             name: Self.openStreamNotification,
             object: reminder
         )
     }
 }
+#endif

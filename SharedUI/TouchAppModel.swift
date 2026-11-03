@@ -62,6 +62,9 @@ final class TouchAppModel {
     func launch() async {
         guard !didLaunch else { return }
         didLaunch = true
+#if os(iOS)
+        Task { await NotificationManager.shared.bootstrap() }
+#endif
         await viewModel.hydrate()
         AppLog.sync.info("Launch hydration finished channels=\(self.viewModel.channels.count, privacy: .public)")
         viewModel.syncOnLaunchIfNeeded()
@@ -77,6 +80,18 @@ final class TouchAppModel {
             updateSportsContext()
             sports.refresh()
             sports.startAutoRefresh()
+        }
+    }
+
+    /// A reminder notification was tapped: play its channel when it resolves.
+    func openReminder(_ reminder: ProgramReminder) {
+        Task { @MainActor in
+            if let channel = await viewModel.resolveReminder(reminder) {
+                openChannel(channel)
+            } else {
+                AppFeedbackCenter.shared.show(.reminderChannelMissing(
+                    playlistName: viewModel.activePlaylist?.name ?? "", channelName: reminder.channelName))
+            }
         }
     }
 
@@ -126,6 +141,11 @@ struct TouchAppObservers: ViewModifier {
                 model.updateSearchIndex()
                 model.updateSportsContext()
             }
+#if os(iOS)
+            .onReceive(NotificationCenter.default.publisher(for: NotificationManager.openStreamNotification)) { note in
+                if let reminder = note.object as? ProgramReminder { model.openReminder(reminder) }
+            }
+#endif
             .onChange(of: viewModel.smartSports.errorMessage) { _, message in
                 if viewModel.isSmartSportsActive, let message { viewModel.showSmartActionUnavailable(message) }
             }

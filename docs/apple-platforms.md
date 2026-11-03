@@ -25,6 +25,17 @@ Both read the same `EPGRowLayout` SoA columns as the Mac grid.
 - iOS/iPadOS: `GuideGridScrollView` keeps only the rows in the viewport, reuses row views, and draws just the cells in the visible time span; the channel column and time strip are sticky.
 - tvOS: lazy rows of focusable cards for a three-hour page; moving focus past either edge pages the timeline.
 
+## Icons
+
+`python3 scripts/make_app_icons.py` regenerates both icon sets from the Mac icon's TV glyph: a full-bleed 1024 iOS icon with light, dark (transparent, the system draws the dark backdrop) and tinted (grayscale) appearances, and the tvOS "App Icon & Top Shelf Image" brand assets (Back/Middle/Front layers for parallax, App Store icon, Top Shelf and wide Top Shelf).
+
+## Platform features
+
+- Reminders (iOS/iPadOS): touch and hold a programme in the guide for Remind Me (at start, 5/15/60 minutes before), Play from Start, Play Channel and Favorites; Settings → Programme Reminders lists and cancels them, and tapping a delivered reminder plays its channel. tvOS can't show alert notifications, so reminders stay off there.
+- Accessibility: the iOS guide draws its cells, so it publishes one accessibility element per visible channel and programme (label, time, "on now"), activatable to play.
+- AirPlay: the iOS player has the system route picker. Picture in Picture would need mpv to render into sample buffers for an `AVSampleBufferDisplayLayer`; not implemented.
+- tvOS focus: the guide sets a default focus on the first channel, controls are gated in their actions rather than `.disabled` (which drops them from the focus chain), and empty states offer a focusable action.
+
 ## Building and checking
 
 ```bash
@@ -32,7 +43,7 @@ scripts/build-touch.sh ios
 scripts/build-touch.sh tvos
 ```
 
-UI walk-throughs add an Xtream source against a local fixture, browse the guide, Sports and the country filter, and play a channel. Full-screen captures land in `.logs/shots/<device>/named/`.
+UI walk-throughs add an Xtream source against a local fixture and exercise the guide, reminders, settings, search, Sports, the country filter, Smart Channels, the player (with AirPlay on iOS) and rotation; on tvOS they drive everything with the Siri Remote. Full-screen captures land in `.logs/shots/<device>/named/`.
 
 ```bash
 python3 scripts/fake_xtream_server.py

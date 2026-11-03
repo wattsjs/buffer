@@ -107,7 +107,7 @@ final class AppFeedbackCenter {
             toast = nil
         }
     }
-#if os(macOS)
+#if !os(tvOS)
     func showReminderResult(
         playlistID: UUID,
         program: EPGProgram,

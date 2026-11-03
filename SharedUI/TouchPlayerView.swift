@@ -1,3 +1,4 @@
+import AVKit
 import SwiftUI
 
 /// Full-screen player for iOS, iPadOS and tvOS. One `PlayerSession` with a
@@ -139,6 +140,11 @@ struct TouchPlayerView: View {
                     .background(Capsule().fill(isCatchup ? Color.orange : Color.red))
                     .opacity(channel.isOnDemand ? 0 : 1)
                 Button { showChannels = true } label: { Label("Channels", systemImage: "list.bullet") }
+#if os(iOS)
+                AirPlayButton()
+                    .frame(width: 44, height: 44)
+                    .accessibilityLabel("AirPlay")
+#endif
             }
             .labelStyle(.titleAndIcon)
             .padding()
@@ -252,3 +258,18 @@ struct TouchPlayerView: View {
         }
     }
 }
+
+#if os(iOS)
+/// System AirPlay route picker (audio routes and video-capable receivers).
+private struct AirPlayButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.prioritizesVideoDevices = true
+        picker.tintColor = .white
+        picker.activeTintColor = .systemTeal
+        return picker
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+#endif

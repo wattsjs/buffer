@@ -223,6 +223,15 @@ struct SettingsScreen: View {
                 Button { adding = true } label: { Label("Add Source", systemImage: "plus") }
                     .accessibilityIdentifier("add-source")
             }
+#if os(iOS)
+            Section("Reminders") {
+                NavigationLink {
+                    RemindersScreen(model: model)
+                } label: {
+                    LabeledContent("Programme Reminders", value: "\(NotificationManager.shared.reminders.count)")
+                }
+            }
+#endif
             Section("Library") {
                 Button { model.viewModel.sync() } label: { Label("Refresh Now", systemImage: "arrow.clockwise") }
                 Button { model.isEditingCountryFilter = true } label: {
@@ -305,7 +314,14 @@ struct SportsListView: View {
                 if sports.isLoading || !sports.hasLoadedOnce {
                     ProgressView("Loading fixtures…")
                 } else {
-                    ContentUnavailableView("No events", systemImage: "sportscourt")
+                    ContentUnavailableView {
+                        Label("No events", systemImage: "sportscourt")
+                    } description: {
+                        Text(sports.refreshWarning ?? "Fixtures couldn't be loaded right now.")
+                    } actions: {
+                        // Also gives the tvOS focus engine a target on this screen.
+                        Button("Refresh") { sports.refresh() }
+                    }
                 }
             }
         }
@@ -429,3 +445,41 @@ struct TouchSearchResults: View {
         }
     }
 }
+
+#if os(iOS)
+/// Upcoming programme reminders; tap to play, swipe to cancel.
+struct RemindersScreen: View {
+    let model: TouchAppModel
+
+    private var reminders: [ProgramReminder] {
+        NotificationManager.shared.reminders.sorted { $0.programStart < $1.programStart }
+    }
+
+    var body: some View {
+        List {
+            ForEach(reminders) { reminder in
+                Button { model.openReminder(reminder) } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(reminder.programTitle).font(.body.weight(.medium))
+                        Text("\(reminder.channelName) · \(reminder.programStart.formatted(.dateTime.weekday(.abbreviated).hour().minute()))")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text("Notifies \(GuideMenus.lead(reminder.leadMinutes))")
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .onDelete { offsets in
+                let ids = offsets.map { reminders[$0].id }
+                ids.forEach { NotificationManager.shared.cancelReminder(id: $0) }
+            }
+        }
+        .overlay {
+            if reminders.isEmpty {
+                ContentUnavailableView("No reminders", systemImage: "bell",
+                    description: Text("Touch and hold a programme in the guide to get a reminder before it starts."))
+            }
+        }
+        .navigationTitle("Reminders")
+    }
+}
+#endif

@@ -158,7 +158,9 @@ struct GuideScreen: View {
                             model.openChannel(channel)
                         }
                     },
-                    onVisibleChannels: { viewModel.syncCatchupGuideIfNeeded(for: $0) }
+                    onVisibleChannels: { viewModel.syncCatchupGuideIfNeeded(for: $0) },
+                    reminderIDs: reminderIDs,
+                    menu: { channel, program in GuideMenus.elements(model: model, channel: channel, program: program) }
                 )
                 .ignoresSafeArea(edges: .bottom)
             }
@@ -191,6 +193,11 @@ struct GuideScreen: View {
         .onAppear {
             if case .home = viewModel.selection { viewModel.selection = .allChannels }
         }
+    }
+
+    private var reminderIDs: Set<String> {
+        guard let playlistID = model.viewModel.displayedPlaylistID else { return [] }
+        return Set(NotificationManager.shared.reminders.lazy.filter { $0.playlistID == playlistID }.map(\.programID))
     }
 
     private var title: String {
@@ -273,18 +280,39 @@ private struct CountryFilterButton: View {
 
 private struct SyncBanner: View {
     let viewModel: EPGViewModel
+    @State private var feedback = AppFeedbackCenter.shared
 
     var body: some View {
-        if viewModel.isRefreshing || viewModel.smartSports.isLoading {
-            HStack(spacing: 8) {
-                ProgressView()
-                Text(viewModel.smartSports.isLoading ? "Loading Smart Channels…" : (viewModel.loadingStage ?? "Syncing…"))
-                    .font(.footnote)
+        VStack(spacing: 8) {
+            if viewModel.isRefreshing || viewModel.smartSports.isLoading {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text(viewModel.smartSports.isLoading ? "Loading Smart Channels…" : (viewModel.loadingStage ?? "Syncing…"))
+                        .font(.footnote)
+                }
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .glassEffect()
+                .allowsHitTesting(false)
             }
-            .padding(.horizontal, 14).padding(.vertical, 8)
-            .glassEffect()
-            .padding(.bottom, 60)
-            .allowsHitTesting(false)
+            if let toast = feedback.toast {
+                Button { feedback.dismiss() } label: {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: toast.symbol).foregroundStyle(toast.tone.accent)
+                        VStack(alignment: .leading, spacing: 2) {
+                            if let title = toast.title { Text(title).font(.subheadline.weight(.semibold)) }
+                            Text(toast.message).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .frame(maxWidth: 520, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(in: .rect(cornerRadius: 16))
+                .accessibilityHint("Dismisses the message")
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
+        .padding(.horizontal)
+        .padding(.bottom, 60)
     }
 }

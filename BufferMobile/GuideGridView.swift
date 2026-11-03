@@ -15,6 +15,10 @@ struct GuideGrid: UIViewRepresentable {
     let onSelectChannel: (Channel) -> Void
     let onSelectProgram: (Channel, EPGProgram) -> Void
     var onVisibleChannels: ([Channel]) -> Void = { _ in }
+    /// Programme IDs with a reminder for the displayed source (bell marker).
+    var reminderIDs: Set<String> = []
+    /// Long-press menu for a channel, or for one of its programmes.
+    var menu: (Channel, EPGProgram?) -> [UIMenuElement] = { _, _ in [] }
 
     func makeUIView(context: Context) -> GuideGridScrollView {
         let view = GuideGridScrollView()
@@ -27,13 +31,13 @@ struct GuideGrid: UIViewRepresentable {
 
     private func update(_ view: GuideGridScrollView) {
         view.callbacks = .init(programs: programs, selectChannel: onSelectChannel,
-                               selectProgram: onSelectProgram, visibleChannels: onVisibleChannels)
+                               selectProgram: onSelectProgram, visibleChannels: onVisibleChannels, menu: menu)
         view.configure(channels: channels, channelSetVersion: channelSetVersion, guideVersion: guideVersion,
-                       metrics: compact ? .compact : .regular)
+                       reminderIDs: reminderIDs, metrics: compact ? .compact : .regular)
     }
 }
 
-final class GuideGridScrollView: UIScrollView, UIScrollViewDelegate {
+final class GuideGridScrollView: UIScrollView, UIScrollViewDelegate, UIContextMenuInteractionDelegate {
     struct Metrics: Equatable {
         var rowHeight: CGFloat
         var channelColumnWidth: CGFloat
@@ -49,12 +53,16 @@ final class GuideGridScrollView: UIScrollView, UIScrollViewDelegate {
         var selectChannel: (Channel) -> Void = { _ in }
         var selectProgram: (Channel, EPGProgram) -> Void = { _, _ in }
         var visibleChannels: ([Channel]) -> Void = { _ in }
+        var menu: (Channel, EPGProgram?) -> [UIMenuElement] = { _, _ in [] }
     }
 
     var callbacks = Callbacks()
     private var channels: [Channel] = []
     private var channelSetVersion = -1
     private var guideVersion = -1
+    private var reminderIDs: Set<String> = []
+    private var accessibilityCache: [UIAccessibilityElement] = []
+    private var menuHighlight: (view: UIView, rect: CGRect)?
     private var metrics = Metrics.regular
     private var window_ = GuideTimelineWindow(pixelsPerMinute: Metrics.regular.pixelsPerMinute)
     private var now = Date()
@@ -83,6 +91,10 @@ final class GuideGridScrollView: UIScrollView, UIScrollViewDelegate {
         addSubview(header)
         addSubview(corner)
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTap(_:))))
+        addInteraction(UIContextMenuInteraction(delegate: self))
+        // Cells are drawn, not views: VoiceOver reads the elements built in
+        // `layoutSubviews` instead of the scroll view itself.
+        isAccessibilityElement = false
         clock = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -92,10 +104,13 @@ final class GuideGridScrollView: UIScrollView, UIScrollViewDelegate {
 
     deinit { clock?.invalidate() }
 
-    func configure(channels: [Channel], channelSetVersion: Int, guideVersion: Int, metrics: Metrics) {
+    func configure(channels: [Channel], channelSetVersion: Int, guideVersion: Int, reminderIDs: Set<String>,
+                   metrics: Metrics) {
         let channelsChanged = channelSetVersion != self.channelSetVersion || channels.count != self.channels.count
         let metricsChanged = metrics != self.metrics
-        guard channelsChanged || metricsChanged || guideVersion != self.guideVersion else { return }
+        guard channelsChanged || metricsChanged || guideVersion != self.guideVersion
+                || reminderIDs != self.reminderIDs else { return }
+        self.reminderIDs = reminderIDs
         self.channels = channels
         self.channelSetVersion = channelSetVersion
         self.guideVersion = guideVersion
@@ -160,7 +175,7 @@ final class GuideGridScrollView: UIScrollView, UIScrollViewDelegate {
             }()
             if row.isStale || row.channelID != channel.id {
                 row.load(channel: channel, programs: callbacks.programs(channel, window_.start, window_.end),
-                         window: window_, rowHeight: m.rowHeight, now: now)
+                         window: window_, rowHeight: m.rowHeight, now: now, reminderIDs: reminderIDs)
             }
             row.frame = CGRect(x: offset.x + m.channelColumnWidth, y: y, width: timelineWidth, height: m.rowHeight)
             row.setTimelineOffset(offset.x)
@@ -188,25 +203,121 @@ final class GuideGridScrollView: UIScrollView, UIScrollViewDelegate {
             lastVisibleRange = visible
             callbacks.visibleChannels(Array(channels[visible]))
         }
+        rebuildAccessibilityElements(visible: visible, timelineWidth: timelineWidth)
+    }
+
+    // MARK: - Hit testing, menus and accessibility
+
+    /// The channel (and programme, if any) under a point in content space.
+    private func target(at point: CGPoint) -> (channel: Channel, program: EPGProgram?)? {
+        let m = metrics
+        let rowIndex = Int((point.y - m.headerHeight) / m.rowHeight)
+        guard point.y >= contentOffset.y + m.headerHeight, channels.indices.contains(rowIndex) else { return nil }
+        let channel = channels[rowIndex]
+        guard point.x - contentOffset.x >= m.channelColumnWidth, let row = rows[rowIndex] else { return (channel, nil) }
+        let localY = point.y - (m.headerHeight + CGFloat(rowIndex) * m.rowHeight)
+        return (channel, row.program(atTimelineX: Double(point.x - m.channelColumnWidth), y: Double(localY)))
+    }
+
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        guard let target = target(at: location) else { return nil }
+        let elements = callbacks.menu(target.channel, target.program)
+        guard !elements.isEmpty else { return nil }
+        menuHighlight = highlightRect(at: location)
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in
+            UIMenu(title: target.program?.title ?? target.channel.name, children: elements)
+        }
+    }
+
+    /// Lift only the pressed cell (or channel name), not the whole grid.
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configuration: UIContextMenuConfiguration,
+                                highlightPreviewForItemWithIdentifier identifier: any NSCopying) -> UITargetedPreview? {
+        guard let (view, rect) = menuHighlight else { return nil }
+        let parameters = UIPreviewParameters()
+        parameters.visiblePath = UIBezierPath(roundedRect: rect, cornerRadius: 6)
+        let center = view.convert(CGPoint(x: rect.midX, y: rect.midY), to: self)
+        return UITargetedPreview(view: view, parameters: parameters,
+                                 target: UIPreviewTarget(container: self, center: center))
+    }
+
+    /// The drawn view and rect (in its coordinates) under a long-press.
+    private func highlightRect(at point: CGPoint) -> (view: UIView, rect: CGRect)? {
+        let m = metrics
+        let rowIndex = Int((point.y - m.headerHeight) / m.rowHeight)
+        guard channels.indices.contains(rowIndex) else { return nil }
+        if point.x - contentOffset.x < m.channelColumnWidth {
+            guard let cell = channelCells[rowIndex] else { return nil }
+            return (cell, cell.bounds)
+        }
+        guard let row = rows[rowIndex],
+              let rect = row.cellRect(atTimelineX: point.x - m.channelColumnWidth) else { return nil }
+        // Row views are viewport-wide and draw from the timeline offset.
+        return (row, rect.offsetBy(dx: -contentOffset.x, dy: 0).intersection(row.bounds))
+    }
+
+    private func rebuildAccessibilityElements(visible: Range<Int>, timelineWidth: CGFloat) {
+        let m = metrics
+        var elements: [UIAccessibilityElement] = []
+        let clock = EPGClockText.shared
+        for index in visible {
+            let channel = channels[index]
+            let y = m.headerHeight + CGFloat(index) * m.rowHeight
+            let channelElement = GuideAccessibilityElement(accessibilityContainer: self) { [weak self] in
+                self?.callbacks.selectChannel(channel)
+            }
+            channelElement.accessibilityLabel = channel.name
+            channelElement.accessibilityHint = "Plays the channel"
+            channelElement.accessibilityTraits = .button
+            channelElement.accessibilityFrameInContainerSpace = CGRect(x: contentOffset.x, y: y,
+                                                                      width: m.channelColumnWidth, height: m.rowHeight)
+            elements.append(channelElement)
+            guard let row = rows[index] else { continue }
+            for cell in row.visibleCells(minX: contentOffset.x, width: timelineWidth) {
+                let program = cell.program
+                let element = GuideAccessibilityElement(accessibilityContainer: self) { [weak self] in
+                    self?.callbacks.selectProgram(channel, program)
+                }
+                let times = clock.compactRange(start: program.start.timeIntervalSinceReferenceDate,
+                                               end: program.end.timeIntervalSinceReferenceDate)
+                element.accessibilityLabel = "\(program.title), \(channel.name)"
+                element.accessibilityValue = cell.isLive ? "On now, \(times)" : times
+                element.accessibilityTraits = .button
+                element.accessibilityFrameInContainerSpace = cell.rect.offsetBy(dx: m.channelColumnWidth, dy: y)
+                elements.append(element)
+            }
+        }
+        accessibilityCache = elements
+    }
+
+    override var accessibilityElements: [Any]? {
+        get { accessibilityCache }
+        set {}
     }
 
     @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
-        let point = recognizer.location(in: self)
-        let m = metrics
-        let rowIndex = Int((point.y - m.headerHeight) / m.rowHeight)
-        guard point.y >= contentOffset.y + m.headerHeight, channels.indices.contains(rowIndex) else { return }
-        let channel = channels[rowIndex]
-        if point.x - contentOffset.x < m.channelColumnWidth {
-            callbacks.selectChannel(channel)
-            return
-        }
-        guard let row = rows[rowIndex] else { return }
-        let localY = point.y - (m.headerHeight + CGFloat(rowIndex) * m.rowHeight)
-        if let program = row.program(atTimelineX: Double(point.x - m.channelColumnWidth), y: Double(localY)) {
-            callbacks.selectProgram(channel, program)
+        guard let target = target(at: recognizer.location(in: self)) else { return }
+        if let program = target.program {
+            callbacks.selectProgram(target.channel, program)
         } else {
-            callbacks.selectChannel(channel)
+            callbacks.selectChannel(target.channel)
         }
+    }
+}
+
+/// An accessibility element for one drawn guide cell; activating it plays.
+final class GuideAccessibilityElement: UIAccessibilityElement {
+    private let activate: () -> Void
+
+    init(accessibilityContainer: Any, activate: @escaping () -> Void) {
+        self.activate = activate
+        super.init(accessibilityContainer: accessibilityContainer)
+    }
+
+    override func accessibilityActivate() -> Bool {
+        activate()
+        return true
     }
 }
 
@@ -230,12 +341,14 @@ final class GuideRowView: UIView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func load(channel: Channel, programs: [EPGProgram], window: GuideTimelineWindow, rowHeight: CGFloat, now: Date) {
+    func load(channel: Channel, programs: [EPGProgram], window: GuideTimelineWindow, rowHeight: CGFloat, now: Date,
+              reminderIDs: Set<String>) {
         channelID = channel.id
         self.programs = programs
         replayStart = channel.archiveWindow(now: now)?.start
         layout.build(programs: programs, timelineStart: window.start, pixelsPerMinute: window.pixelsPerMinute,
-                     timelineWidth: window.width, rowHeight: Double(rowHeight), showGaps: channel.supportsRewind)
+                     timelineWidth: window.width, rowHeight: Double(rowHeight), showGaps: channel.supportsRewind,
+                     reminderIDs: reminderIDs)
         layout.applyState(now: now, replayStart: replayStart)
         isStale = false
         setNeedsDisplay()
@@ -254,6 +367,33 @@ final class GuideRowView: UIView {
         let index = Int(layout.source[cell])
         return programs.indices.contains(index) ? programs[index] : nil
     }
+
+    /// The programme cell spanning a timeline x, in row coordinates.
+    func cellRect(atTimelineX x: CGFloat) -> CGRect? {
+        let cell = layout.firstCell(endingAfter: Double(x))
+        guard cell < layout.count, CGFloat(layout.x[cell]) <= x, !layout.isGap(cell) else { return nil }
+        return layout.rect(cell)
+    }
+
+    /// Programme cells intersecting the visible span, in row coordinates.
+    func visibleCells(minX: CGFloat, width: CGFloat) -> [(rect: CGRect, program: EPGProgram, isLive: Bool)] {
+        var result: [(CGRect, EPGProgram, Bool)] = []
+        var cell = layout.firstCell(endingAfter: Double(minX))
+        while cell < layout.count, CGFloat(layout.x[cell]) < minX + width {
+            defer { cell += 1 }
+            let index = Int(layout.source[cell])
+            guard !layout.isGap(cell), programs.indices.contains(index) else { continue }
+            var rect = layout.rect(cell)
+            let left = max(rect.minX, minX)
+            rect = CGRect(x: left, y: rect.minY, width: min(rect.maxX, minX + width) - left, height: rect.height)
+            result.append((rect, programs[index], layout.flags[cell] & EPGCellFlags.live != 0))
+        }
+        return result
+    }
+
+    private static let bell = UIImage(systemName: "bell.fill",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .semibold))?
+        .withTintColor(.systemOrange, renderingMode: .alwaysOriginal)
 
     private static let titleAttributes: [NSAttributedString.Key: Any] = [
         .font: UIFont.systemFont(ofSize: 14, weight: .semibold), .foregroundColor: UIColor.label,
@@ -299,6 +439,9 @@ final class GuideRowView: UIView {
             let textWidth = frame.maxX - textX - 6
             guard textWidth > 12 else { continue }
             let past = flags & EPGCellFlags.past != 0
+            if flags & EPGCellFlags.reminder != 0, let bell = Self.bell, frame.width > 40 {
+                bell.draw(at: CGPoint(x: frame.maxX - bell.size.width - 6, y: frame.minY + 6))
+            }
             (programs[index].title as NSString).draw(
                 with: CGRect(x: textX, y: frame.minY + 7, width: textWidth, height: 18),
                 options: [.truncatesLastVisibleLine, .usesLineFragmentOrigin],
