@@ -2,8 +2,8 @@ import Foundation
 
 // Ledger hot paths: one snapshot per Smart variant during selection and
 // availability passes, and reserve/teardown churn from probes and players.
-// swiftc -O -swift-version 6 Buffer/Models/ServerConfig.swift Buffer/Models/SourceChannelIdentity.swift \
-//   Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift Buffer/Services/AccountCapacityLedger.swift \
+// swiftc -O -swift-version 6 Shared/Models/ServerConfig.swift Shared/Models/SourceChannelIdentity.swift \
+//   Shared/Models/Channel.swift Shared/Models/EPGProgram.swift Shared/Services/AccountCapacityLedger.swift \
 //   benchmarks/account_capacity_benchmark.swift -o .local/bench/account-capacity-bench
 
 @main struct AccountCapacityBenchmark {

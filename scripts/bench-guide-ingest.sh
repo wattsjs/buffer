@@ -10,14 +10,14 @@ RUNS="${RUNS:-5}"
 OUT=.local/bench/ingest
 mkdir -p "$OUT/before" "$OUT/fx"
 CACHE="${TMPDIR:-/tmp}/ingest-module-cache"
-git show "$BASE_REF:Buffer/Services/XMLTVParser.swift" > "$OUT/before/XMLTVParser.swift"
-git show "$BASE_REF:Buffer/Services/M3UParser.swift" > "$OUT/before/M3UParser.swift"
-COMMON=(Buffer/Models/EPGProgram.swift Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift
-        Buffer/Models/VODItem.swift Buffer/Support/AppLog.swift Buffer/Support/PerfMetrics.swift)
-FLAGS=(-O -module-cache-path "$CACHE" -I Buffer/SwiftLibxml2 -import-objc-header Buffer/Support/ChannelIdentityEncoding.h)
+git show "$BASE_REF:Shared/Services/XMLTVParser.swift" > "$OUT/before/XMLTVParser.swift"
+git show "$BASE_REF:Shared/Services/M3UParser.swift" > "$OUT/before/M3UParser.swift"
+COMMON=(Shared/Models/EPGProgram.swift Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift
+        Shared/Models/VODItem.swift Shared/Support/AppLog.swift Shared/Support/PerfMetrics.swift)
+FLAGS=(-O -module-cache-path "$CACHE" -I Shared/SwiftLibxml2 -import-objc-header Shared/Support/ChannelIdentityEncoding.h)
 swiftc "${FLAGS[@]}" -D LEGACY_INGEST "${COMMON[@]}" "$OUT/before/XMLTVParser.swift" "$OUT/before/M3UParser.swift" \
   benchmarks/guide_ingest_benchmark.swift -o "$OUT/before/bench"
-swiftc "${FLAGS[@]}" "${COMMON[@]}" Buffer/Services/XMLTVParser.swift Buffer/Services/M3UParser.swift \
+swiftc "${FLAGS[@]}" "${COMMON[@]}" Shared/Services/XMLTVParser.swift Shared/Services/M3UParser.swift \
   benchmarks/guide_ingest_benchmark.swift -o "$OUT/after-bench"
 [ -f "$OUT/fx/guide.xml" ] || "$OUT/after-bench" gen-xml "$OUT/fx/guide.xml" 4000 500 0
 [ -f "$OUT/fx/guide-interleaved.xml" ] || "$OUT/after-bench" gen-xml "$OUT/fx/guide-interleaved.xml" 2000 200 1

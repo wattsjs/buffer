@@ -27,11 +27,11 @@ def digest(path):
 
 def compile_driver(name, model):
     executable = ROOT / '.local/bench' / f'library-memory-{name}'
-    paths = [model if p == 'Buffer/Support/PerfMetrics.swift', 'Buffer/Support/AppLog.swift', 'Buffer/ViewModels/EPGViewModel.swift' else ROOT / p for p in SOURCES]
+    paths = [model if p == 'Shared/Support/PerfMetrics.swift', 'Shared/Support/AppLog.swift', 'Shared/ViewModels/EPGViewModel.swift' else ROOT / p for p in SOURCES]
     header = ROOT / BRIDGE_HEADER
     inputs = paths + [header]
     input_hashes = [digest(p) for p in inputs]
-    subprocess.run(['swiftc', '-O', '-I', str(ROOT / 'Buffer/SwiftLibxml2'),
+    subprocess.run(['swiftc', '-O', '-I', str(ROOT / 'Shared/SwiftLibxml2'),
                     '-import-objc-header', str(header),
                     *map(str, paths), '-o', str(executable)], cwd=ROOT, check=True, timeout=90)
     if input_hashes != [digest(p) for p in inputs]:
@@ -68,7 +68,7 @@ def run():
     prior = json.loads(args.compare.read_text()) if args.compare else None
     run_id = uuid.uuid4().hex[:12]
     (ROOT / '.local/bench').mkdir(parents=True, exist_ok=True)
-    executable, hashes = compile_driver('after-' + run_id, ROOT / 'Buffer/ViewModels/EPGViewModel.swift')
+    executable, hashes = compile_driver('after-' + run_id, ROOT / 'Shared/ViewModels/EPGViewModel.swift')
     report = dict(schemaVersion=1, fixture='library-search-unmatched-v1', configuration='optimized',
                   recordedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                   sourceHashes=hashes, executableSHA256=digest(executable), after=[],

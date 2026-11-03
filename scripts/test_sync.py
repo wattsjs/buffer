@@ -18,20 +18,19 @@ import urllib.parse
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BRIDGE_HEADER = 'benchmarks/epg_test_bridge.h'
 SOURCES = [
-    'Buffer/Models/SourceChannelIdentity.swift', 'Buffer/Models/Channel.swift', 'Buffer/Models/EPGProgram.swift',
-    'Buffer/Models/ServerConfig.swift', 'Buffer/Models/VODItem.swift',
-    'Buffer/Models/StreamProbe.swift',
-    'Buffer/Models/SmartSports.swift', 'Buffer/Services/AccountCapacityLedger.swift',
-    'Buffer/Services/SmartSportsCatalog.swift', 'Buffer/Services/SmartSportsCatalogStore.swift',
-    'Buffer/Services/SmartSportsSnapshotLoader.swift', 'Buffer/Models/SmartChannelFilter.swift', 'Buffer/Services/AutoChannelGrouper.swift', 'Buffer/Services/BackgroundSourceRefresher.swift', 'Buffer/Services/BackgroundRefreshPolicy.swift', 'Buffer/Services/SmartSportsCoordinator.swift',
-    'Buffer/Models/VODSeries.swift', 'Buffer/Models/ServerAccountStatus.swift',
-    'Buffer/Models/ProgramReminder.swift', 'Buffer/Models/SyncInterval.swift',
-    'Buffer/Models/PlaybackRequest.swift',
-    'Buffer/Services/XtreamClient.swift', 'Buffer/Services/StalkerClient.swift',
-    'Buffer/Services/ConnectorJSONScanner.swift', 'Buffer/Services/XtreamColumnarDecoder.swift', 'Buffer/Services/StalkerColumnarDecoder.swift',
-    'Buffer/Services/M3UParser.swift', 'Buffer/Support/PerfMetrics.swift', 'Buffer/Services/XMLTVParser.swift',
-    'Buffer/Support/AppLog.swift', 'Buffer/Support/GuideLookup.swift', 'Buffer/Support/GuideHistory.swift',
-    'Buffer/Views/ProgramSearchIndex.swift', 'benchmarks/sync_test_support.swift', 'Buffer/ViewModels/EPGViewModel.swift',
+    'Shared/Models/SourceChannelIdentity.swift', 'Shared/Models/Channel.swift', 'Shared/Models/EPGProgram.swift',
+    'Shared/Models/ServerConfig.swift', 'Shared/Models/VODItem.swift',
+    'Shared/Models/StreamProbe.swift',
+    'Shared/Models/SmartSports.swift', 'Shared/Services/AccountCapacityLedger.swift',
+    'Shared/Services/SmartSportsCatalog.swift', 'Shared/Services/SmartSportsCatalogStore.swift',
+    'Shared/Services/SmartSportsSnapshotLoader.swift', 'Shared/Models/SmartChannelFilter.swift', 'Shared/Services/AutoChannelGrouper.swift', 'Shared/Services/BackgroundSourceRefresher.swift', 'Shared/Services/BackgroundRefreshPolicy.swift', 'Shared/Services/SmartSportsCoordinator.swift',
+    'Shared/Models/VODSeries.swift', 'Shared/Models/ServerAccountStatus.swift',
+    'Shared/Models/ProgramReminder.swift', 'Shared/Models/SyncInterval.swift',
+    'Shared/Models/PlaybackRequest.swift',
+    'Shared/Services/XtreamClient.swift', 'Shared/Services/XtreamColumnarDecoder.swift', 'Shared/Services/ConnectorJSONScanner.swift', 'Shared/Services/StalkerClient.swift', 'Shared/Services/StalkerColumnarDecoder.swift',
+    'Shared/Services/M3UParser.swift', 'Shared/Support/PerfMetrics.swift', 'Shared/Services/XMLTVParser.swift',
+    'Shared/Support/AppLog.swift', 'Shared/Support/GuideLookup.swift', 'Shared/Support/GuideHistory.swift',
+    'Shared/Support/ProgramSearchIndex.swift', 'benchmarks/sync_test_support.swift', 'Shared/ViewModels/EPGViewModel.swift',
     'benchmarks/sync_integration.swift',
 ]
 
@@ -43,7 +42,7 @@ class SyncHTTPTests(unittest.TestCase):
     def setUpClass(cls):
         cls.executable = ROOT / '.local/bench/sync-tests'
         cls.executable.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(['swiftc', '-O', '-D', 'GUIDE_PRODUCTION_METRICS', '-I', 'Buffer/SwiftLibxml2', '-import-objc-header', BRIDGE_HEADER, *SOURCES,
+        subprocess.run(['swiftc', '-O', '-D', 'GUIDE_PRODUCTION_METRICS', '-I', 'Shared/SwiftLibxml2', '-import-objc-header', BRIDGE_HEADER, *SOURCES,
                         '-o', str(cls.executable)], cwd=ROOT, check=True, timeout=90)
 
     def run_scenario(self, scenario):

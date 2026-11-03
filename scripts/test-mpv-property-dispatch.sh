@@ -6,9 +6,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .local/bench
 swiftc -O -wmo -swift-version 6 -parse-as-library \
-  Buffer/Support/MPVItemLifecycle.swift Buffer/Support/PlaybackEvents.swift \
-  Buffer/Support/MPVPropertyBatch.swift Buffer/Support/PlaybackCacheSample.swift \
-  Buffer/Support/PlaybackClockSample.swift Buffer/Support/PlaybackLivenessMonitor.swift \
+  Shared/Support/MPVItemLifecycle.swift Shared/Support/PlaybackEvents.swift \
+  Shared/Support/MPVPropertyBatch.swift Shared/Support/PlaybackCacheSample.swift \
+  Shared/Support/PlaybackClockSample.swift Shared/Support/PlaybackLivenessMonitor.swift \
   benchmarks/mpv_property_dispatch_benchmark.swift benchmarks/mpv_property_dispatch_harness.swift \
   -o .local/bench/mpv-property-dispatch
 .local/bench/mpv-property-dispatch

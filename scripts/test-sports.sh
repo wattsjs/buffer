@@ -2,14 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .local/bench
-sources=(Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift Buffer/Models/SportEvent.swift
-         Buffer/Services/ESPNClient.swift Buffer/Services/ESPNScoreboardDecoder.swift Buffer/Services/ConnectorJSONScanner.swift Buffer/Services/StreamMatcher.swift Buffer/Support/AppLog.swift Buffer/Support/PerfMetrics.swift
-         Buffer/ViewModels/SportsViewModel.swift Buffer/Support/SportsFixtureCache.swift benchmarks/sports_test_support.swift)
+sources=(Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift Shared/Models/SportEvent.swift
+         Shared/Services/ESPNClient.swift Shared/Services/ESPNScoreboardDecoder.swift Shared/Services/ConnectorJSONScanner.swift Shared/Services/StreamMatcher.swift Shared/Support/AppLog.swift Shared/Support/PerfMetrics.swift
+         Shared/ViewModels/SportsViewModel.swift Shared/Support/SportsFixtureCache.swift benchmarks/sports_test_support.swift)
 swiftc "${sources[@]}" benchmarks/espn_request_tests.swift -o .local/bench/espn-tests
 .local/bench/espn-tests
 swiftc -D SPORTS_MATCH_TESTING "${sources[@]}" benchmarks/sports_lifecycle_tests.swift -o .local/bench/sports-lifecycle-tests
 .local/bench/sports-lifecycle-tests
 
-swiftc Buffer/Models/SportEvent.swift Buffer/Support/AppLog.swift Buffer/Support/SportsFixtureCache.swift \
+swiftc Shared/Models/SportEvent.swift Shared/Support/AppLog.swift Shared/Support/SportsFixtureCache.swift \
   benchmarks/sports_fixture_cache_tests.swift -o .local/bench/sports-fixture-cache-tests
 .local/bench/sports-fixture-cache-tests

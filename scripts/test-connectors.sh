@@ -4,13 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .local/bench
-models=(Buffer/Models/SourceChannelIdentity.swift Buffer/Models/Channel.swift Buffer/Models/EPGProgram.swift
-        Buffer/Models/ServerConfig.swift Buffer/Models/VODItem.swift Buffer/Models/VODSeries.swift Buffer/Models/SportEvent.swift)
-clients=(Buffer/Services/ConnectorJSONScanner.swift Buffer/Services/XtreamColumnarDecoder.swift Buffer/Services/StalkerColumnarDecoder.swift Buffer/Services/XtreamClient.swift
-         Buffer/Services/StalkerClient.swift Buffer/Services/ESPNClient.swift Buffer/Services/ESPNScoreboardDecoder.swift
-         Buffer/Support/AppLog.swift)
+models=(Shared/Models/SourceChannelIdentity.swift Shared/Models/Channel.swift Shared/Models/EPGProgram.swift
+        Shared/Models/ServerConfig.swift Shared/Models/VODItem.swift Shared/Models/VODSeries.swift Shared/Models/SportEvent.swift)
+clients=(Shared/Services/ConnectorJSONScanner.swift Shared/Services/XtreamColumnarDecoder.swift Shared/Services/StalkerColumnarDecoder.swift Shared/Services/XtreamClient.swift
+         Shared/Services/StalkerClient.swift Shared/Services/ESPNClient.swift Shared/Services/ESPNScoreboardDecoder.swift
+         Shared/Support/AppLog.swift)
 support=(benchmarks/connector_fixtures.swift benchmarks/legacy_connector_decoders.swift)
-swiftc -O Buffer/Services/ConnectorJSONScanner.swift benchmarks/connector_scanner_tests.swift -o .local/bench/connector-scanner-tests
+swiftc -O Shared/Services/ConnectorJSONScanner.swift benchmarks/connector_scanner_tests.swift -o .local/bench/connector-scanner-tests
 .local/bench/connector-scanner-tests
 swiftc -O -D CONNECTOR_TESTING "${models[@]}" "${clients[@]}" "${support[@]}" benchmarks/connector_decode_tests.swift \
   benchmarks/connector_decode_tests_stalker_espn.swift -o .local/bench/connector-decode-tests

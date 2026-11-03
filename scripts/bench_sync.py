@@ -40,7 +40,7 @@ def run():
     report = dict(fixture='sync-http-overlap-v1', schemaVersion=1,
                   configuration='Standalone optimized production EPGViewModel + HTTP clients/parsers; platform/cache stubs',
                   movieAndSeriesLatencyMs=650, guideLatencyMs=20, after=[],
-                  afterSourceSHA256=digest(ROOT / 'Buffer/Support/PerfMetrics.swift', 'Buffer/Support/AppLog.swift', 'Buffer/ViewModels/EPGViewModel.swift'),
+                  afterSourceSHA256=digest(ROOT / 'Shared/Support/PerfMetrics.swift', 'Shared/Support/AppLog.swift', 'Shared/ViewModels/EPGViewModel.swift'),
                   afterExecutableSHA256=digest(current),
                   sourceHashes={p: digest(ROOT / p) for p in [*test_sync.SOURCES, test_sync.BRIDGE_HEADER]},
                   recordedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -49,8 +49,8 @@ def run():
     if args.before_source:
         source = args.before_source.resolve(strict=True)
         before_executable = ROOT / '.local/bench/sync-tests-before'
-        sources = [str(source) if p == 'Buffer/ViewModels/EPGViewModel.swift' else p for p in test_sync.SOURCES]
-        subprocess.run(['swiftc', '-O', '-I', 'Buffer/SwiftLibxml2', '-import-objc-header', test_sync.BRIDGE_HEADER, *sources,
+        sources = [str(source) if p == 'Shared/ViewModels/EPGViewModel.swift' else p for p in test_sync.SOURCES]
+        subprocess.run(['swiftc', '-O', '-I', 'Shared/SwiftLibxml2', '-import-objc-header', test_sync.BRIDGE_HEADER, *sources,
                         '-o', str(before_executable)], cwd=ROOT, check=True, timeout=90)
         report.update(before=[], beforeSourceSHA256=digest(source), beforeExecutableSHA256=digest(before_executable))
     for _ in range(args.samples):

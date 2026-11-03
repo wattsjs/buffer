@@ -16,8 +16,8 @@ import sys
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-COMMON = ['Buffer/Models/EPGProgram.swift', 'Buffer/Models/SourceChannelIdentity.swift', 'Buffer/Models/Channel.swift',
-          'Buffer/Models/VODItem.swift', 'Buffer/Support/AppLog.swift',
+COMMON = ['Shared/Models/EPGProgram.swift', 'Shared/Models/SourceChannelIdentity.swift', 'Shared/Models/Channel.swift',
+          'Shared/Models/VODItem.swift', 'Shared/Support/AppLog.swift',
           'benchmarks/parser_memory_benchmark.swift']
 
 
@@ -28,11 +28,11 @@ def digest(path):
 def compile_parser(name, configuration, xml, m3u):
     executable = ROOT / '.local/bench' / f'parser-memory-{configuration}-{name}'
     sources = [ROOT / p for p in COMMON] + [xml, m3u]
-    header = ROOT / 'Buffer/Support/ChannelIdentityEncoding.h'
+    header = ROOT / 'Shared/Support/ChannelIdentityEncoding.h'
     inputs = sources + [header]
     input_hashes = [digest(p) for p in inputs]
     subprocess.run(['swiftc', '-O' if configuration == 'optimized' else '-Onone',
-                    '-I', str(ROOT / 'Buffer/SwiftLibxml2'),
+                    '-I', str(ROOT / 'Shared/SwiftLibxml2'),
                     '-import-objc-header', str(header),
                     *map(str, sources), '-o', str(executable)], cwd=ROOT,
                    check=True, timeout=90)
@@ -74,7 +74,7 @@ def run():
         parser.error('use either source snapshots or a prior report')
     previous = json.loads(args.compare.read_text()) if args.compare else None
     (ROOT / '.local/bench').mkdir(parents=True, exist_ok=True)
-    xml, m3u = ROOT / 'Buffer/Support/PerfMetrics.swift', 'Buffer/Services/XMLTVParser.swift', ROOT / 'Buffer/Services/M3UParser.swift'
+    xml, m3u = ROOT / 'Shared/Support/PerfMetrics.swift', 'Shared/Services/XMLTVParser.swift', ROOT / 'Shared/Services/M3UParser.swift'
     run_id = uuid.uuid4().hex[:12]
     after, hashes = compile_parser('after-' + run_id, args.configuration, xml, m3u)
     before = None

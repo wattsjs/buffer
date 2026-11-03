@@ -8,8 +8,8 @@ import pathlib
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SOURCES = ["Buffer/Models/SourceChannelIdentity.swift", "Buffer/Models/Channel.swift", "Buffer/Models/EPGProgram.swift", "Buffer/Models/SportEvent.swift",
-           "Buffer/Support/PerfMetrics.swift", "Buffer/Support/AppLog.swift", "Buffer/Services/StreamMatcher.swift", "Buffer/Support/SportEventMatchState.swift",
+SOURCES = ["Shared/Models/SourceChannelIdentity.swift", "Shared/Models/Channel.swift", "Shared/Models/EPGProgram.swift", "Shared/Models/SportEvent.swift",
+           "Shared/Support/PerfMetrics.swift", "Shared/Support/AppLog.swift", "Shared/Services/StreamMatcher.swift", "Shared/Support/SportEventMatchState.swift",
            "benchmarks/sport_card_context_benchmark.swift"]
 
 
@@ -20,7 +20,7 @@ def digest(path):
 def run(source, mode):
     executable = ROOT / f".local/bench/sport-card-context-{mode}"
     executable.parent.mkdir(parents=True, exist_ok=True)
-    sources = [str(source) if name == "Buffer/Support/SportEventMatchState.swift" else name for name in SOURCES]
+    sources = [str(source) if name == "Shared/Support/SportEventMatchState.swift" else name for name in SOURCES]
     command = ["swiftc", "-O", *sources, "-o", str(executable)]
     if mode == "before":
         command.extend(["-D", "DICTIONARY_CONTEXT"])
@@ -43,7 +43,7 @@ def main():
         source = args.before_source.resolve(strict=True)
         report["beforeSourcePath"] = str(source.relative_to(ROOT)) if source.is_relative_to(ROOT) else str(source)
         report["before"] = run(source, "before")
-    report["after"] = run(ROOT / "Buffer/Support/SportEventMatchState.swift", "after")
+    report["after"] = run(ROOT / "Shared/Support/SportEventMatchState.swift", "after")
     if "before" in report:
         old = {case["name"]: case for case in report["before"]["cases"]}
         for case in report["after"]["cases"]:

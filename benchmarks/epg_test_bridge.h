@@ -1,2 +1,2 @@
-#include "../Buffer/Support/ChannelIdentityEncoding.h"
-#include "../Buffer/Services/BufferProbe.h"
+#include "../Shared/Support/ChannelIdentityEncoding.h"
+#include "../Shared/Services/BufferProbe.h"

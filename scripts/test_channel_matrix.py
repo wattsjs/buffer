@@ -204,9 +204,9 @@ class ChannelMatrixTests(unittest.TestCase):
     def test_actual_swift_coordinator_stops_before_next_source(self):
         with tempfile.TemporaryDirectory() as folder:
             executable = pathlib.Path(folder) / 'scenario-tests'
-            subprocess.run(['swiftc', str(ROOT / 'Buffer/Support/SavedPlaybackScenarioPlan.swift'),
-                str(ROOT / 'Buffer/Models/SourceChannelIdentity.swift'), str(ROOT / 'Buffer/Models/Channel.swift'), str(ROOT / 'Buffer/Models/EPGProgram.swift'),
-                str(ROOT / 'Buffer/Support/SavedScenarioArchiveSelection.swift'),
+            subprocess.run(['swiftc', str(ROOT / 'Shared/Support/SavedPlaybackScenarioPlan.swift'),
+                str(ROOT / 'Shared/Models/SourceChannelIdentity.swift'), str(ROOT / 'Shared/Models/Channel.swift'), str(ROOT / 'Shared/Models/EPGProgram.swift'),
+                str(ROOT / 'Shared/Support/SavedScenarioArchiveSelection.swift'),
                 str(ROOT / 'benchmarks/saved_scenario_tests.swift'), '-o', str(executable)],
                 capture_output=True, text=True, check=True, timeout=60)
             output = subprocess.check_output([str(executable)], text=True, timeout=15)

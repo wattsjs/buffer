@@ -18,11 +18,10 @@ class CatchupHTTPTests(unittest.TestCase):
     def setUpClass(cls):
         cls.executable = ROOT / '.local/bench/catchup-tests'
         cls.executable.parent.mkdir(parents=True, exist_ok=True)
-        sources = ['Buffer/Models/SourceChannelIdentity.swift', 'Buffer/Models/Channel.swift', 'Buffer/Models/EPGProgram.swift',
-                   'Buffer/Models/ServerConfig.swift', 'Buffer/Models/VODItem.swift',
-                   'Buffer/Models/VODSeries.swift', 'Buffer/Services/XtreamClient.swift',
-                   'Buffer/Services/ConnectorJSONScanner.swift', 'Buffer/Services/XtreamColumnarDecoder.swift',
-                   'Buffer/Support/AppLog.swift', 'benchmarks/catchup_integration.swift']
+        sources = ['Shared/Models/SourceChannelIdentity.swift', 'Shared/Models/Channel.swift', 'Shared/Models/EPGProgram.swift',
+                   'Shared/Models/ServerConfig.swift', 'Shared/Models/VODItem.swift',
+                   'Shared/Models/VODSeries.swift', 'Shared/Services/XtreamClient.swift', 'Shared/Services/XtreamColumnarDecoder.swift', 'Shared/Services/ConnectorJSONScanner.swift',
+                   'Shared/Support/AppLog.swift', 'benchmarks/catchup_integration.swift']
         subprocess.run(['swiftc', '-O', *sources, '-o', str(cls.executable)], cwd=ROOT, check=True, timeout=60)
 
     def run_scenario(self, scenario):
